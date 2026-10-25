@@ -1046,6 +1046,59 @@ pub fn finish(store: &Store, claim_id: &str, to_stage: &str) -> Result<Claim, St
     Ok(c)
 }
 
+// ---- 外部收尾判定 ----
+//
+// 规则（用户 2026-10-25 定）：会话只有两种终点——
+//   ① 完成：agent 跑 tb done/close，或用户在网页把状态改成 已解决/关闭、把任务拖到列4/列5；
+//   ② 被迫结束：会话断开（心跳超时/进程被杀）→ 退回 待处理 + 列1。
+// 除这两种外，会话一直 running/waiting，不自动结束。
+//
+// 关键：被①（用户手动收尾）完成的任务，绝不能又被②回收回列1。所以回收前必须先判定。
+
+// 纯判定：给定任务当前的工作流状态名 + 看板列名，是否已被「外部」完成。
+// 返回 Some("closed") / Some("done") / None。列名（数字 1..5）优先于状态名——
+// 用户可能只拖了列没改状态。可单测，不碰网络。
+pub fn external_done_by(
+    stage_name: &str,
+    list_name: &str,
+    cfg: &crate::config::Config,
+) -> Option<&'static str> {
+    if list_name == cfg.tasklist_closed {
+        return Some("closed");
+    }
+    if list_name == cfg.tasklist_done {
+        return Some("done");
+    }
+    if stage_name == STAGE_CLOSED {
+        return Some("closed");
+    }
+    if stage_name == STAGE_DONE {
+        return Some("done");
+    }
+    None
+}
+
+// 网络版：读任务当前的列名 + 状态名，套 external_done_by。查不到返回 None（宁可漏判也不误判）。
+fn external_done_state(ctx: &mut Ctx, project_id: &str, task_id: &str) -> Option<&'static str> {
+    let cfg = ctx.tb.cfg.clone();
+    let info = ctx.task_info(task_id).ok()?;
+    let list_name = if info.list_id.is_empty() {
+        String::new()
+    } else {
+        ctx.list_name_of(project_id, &info.list_id)
+    };
+    let stage_name = if info.stage_id.is_empty() {
+        String::new()
+    } else {
+        ctx.ensure_stages(project_id)
+            .ok()
+            .and_then(|st| st.into_iter().find(|s| s.id == info.stage_id))
+            .map(|s| s.name)
+            .unwrap_or_default()
+    };
+    external_done_by(&stage_name, &list_name, &cfg)
+}
+
 // ---- 接单 / 提问 / 继续 / 放弃 / 回收 ----
 //
 // 这是「任务跟着会话走」的核心状态机。两个维度组合出五种局面：
@@ -1526,6 +1579,18 @@ pub fn wait(
             }
         }
 
+        // 用户在网页手动收尾（改状态为 已解决/关闭，或拖到列4/列5）→ 任务已完成，
+        // 标记本地 claim 收尾并停止等待，别再傻等评论。
+        if let Some(st) = external_done_state(&mut ctx, &claim.project_id, &claim.task_id) {
+            let _ = store.update_claim(claim_id, st, "用户手动收尾（改状态/拖到列4-5）");
+            let c = store.get_claim(claim_id).unwrap_or_else(|| claim.clone());
+            return Ok(WaitOutcome::Gone {
+                state: st.to_string(),
+                claim: c,
+                waited_secs: started.elapsed().as_secs(),
+            });
+        }
+
         // 只看「提问之后」的评论；ask_at 用服务端时间戳，避免本地时钟漂移。
         let fresh: Vec<CommentInfo> = ctx
             .read_comments(&claim.task_id)
@@ -1655,6 +1720,16 @@ pub fn sweep(store: &Store, force: bool) -> Result<Vec<String>, String> {
     let mut ctx = Ctx::new(store.clone(), false)?;
     let mut out = Vec::new();
     for c in stale {
+        // 用户可能已手动收尾（网页改状态为 已解决/关闭，或拖到列4/列5）：
+        // 那就标记完成，绝不回收回列1。会话被迫结束才回列1，手动完成不算。
+        if let Some(st) = external_done_state(&mut ctx, &c.project_id, &c.task_id) {
+            let _ = store.update_claim(&c.claim_id, st, "用户手动收尾（改状态/拖到列4-5）");
+            out.push(format!(
+                "已确认外部收尾 {}（{}）：{st}，不回收",
+                c.claim_id, c.task_name
+            ));
+            continue;
+        }
         let secs = crate::store::age_secs(c.heartbeat());
         let ago = human_age(secs);
         let note = format!(
@@ -1924,7 +1999,8 @@ fn workflow_text(
         DEFAULT_WAIT_TIMEOUT_SECS
     ));
     s.push_str("        可以连续等很多轮，直到用户回复或会话结束）；\n");
-    s.push_str("      退出码 3 = 任务在别处被收尾了（停止等待，别再 ask）。\n");
+    s.push_str("      退出码 3 = 任务在别处被收尾了（用户手动改成已解决/关闭、拖到列4/列5，\n");
+    s.push_str("        或你在别处 done/close）：停止等待，别再 ask。\n");
     s.push_str("      等的时候不要干别的，也不要重复 ask。\n");
     step += 1;
 
@@ -2052,6 +2128,28 @@ pub fn agent_prompt_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 外部收尾判定：用户网页手动改状态、或拖到列4/列5，都算「已完成」。
+    // 列名用数字（1..5），列优先于状态名（可能只拖了列没改状态）。
+    #[test]
+    fn external_done_by_detects_manual_completion() {
+        let cfg = crate::config::Config::default(); // tasklist_done="4" closed="5"
+        // 只拖列、状态还是「进行中」也算完成
+        assert_eq!(external_done_by("进行中", "4", &cfg), Some("done"));
+        assert_eq!(external_done_by("进行中", "5", &cfg), Some("closed"));
+        // 只改状态、列还在 2 也算完成
+        assert_eq!(external_done_by("已解决", "2", &cfg), Some("done"));
+        assert_eq!(external_done_by("关闭", "2", &cfg), Some("closed"));
+        // 列和状态冲突时列优先：拖到列5=关闭
+        assert_eq!(external_done_by("已解决", "5", &cfg), Some("closed"));
+        // 没收尾的都不算
+        assert_eq!(external_done_by("待处理", "1", &cfg), None);
+        assert_eq!(external_done_by("进行中", "2", &cfg), None);
+        assert_eq!(external_done_by("待回复", "3", &cfg), None);
+        // 空列名（数据源没有看板列维度）时退化成只看状态
+        assert_eq!(external_done_by("已解决", "", &cfg), Some("done"));
+        assert_eq!(external_done_by("进行中", "", &cfg), None);
+    }
 
     fn tmp_store(tag: &str) -> Store {
         let root = std::env::temp_dir().join(format!("tbhub-test-{tag}"));
