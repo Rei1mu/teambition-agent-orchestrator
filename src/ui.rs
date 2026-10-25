@@ -870,7 +870,7 @@ mod tests {
             .insert(pid.to_string(), "# 界面里的任务标题\n正文第二行".to_string());
         let (text, has_task) = app.copy_prompt(pid, "项目一", CopyMode::ThisTask);
         assert!(has_task, "填了草稿就该带上本次任务");
-        assert!(text.contains("本次任务"), "文案应有「本次任务」段");
+        assert!(text.contains("This task"), "文案应有 This task 段");
         assert!(text.contains("start"), "应让 agent 跑 start");
         assert!(text.contains("界面里的任务标题"), "标题应进文案");
     }

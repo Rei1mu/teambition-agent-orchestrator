@@ -54,6 +54,13 @@ pub enum Cmd {
         #[arg(long)]
         project: String,
     },
+    /// 打印单个 skill 的完整内容。文案里只列 skill 名字，agent 用到哪个读哪个（省 token）
+    Skill {
+        /// skill 名字（和 tb skills 列出的一致）
+        name: String,
+        #[arg(long)]
+        project: String,
+    },
     /// 把本地文件推成一条 skill（任务类型=skill）。同名则更新内容
     SkillPush {
         #[arg(long)]
@@ -169,7 +176,7 @@ pub enum Cmd {
     Close { claim_id: String },
     /// 查看本地领取台账
     Status,
-    /// 生成给 agent 的调用文案(含已启用 skill)
+    /// 生成给 agent 的调用文案(英文速查表 + 已启用 skill 名字列表，不含 skill 全文)
     Prompt {
         #[arg(long)]
         project: String,

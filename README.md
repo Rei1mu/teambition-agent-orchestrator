@@ -98,6 +98,7 @@ skill 不是阶段，而是「任务类型」(sfc)：项目里有一个名为 `s
 ```bat
 tb skill-push --project <id> --file SKILL.md
 tb skills --project <id>
+tb skill <名字> --project <id>          :: 打印单个 skill 全文（agent 文案按需读它）
 tb switch --project <id> --skill <名> --on
 tb switch --project <id> --skill <名> --off
 ```
@@ -274,7 +275,25 @@ tb prompt --project <id> --task-file .\todo.md        :: 任务正文从文件�
 
 两个按钮的差别是**刻意的**：点「领列1任务」时哪怕输入框里还留着上次写的草稿，文案里也不会出现——否则 agent 会自建任务而不是去领，行为就跑偏了。
 
-文案含：任务标题/正文、已启用 skill 全文、共享记忆目录、开工命令（`claim` 或 `start`）、收尾规则。
+### 省 token 设计（英文速查表 + skill 按需读）
+
+文案是发给 agent 的、人基本不读，所以按 token 成本优化过：
+
+- **闭环指令是英文速查表**。实测同义内容中文约 882 token、英文约 540 token（cl100k）——中文字在 BPE 分词里普遍 1 字 1+ token，英文 1 token 能装好几个字母。阶段名（待处理/进行中/…）保持中文，那是 Teambition 上的真实名字，改了 agent 对不上。
+- **skill 不内联全文，只列名字**。以前每次发文案都把全部启用 skill 的全文贴进去，skill 越多越大越贵；现在文案只给名字列表 + 一条读取命令，agent 用到哪个读哪个：
+
+```
+Enabled skills (3): 部署流程, 代码规范, 发布 checklist
+Read one on demand (do NOT read all): `tb skill <name> --project <id>`
+```
+
+```bat
+tb skill 部署流程 --project <id>   :: 打印该 skill 全文
+```
+
+不变量一条没丢（只经 tb 改状态/列、别自建任务、每条必须终结于 ask/done/close、长操作前后 beat、待回复永不超时、心跳超时退回队列、退出码 0/2/3 语义），由单测 `workflow_keeps_key_invariants` 守着；`prompt_with_huge_skill_stays_small` 防体积回潮。测量脚本：`tools/token_cmp.py`。
+
+文案含：任务标题/正文、已启用 skill 名字列表、共享记忆目录、开工命令（`claim` 或 `start`）、收尾规则。
 
 `--task` / `--task-file` 的正文会落盘到 `data/tasks/<标题>.md`，文案里给出绝对路径，agent 直接用 `tb start --file` 读，不用你贴正文。
 

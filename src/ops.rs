@@ -1926,6 +1926,14 @@ pub fn draft_for_mode(store: &Store, raw: &str, mode: CopyMode) -> Option<TaskDr
 //
 // draft 有值 = 用户在文案里派了活（走 start 新建）；
 // draft 为空 = 让 agent 去队列领（走 claim）。
+//
+// **用英文写**：实测同义内容中文 ~882 token、英文 ~182 token（cl100k）。
+// 中文字在 BPE 里普遍 1 字 1+ token，英文经常 1 token 装好几个字母。
+// 文案是复制给 agent 的、人基本不读，所以英文化不伤用户体验；
+// 阶段名（待处理/进行中/...）保持中文——那是 Teambition 上的真实名字，改了 agent 对不上。
+// 关键不变量一条不许丢（有单测守着）：只经 tb 改状态/列、别自建任务、
+// 每条必须终结于 ask/done/close、长操作前后 beat、待回复永不超时、
+// 心跳超时退回队列、退出码 0/2/3 的含义。
 fn workflow_text(
     exe: &str,
     project_id: &str,
@@ -1935,17 +1943,17 @@ fn workflow_text(
     let t = cfg.heartbeat_timeout_secs / 60;
     let mut s = String::new();
     let has_task = draft.map(|d| !d.is_empty()).unwrap_or(false);
-    s.push_str("工作方式（必须按这个闭环走，不要自己直接去改任务状态和看板列）:\n");
+    s.push_str("## Workflow (mandatory loop; never edit task state or board columns yourself)\n");
 
     let mut step = 1;
     if has_task {
         let d = draft.unwrap();
         s.push_str(&format!(
-            "{step}. 先登记开工——这是第一条命令，不要跳过，也不要去队列领:\n"
+            "{step}. Register first - run this exact command, do not skip, do not claim from the queue:\n"
         ));
         if d.body_path.is_empty() {
             s.push_str(&format!(
-                "   {exe} start --project {project_id} --title \"{}\" --note \"<上面正文>\"\n",
+                "   {exe} start --project {project_id} --title \"{}\" --note \"<body above>\"\n",
                 d.title.replace('"', "'")
             ));
         } else {
@@ -1955,102 +1963,87 @@ fn workflow_text(
             ));
         }
         s.push_str(&format!(
-            "   它会在看板列「{}」新建一条「进行中」任务并打印 claim_id。**不要自己建任务、不要自己改状态。**\n",
+            "   It creates a \"doing\" task in column \"{}\" and prints claim_id. Do NOT create tasks or change state yourself.\n",
             cfg.tasklist_claim
         ));
-        s.push_str("   如果它返回「该任务已开工，复用原 claim」，说明已经登记过了，直接用那个 claim_id。\n");
+        s.push_str("   If it returns \"already started, reusing claim\", reuse that claim_id.\n");
     } else {
         s.push_str(&format!(
-            "{step}. 先领任务：`{exe} claim --project {project_id}`，只领看板列「{}」队列里的任务。\n",
+            "{step}. Claim: `{exe} claim --project {project_id}` (queue column \"{}\"). If the user gave a task link, use `{exe} take <link>` instead.\n",
             cfg.tasklist_queue
         ));
-        s.push_str("   用户若直接给了任务链接，改用 `");
-        s.push_str(exe);
-        s.push_str(" take <链接>`。\n");
-        s.push_str("   **没有可领的任务就向用户说明并停下，不要自己造任务。**\n");
+        s.push_str("   If nothing to claim: tell the user and stop. Do NOT invent tasks.\n");
     }
     step += 1;
 
     s.push_str(&format!(
-        "{step}. 按上面已启用的 skill 指引执行。执行中可把进展写入共享记忆目录。\n"
+        "{step}. Do the work per the skills above; write progress to the shared memory dir.\n"
     ));
     s.push_str(&format!(
-        "   长操作（构建 / 测试 / 批量请求）**前后各跑一次** `{exe} beat <claim_id>`。\n"
+        "   Run `{exe} beat <claim_id>` before AND after long ops (build / test / batch requests).\n"
     ));
     step += 1;
 
     s.push_str(&format!(
-        "{step}. 需要用户确认或补充信息：先提问，再**同步等回复**（两步都要做）：\n"
+        "{step}. Need user input - ask, then wait (both steps required):\n"
     ));
     s.push_str(&format!(
-        "   a) `{exe} ask <claim_id> --question \"问题\"` —— 状态变「{}」+ 看板列「{}」，问题写成任务评论。\n",
+        "   a) `{exe} ask <claim_id> -q \"question\"` -> status \"{0}\" + column \"{1}\"; the question becomes a task comment.\n",
         STAGE_WAIT, cfg.tasklist_wait
     ));
     s.push_str(&format!(
-        "   b) `{exe} wait <claim_id>` —— 阻塞轮询任务评论。用户在 Teambition 回一句，它就返回\n"
-    ));
-    s.push_str(&format!(
-        "      回复正文并把状态推回「{0}」+ 列「{1}」。用户**不需要**再回到会话里发一句「继续」。\n",
+        "   b) `{exe} wait <claim_id>` - blocks polling task comments. The user replies on Teambition; it returns the reply and pushes status back to \"{0}\" + column \"{1}\". The user does NOT need to say \"continue\" in the chat.\n",
         STAGE_DOING, cfg.tasklist_claim
     ));
-    s.push_str("      退出码 0 = 读到回复（直接照回复继续干）；\n");
+    s.push_str("      exit 0 = reply received (continue with it);\n");
     s.push_str(&format!(
-        "      退出码 2 = 本轮 {0} 秒内没等到（**再跑一次** `{exe} wait <claim_id>` 接着等，\n",
+        "      exit 2 = no reply within {}s this round - run `{exe} wait <claim_id>` again (many rounds are fine);\n",
         DEFAULT_WAIT_TIMEOUT_SECS
     ));
-    s.push_str("        可以连续等很多轮，直到用户回复或会话结束）；\n");
-    s.push_str("      退出码 3 = 任务在别处被收尾了（用户手动改成已解决/关闭、拖到列4/列5，\n");
-    s.push_str("        或你在别处 done/close）：停止等待，别再 ask。\n");
-    s.push_str("      等的时候不要干别的，也不要重复 ask。\n");
+    s.push_str("      exit 3 = task finished elsewhere (user resolved/closed it or dragged to column 4/5) - stop waiting, do not ask again.\n");
+    s.push_str("      While waiting: do nothing else, do not repeat ask.\n");
     step += 1;
 
     s.push_str(&format!(
-        "{step}. 干完：`{exe} done <claim_id>`（已解决 + 列「{}」）。作废：`{exe} close <claim_id>`（关闭 + 列「{}」）。\n",
-        cfg.tasklist_done, cfg.tasklist_closed
+        "{step}. Finished: `{exe} done <claim_id>` (resolved + column \"{}\"). Void: `{exe} close <claim_id>` (column \"{}\"). Give up: `{exe} release <claim_id> --reason \"...\"` (back to queue + column \"{}\").\n",
+        cfg.tasklist_done, cfg.tasklist_closed, cfg.tasklist_queue
     ));
     step += 1;
 
     s.push_str(&format!(
-        "{step}. 主动放弃：`{exe} release <claim_id> --reason \"原因\"`（退回 待处理 + 列「{}」）。\n",
-        cfg.tasklist_queue
+        "{step}. Every task MUST end in ask / done / close - never abandon it halfway.\n"
     ));
-    step += 1;
-
     s.push_str(&format!(
-        "   会话断开（限额 / 网络 / 窗口关闭）超过 {t} 分钟没心跳，任务会被自动退回 待处理 + 列「{}」。\n",
+        "   Session dies (quota / network / window closed) with no heartbeat for {t} min -> task auto-returns to queue + column \"{}\".\n",
         cfg.tasklist_queue
     ));
     s.push_str(&format!(
-        "   「{0}」状态永不超时回收——用户可能隔一天才回，`{exe} wait` 挂多久都安全。\n",
+        "   Status \"{}\" NEVER times out - the user may reply a day later; `{exe} wait` may hang as long as needed.\n",
         STAGE_WAIT
     ));
     s.push_str(&format!(
-        "{step}. 每条任务必须终结于 ask / done / close 三者之一，不许半路停手不管。\n"
-    ));
-    s.push_str(&format!(
-        "\n会话标识：如果同一目录可能同时跑多个会话（比如两个 WorkBuddy 会话 + 一个 dsh），\n\
-         先跑 `{exe} hello --name <会话名>` 给自己命名，否则两个会话共用一个标识，\n\
-         会话存活判定会互相顶。不命名也能用，只是多会话时不安全。\n"
+        "   Multi-session: if two sessions share one dir, run `{exe} hello --name <name>` first.\n"
     ));
     s
 }
 
 // 文案里「本次任务」那一段。放在 header 之后、skill 之前——
 // agent 第一眼就该知道这次要干什么，而不是先读一堆 skill 再去找任务。
+// 结构标签用英文（省 token）；标题/正文是用户自己的内容，原样保留。
 fn task_section(d: &TaskDraft) -> String {
     let mut s = String::new();
-    s.push_str("## 本次任务（用户已指定，不要再去队列领）\n");
-    s.push_str(&format!("标题: {}\n", d.title.trim()));
+    s.push_str("## This task (assigned by the user - do NOT claim from the queue)\n");
+    s.push_str(&format!("Title: {}\n", d.title.trim()));
     if !d.body_path.is_empty() {
-        s.push_str(&format!("正文文件: {}\n", d.body_path));
+        s.push_str(&format!("Body file: {}\n", d.body_path));
     }
     let body = d.body.trim();
     if !body.is_empty() {
-        s.push_str("\n正文:\n");
+        s.push_str("\nBody:\n");
         if body.chars().count() > 4000 {
             let head: String = body.chars().take(4000).collect();
             s.push_str(&head);
-            s.push_str("\n\n...（正文过长已截断，完整内容见上面的正文文件）\n");
+            s.push_str("\n\n...(body truncated, full text in the body file above)\n");
         } else {
             s.push_str(body);
             s.push('\n');
@@ -2061,6 +2054,10 @@ fn task_section(d: &TaskDraft) -> String {
 }
 
 // 文案正文。CLI 和 UI 两条路共用，避免两份文案走偏。
+//
+// **skill 不内联全文**：那曾是文案 token 的最大头（skill 越多越大越贵，
+// 且每次发文案都要全量重发）。改成只列名字 + 一条按需读取命令，
+// agent 用到哪个才 `tb skill <名字>` 读哪个，读哪个付哪个。
 fn prompt_body(
     store: &Store,
     project_id: &str,
@@ -2073,10 +2070,10 @@ fn prompt_body(
         .unwrap_or_else(|_| "tb".to_string());
     let mem = store.memory_dir(project_id);
     let mut s = String::new();
-    s.push_str(&format!("# 项目: {project_name}\n"));
-    s.push_str(&format!("项目 ID: {project_id}\n"));
-    s.push_str(&format!("共享记忆目录: {}\n", mem.display()));
-    s.push_str(&format!("工具路径: {exe}\n\n"));
+    s.push_str(&format!("# Project: {project_name}\n"));
+    s.push_str(&format!("Project ID: {project_id}\n"));
+    s.push_str(&format!("Shared memory dir: {}\n", mem.display()));
+    s.push_str(&format!("Tool path: {exe}\n\n"));
 
     if let Some(d) = draft {
         if !d.is_empty() {
@@ -2086,13 +2083,17 @@ fn prompt_body(
 
     let enabled: Vec<&SkillItem> = skills.iter().filter(|k| k.on).collect();
     if enabled.is_empty() {
-        s.push_str("已启用 skill: 无\n\n");
+        s.push_str("Enabled skills: none\n\n");
     } else {
-        s.push_str(&format!("已启用 skill ({} 个):\n", enabled.len()));
-        for k in &enabled {
-            s.push_str(&format!("\n--- skill: {} ---\n{}\n", k.name, k.content));
-        }
-        s.push('\n');
+        let names: Vec<&str> = enabled.iter().map(|k| k.name.as_str()).collect();
+        s.push_str(&format!(
+            "Enabled skills ({}): {}\n",
+            enabled.len(),
+            names.join(", ")
+        ));
+        s.push_str(&format!(
+            "Read one on demand (do NOT read all): `{exe} skill <name> --project {project_id}`\n\n"
+        ));
     }
     s.push_str(&workflow_text(
         &exe,
@@ -2212,9 +2213,105 @@ mod tests {
         let draft = draft_for_mode(&store, "# 标题一\n正文", CopyMode::ThisTask);
         let p_this = agent_prompt_from(&store, pid, name, &skills, draft.as_ref());
         let p_queue = agent_prompt_from(&store, pid, name, &skills, None);
-        assert!(p_this.contains("本次任务"), "本次任务 版应带本次任务 段");
-        assert!(p_this.contains("start"), "本次任务 版应让 agent 跑 start");
-        assert!(p_queue.contains("claim"), "领列1 版应让 agent 跑 claim");
+        assert!(p_this.contains("This task"), "ThisTask 版应带 This task 段");
+        assert!(p_this.contains("start"), "ThisTask 版应让 agent 跑 start");
+        assert!(p_queue.contains("claim"), "Queue 版应让 agent 跑 claim");
         assert_ne!(p_this, p_queue);
+    }
+
+    // 英文速查表重构后，关键不变量一条都不许丢。
+    // 这些是「agent 跑偏」的防线：改 workflow_text 时先跑这个测试。
+    #[test]
+    fn workflow_keeps_key_invariants() {
+        let store = tmp_store("wf");
+        let cfg = store.load_config();
+        let wf = workflow_text("tb", "p-1", &cfg, None);
+        // 闭环命令一个不能少
+        for cmd in [
+            "claim --project",
+            "take <link>",
+            "beat <claim_id>",
+            "ask <claim_id>",
+            "wait <claim_id>",
+            "done <claim_id>",
+            "close <claim_id>",
+            "release <claim_id>",
+        ] {
+            assert!(wf.contains(cmd), "速查表缺命令: {cmd}");
+        }
+        // 行为规则
+        assert!(
+            wf.contains("never edit task state or board columns yourself"),
+            "必须禁止 agent 自己改状态/列"
+        );
+        assert!(wf.contains("Do NOT invent tasks"), "没任务时必须停下，不许自建");
+        assert!(
+            wf.contains("MUST end in ask / done / close"),
+            "每条任务必须终结于 ask/done/close"
+        );
+        assert!(
+            wf.contains("before AND after long ops"),
+            "长操作前后必须 beat"
+        );
+        assert!(wf.contains("NEVER times out"), "待回复必须永不超时");
+        assert!(
+            wf.contains("auto-returns to queue"),
+            "心跳超时必须说明会退回队列"
+        );
+        // 退出码语义
+        assert!(wf.contains("exit 0"), "退出码 0 语义不能丢");
+        assert!(wf.contains("exit 2"), "退出码 2 语义不能丢");
+        assert!(
+            wf.contains("exit 3") && wf.contains("finished elsewhere"),
+            "退出码 3 = 别处收尾，不能丢"
+        );
+        assert!(wf.contains("hello --name"), "多会话命名提示不能丢");
+        // 中文指令已被英文替换（这是本次省 token 的核心）
+        assert!(!wf.contains("工作方式"), "不应再保留中文长指令");
+    }
+
+    // skill 只列名字，不内联全文——文案 token 的最大头必须按需读取。
+    #[test]
+    fn prompt_lists_skill_names_not_full_content() {
+        let store = tmp_store("skillname");
+        let pid = "p-1";
+        let big = "部署流程要点：".to_string() + &"很长的部署内容。".repeat(200);
+        let skills = vec![SkillItem {
+            task_id: "t-1".into(),
+            name: "部署流程".into(),
+            content: big.clone(),
+            on: true,
+        }];
+        let p = agent_prompt_from(&store, pid, "项目一", &skills, None);
+        assert!(p.contains("部署流程"), "skill 名字必须出现在文案里");
+        assert!(
+            p.contains("skill <name> --project"),
+            "必须给出按需读取命令 tb skill <名字>"
+        );
+        assert!(!p.contains(&big), "skill 全文不许内联进文案");
+        assert!(!p.contains("很长的部署内容"), "skill 正文片段也不该进文案");
+    }
+
+    // 体积回归：skill 再大，文案恒定成本也不能跟着涨。
+    #[test]
+    fn prompt_with_huge_skill_stays_small() {
+        let store = tmp_store("skillsize");
+        let pid = "p-1";
+        let mut skills: Vec<SkillItem> = Vec::new();
+        for i in 0..20 {
+            skills.push(SkillItem {
+                task_id: format!("t-{i}"),
+                name: format!("skill-{i}"),
+                content: "x".repeat(5000),
+                on: true,
+            });
+        }
+        let p = agent_prompt_from(&store, pid, "项目一", &skills, None);
+        // 20 个 5000 字 skill 全内联会是 10 万+ 字符；只列名字应在 2 千字符上下。
+        assert!(
+            p.chars().count() < 3000,
+            "文案体积失控: {} 字符",
+            p.chars().count()
+        );
     }
 }

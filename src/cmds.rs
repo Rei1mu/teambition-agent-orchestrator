@@ -159,6 +159,20 @@ pub fn run() -> Result<(), String> {
                 );
             }
         }
+        Cmd::Skill { name, project } => {
+            // 按需读取：agent 文案里只列 skill 名字，用到哪个才来读哪个，
+            // 不再把全部 skill 全文塞进文案（那是文案 token 的最大头）。
+            let skills = list_skills(&store, &project)?;
+            let k = skills
+                .iter()
+                .find(|k| k.name == name)
+                .ok_or_else(|| {
+                    format!(
+                        "没有名为「{name}」的 skill。用 tb skills --project {project} 看有哪些"
+                    )
+                })?;
+            println!("{}", k.content);
+        }
         Cmd::SkillPush { project, file, name } => {
             let content = std::fs::read_to_string(&file).map_err(|e| format!("读文件失败: {e}"))?;
             let name = name.unwrap_or_else(|| {
