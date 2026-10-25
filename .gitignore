@@ -1,0 +1,18 @@
+# Rust 构建产物
+/target/
+tools/dlltool-shim/target/
+
+# 本地运行时数据（含 Teambition token 的 config.toml，禁止入库）
+/data/
+
+# 生成的导入库（可由 tools/gen_msvc_libs.py 重新生成，体积大）
+/tools/mingw-lib/
+/tools/msvc-lib/
+
+# 日志 / 临时文件
+*.log
+testh.s
+
+# 验证用截图（生成物，不进仓库）
+tools/*.png
+docs/ui/
