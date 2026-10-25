@@ -21,6 +21,13 @@ enum Ev {
     LoggedIn(usize),
     Err(String),
     ReloadDone(String),
+    /// GitButler/git 后台检测结果
+    GbChecked {
+        gb: crate::gitbutler::GbStatus,
+        git: Option<String>,
+    },
+    /// GitButler CLI 后台安装结果
+    GbInstalled(Result<(), String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -98,6 +105,11 @@ pub struct App {
     font_size: f32,
     // 已经应用到 egui 的字号，避免每帧重复 set_style
     applied_font: f32,
+    // GitButler 绑定（优先级高于 Teambition）：None = 还没检测完
+    gb: Option<crate::gitbutler::GbStatus>,
+    git_ver: Option<String>,
+    gb_busy: bool,
+    gb_msg: String,
 }
 
 // 按候选顺序找第一个存在的字体装上。中文放字体链最前，
@@ -189,11 +201,137 @@ impl App {
             reload_elevate: false,
             font_size,
             applied_font: 0.0,
+            gb: None,
+            git_ver: None,
+            gb_busy: false,
+            gb_msg: String::new(),
         };
         if !needs_token {
             app.reload_projects();
         }
+        // GitButler 检测放后台跑（要起子进程取版本/工作区状态），不挡窗口打开
+        app.check_gitbutler();
         app
+    }
+
+    /// 后台检测 GitButler CLI + git。
+    fn check_gitbutler(&mut self) {
+        let store = self.store.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let gb = crate::gitbutler::detect(&store);
+            let git = crate::gitbutler::git_available();
+            let _ = tx.send(Ev::GbChecked { gb, git });
+        });
+    }
+
+    /// 后台把 GitButler CLI 装到运行目录（下载 MSI 约 36MB + 抽取，比较慢）。
+    fn install_gitbutler(&mut self) {
+        self.gb_busy = true;
+        self.gb_msg = "正在安装 GitButler CLI（下载约 36MB，稍候）...".to_string();
+        let store = self.store.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let r = crate::gitbutler::install(&store).map(|_| ());
+            let _ = tx.send(Ev::GbInstalled(r));
+        });
+    }
+
+    /// GitButler 状态卡：CLI 装没装、什么版本、从哪来、当前目录配没配；
+    /// 缺的时候给「安装到运行目录」一键装。git 是它的系统级依赖，一起显示。
+    fn draw_gitbutler_card(&mut self, ui: &mut egui::Ui) {
+        // 先克隆出来，避免闭包里同时借 self 和改 self
+        let gb = self.gb.clone();
+        let mut want_check = false;
+        let mut want_install = false;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("GitButler").strong());
+                match &gb {
+                    None => {
+                        ui.spinner();
+                        ui.label("检测中...");
+                    }
+                    Some(g) if g.found => {
+                        let ver = g.version.clone().unwrap_or_else(|| "版本未知".to_string());
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0x2e, 0x7d, 0x32),
+                            format!("✓ but {ver}"),
+                        );
+                        ui.label(format!("来源: {}", g.source.map(|s| s.label()).unwrap_or("?")));
+                        match g.project_setup {
+                            Some(true) => {
+                                ui.label("· 工作区已配置");
+                            }
+                            Some(false) => {
+                                ui.label("· 当前目录未配置（but setup）");
+                            }
+                            None => {}
+                        }
+                        if ui.small_button("重新检测").clicked() {
+                            want_check = true;
+                        }
+                    }
+                    Some(_) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xc6, 0x28, 0x28),
+                            "✗ 未检测到 GitButler CLI",
+                        );
+                        ui.label("（优先级高于 Teambition，agent 靠它管分支/提交）");
+                    }
+                }
+            });
+            // git 依赖（系统级，不自动装，只引导）
+            if self.git_ver.is_none() && gb.is_some() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xc6, 0x28, 0x28),
+                        "✗ 未检测到 git（GitButler CLI 依赖它）",
+                    );
+                    if ui.small_button("复制下载页").clicked() {
+                        ui.ctx()
+                            .copy_text(crate::gitbutler::GIT_DOWNLOAD_URL.to_string());
+                    }
+                });
+            } else if let Some(v) = &self.git_ver {
+                ui.label(format!("git {v}"));
+            }
+            // 缺 CLI 时给一键安装
+            let missing = gb.as_ref().map(|g| !g.found).unwrap_or(false);
+            if missing && !self.gb_busy {
+                ui.horizontal(|ui| {
+                    if ui.button("安装到运行目录 (data/bin)").clicked() {
+                        want_install = true;
+                    }
+                    if ui.small_button("复制官方安装命令").clicked() {
+                        ui.ctx()
+                            .copy_text(crate::gitbutler::OFFICIAL_INSTALL_CMD.to_string());
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Windows 官方只发 MSI：点安装会自动下载并抽取 but.exe 到 data/bin，\
+                         无需管理员、不动注册表。官方一键命令仅 mac/linux 可用。",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+            if self.gb_busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(&self.gb_msg);
+                });
+            } else if !self.gb_msg.is_empty() {
+                ui.label(egui::RichText::new(&self.gb_msg).small().weak());
+            }
+        });
+        if want_check {
+            self.check_gitbutler();
+        }
+        if want_install {
+            self.install_gitbutler();
+        }
     }
 
     fn reload_projects(&mut self) {
@@ -334,11 +472,30 @@ impl eframe::App for App {
                     self.reload_out = text;
                     self.reload_log = crate::capability::log_tail(&self.reload_root, 15);
                 }
+                Ev::GbChecked { gb, git } => {
+                    self.gb = Some(gb);
+                    self.git_ver = git;
+                }
+                Ev::GbInstalled(r) => {
+                    self.gb_busy = false;
+                    match r {
+                        Ok(()) => {
+                            self.gb_msg = "安装完成，正在重新检测...".to_string();
+                            self.check_gitbutler();
+                        }
+                        Err(e) => {
+                            self.gb_msg = format!("安装失败: {e}");
+                        }
+                    }
+                }
             }
         }
         // 后台在工作时保持界面响应
         if self.loading_projects || self.loading_skill.is_some() || self.setup_busy || self.reload_busy
         {
+            ctx.request_repaint();
+        }
+        if self.gb_busy || self.gb.is_none() {
             ctx.request_repaint();
         }
 
@@ -448,6 +605,10 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // GitButler 状态卡：优先级高于 Teambition，哪个视图都置顶显示，
+            // 缺 CLI 时给一键安装（装到运行目录，无需管理员）。
+            self.draw_gitbutler_card(ui);
+            ui.add_space(6.0);
             if self.view == View::Settings {
                 self.draw_settings(ui);
                 return;

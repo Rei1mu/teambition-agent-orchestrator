@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod capability;
 mod cmds;
 mod config;
+mod gitbutler;
 mod mcp_server;
 mod oauth;
 mod ops;
@@ -41,6 +42,14 @@ pub enum Cmd {
         /// 切换 MCP 服务地址。已登录的 token 会保留
         #[arg(long)]
         url: Option<String>,
+    },
+    /// GitButler CLI 绑定：status 看状态 / install 装到运行目录 / path 打印路径。
+    /// 优先级高于 Teambition：缺它 TBHub 不干活
+    #[command(name = "gitbutler")]
+    GitButler {
+        /// status | install | path
+        #[arg(default_value = "status")]
+        action: String,
     },
     /// 列出企业下所有项目
     Projects,

@@ -37,7 +37,82 @@ pub fn run() -> Result<(), String> {
     }
     // 不带子命令（双击 tb / 直接 tb）→ 打开 GUI 窗口。agent 调用一律走显式子命令(CLI)。
     let cmd = cli.cmd.unwrap_or(Cmd::Ui);
+
+    // GitButler 优先于 Teambition：每次启动先过这一关。
+    // agent 靠 GitButler CLI 管分支/提交，缺它后面全白跑；git 是它的系统级依赖。
+    // 例外：
+    //   - gitbutler 子命令本身（就是用来装/查它的）
+    //   - config/login/logout（引导前置）
+    //   - ui（**关键**：窗口本身就是「显示状态 + 一键安装」的入口，
+    //     拦掉它用户就没地方点安装了。窗口里会用状态卡自己检测）
+    // TB_SKIP_GITBUTLER=1 可强制跳过（排查问题用）。
+    let gb_exempt = matches!(
+        &cmd,
+        Cmd::GitButler { .. }
+            | Cmd::Config { .. }
+            | Cmd::Login { .. }
+            | Cmd::Logout { .. }
+            | Cmd::Ui
+    );
+    if !gb_exempt && std::env::var("TB_SKIP_GITBUTLER").is_err() {
+        let gb = crate::gitbutler::detect(&store);
+        let git_ver = crate::gitbutler::git_available();
+        if !gb.found || git_ver.is_none() {
+            crate::gitbutler::print_missing_guidance(&gb, &git_ver);
+            let mut missing = Vec::new();
+            if !gb.found {
+                missing.push("GitButler CLI");
+            }
+            if git_ver.is_none() {
+                missing.push("git");
+            }
+            return Err(format!("缺少 {}（优先级高于 Teambition，先装上）", missing.join(" 和 ")));
+        }
+    }
+
     match cmd {
+        Cmd::GitButler { action } => match action.as_str() {
+            "status" => {
+                let gb = crate::gitbutler::detect(&store);
+                if gb.found {
+                    let ver = gb.version.clone().unwrap_or_else(|| "版本未知".to_string());
+                    println!(
+                        "✓ GitButler CLI {ver} · 来源: {} · {}",
+                        gb.source.map(|s| s.label()).unwrap_or("?"),
+                        gb.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                    );
+                    match gb.project_setup {
+                        Some(true) => println!("  当前目录已是 GitButler 项目"),
+                        Some(false) => println!("  当前目录还没配置（跑 but setup 把它纳入 GitButler）"),
+                        None => {}
+                    }
+                } else {
+                    let git_ver = crate::gitbutler::git_available();
+                    crate::gitbutler::print_missing_guidance(&gb, &git_ver);
+                    return Err("未检测到 GitButler CLI".to_string());
+                }
+                match crate::gitbutler::git_available() {
+                    Some(v) => println!("✓ git {v}"),
+                    None => {
+                        println!("✗ 未检测到 git: {}", crate::gitbutler::GIT_DOWNLOAD_URL);
+                        return Err("未检测到 git".to_string());
+                    }
+                }
+            }
+            "install" => {
+                crate::gitbutler::install(&store)?;
+            }
+            "path" => {
+                let gb = crate::gitbutler::detect(&store);
+                match gb.path {
+                    Some(p) => println!("{}", p.display()),
+                    None => return Err("未检测到 GitButler CLI".to_string()),
+                }
+            }
+            other => {
+                return Err(format!("未知动作: {other}（status / install / path）"));
+            }
+        },
         Cmd::Login { token } => {
             crate::oauth::login(&store, token)?;
         }
