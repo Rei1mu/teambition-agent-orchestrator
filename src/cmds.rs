@@ -32,10 +32,12 @@ pub fn run() -> Result<(), String> {
     // 任何命令启动都顺带给「本会话占着的 running 任务」刷一次心跳：
     // 会话还活着（还在跑 tb）就不该被当成僵尸回收，长构建期间尤其需要。
     // sweep / hello 除外——sweep 是来回收的，先续命就回收不掉了。
-    if !matches!(&cli.cmd, Cmd::Sweep { .. } | Cmd::Hello { .. }) {
+    if !matches!(&cli.cmd, Some(Cmd::Sweep { .. }) | Some(Cmd::Hello { .. })) {
         store.beat_agent(&current_agent());
     }
-    match cli.cmd {
+    // 不带子命令（双击 tb / 直接 tb）→ 打开 GUI 窗口。agent 调用一律走显式子命令(CLI)。
+    let cmd = cli.cmd.unwrap_or(Cmd::Ui);
+    match cmd {
         Cmd::Login { token } => {
             crate::oauth::login(&store, token)?;
         }
@@ -100,11 +102,44 @@ pub fn run() -> Result<(), String> {
             }
         }
         Cmd::Init { project } => {
+            // 列名统一数字 1..5：顺手把本地 config 的 tasklist_* 归一到默认值
+            // （load-modify-save，token 不动）。老 config 若是中文列名，这里纠偏。
+            let mut cfg = store.load_config();
+            cfg.tasklist_queue = DEFAULT_TASKLIST_QUEUE.to_string();
+            cfg.tasklist_claim = DEFAULT_TASKLIST_CLAIM.to_string();
+            cfg.tasklist_wait = DEFAULT_TASKLIST_WAIT.to_string();
+            cfg.tasklist_done = DEFAULT_TASKLIST_DONE.to_string();
+            cfg.tasklist_closed = DEFAULT_TASKLIST_CLOSED.to_string();
+            store.save_config(&cfg)?;
+
             let mut ctx = Ctx::new(store.clone(), false)?;
             let stages = ctx.ensure_stages(&project)?;
-            println!("项目 {project} 的阶段:");
+            println!("项目 {project} 的阶段（工作流状态，已自动补齐）:");
             for s in &stages {
                 println!("  {}\t{}", s.id, s.name);
+            }
+
+            // 看板列：网页 API 不能建/改名列，只能手动建。校验 5 个数字列 1..5 齐全，
+            // 不齐就引导用户去 Teambition 网页手动补。
+            let lists = ctx.task_lists(&project).unwrap_or_default();
+            let names: Vec<&str> = lists.iter().map(|l| l.name.as_str()).collect();
+            let ok = tasklists_ready(&names);
+            println!(
+                "\n看板列（任务列表，网页维护）: 找到 {} 个 -> {}",
+                lists.len(),
+                if names.is_empty() { "(无)".to_string() } else { names.join(", ") }
+            );
+            if ok {
+                println!("  ✓ 5 个数字列 1/2/3/4/5 齐全，本地列配置已设为 1/2/3/4/5。");
+            } else {
+                println!("  ✗ 数字列不齐。Teambition 网页 API 建不了列，请手动去项目看板补足，");
+                println!("    名字就用数字、按顺序建（别改中文，太麻烦）:");
+                println!("      列 1 = 待处理  （队列：没人接的任务）");
+                println!("      列 2 = 进行中  （agent 正在干）");
+                println!("      列 3 = 待回复  （等用户在 Teambition 评论回复）");
+                println!("      列 4 = 已解决  （已完成）");
+                println!("      列 5 = 关闭    （作废）");
+                println!("    建好后重跑一次 tb init 校验。");
             }
         }
         Cmd::Skills { project } => {

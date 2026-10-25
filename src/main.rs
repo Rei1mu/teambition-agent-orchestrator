@@ -18,8 +18,10 @@ mod ui;
     about = "TBHub - Teambition 共享 Skill / 任务中枢 (CLI + MCP + 窗口)"
 )]
 pub struct Cli {
+    // 子命令可选：不带参数直接跑 = 打开 GUI（双击 tb / 直接 tb 即窗口）。
+    // agent 调用一律用显式子命令走 CLI。
     #[command(subcommand)]
-    pub cmd: Cmd,
+    pub cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]

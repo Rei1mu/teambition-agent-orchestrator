@@ -27,13 +27,28 @@ pub const TASK_TYPE_SKILL: &str = "skill";
 // 所以这里按「列名」引用，列名对不上就跳过移列（只改状态），不阻断流程。
 // 语义：列1=队列(没人接) / 列2=agent 正在干 / 列3=球在用户那 / 列4=已解决 / 列5=关闭。
 //
-// 默认用中文列名而不是数字：列名不存在时只会「跳过移列」，
-// 而用数字（1..4）在只有 4 列的旧项目上会把「已解决」错移进「关闭」列。
-pub const DEFAULT_TASKLIST_QUEUE: &str = "待处理";
-pub const DEFAULT_TASKLIST_CLAIM: &str = "进行中";
-pub const DEFAULT_TASKLIST_WAIT: &str = "待回复";
-pub const DEFAULT_TASKLIST_DONE: &str = "已解决";
-pub const DEFAULT_TASKLIST_CLOSED: &str = "关闭";
+// 列名统一用数字 1..5（用户拍板：不折腾中文列名）。tb init 会校验项目里有这 5 个
+// 数字列，缺列就引导用户去 Teambition 网页手动建（网页 API 建不了列）。
+pub const DEFAULT_TASKLIST_QUEUE: &str = "1";
+pub const DEFAULT_TASKLIST_CLAIM: &str = "2";
+pub const DEFAULT_TASKLIST_WAIT: &str = "3";
+pub const DEFAULT_TASKLIST_DONE: &str = "4";
+pub const DEFAULT_TASKLIST_CLOSED: &str = "5";
+
+// 期望的 5 个数字列名（顺序即语义，跟上面五个 DEFAULT_ 对齐）。
+pub const TASKLIST_WANT: [&str; 5] = [
+    DEFAULT_TASKLIST_QUEUE,
+    DEFAULT_TASKLIST_CLAIM,
+    DEFAULT_TASKLIST_WAIT,
+    DEFAULT_TASKLIST_DONE,
+    DEFAULT_TASKLIST_CLOSED,
+];
+
+/// 项目现有列名是否覆盖了 5 个数字列。顺序不强制，只要有这 5 个名字即可。
+/// tb init 用它判断要不要引导用户去网页手动补列。
+pub fn tasklists_ready(names: &[&str]) -> bool {
+    TASKLIST_WANT.iter().all(|w| names.contains(w))
+}
 
 // 会话心跳阈值（秒）。running 状态的 claim 超过这个时间没续命，
 // 就判定「会话已断开」，回滚成 待处理 + 列1。waiting 状态永不超时。
@@ -160,3 +175,31 @@ impl Config {
 
 // 本地 skill 开关。project_id -> (skill 名 -> 开关)。只存本地。
 pub type Switches = HashMap<String, HashMap<String, bool>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tasklists_ready_accepts_1_to_5() {
+        assert!(tasklists_ready(&["1", "2", "3", "4", "5"]));
+    }
+
+    #[test]
+    fn tasklists_ready_tolerates_extra_and_order() {
+        // 顺序不强制、允许多余列：只要有这 5 个数字即可。
+        assert!(tasklists_ready(&["5", "4", "3", "2", "1", "归档"]));
+    }
+
+    #[test]
+    fn tasklists_ready_rejects_missing_column() {
+        // 旧项目只有 4 列，缺「5」→ 不齐，引导补列。
+        assert!(!tasklists_ready(&["1", "2", "3", "4"]));
+    }
+
+    #[test]
+    fn tasklists_ready_rejects_chinese_names() {
+        // 用户拍板用数字；中文列名视为不齐，引导改成数字。
+        assert!(!tasklists_ready(&["待处理", "进行中", "待回复", "已解决", "关闭"]));
+    }
+}
