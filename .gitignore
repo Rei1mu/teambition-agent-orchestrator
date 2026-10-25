@@ -16,3 +16,10 @@ testh.s
 # 验证用截图（生成物，不进仓库）
 tools/*.png
 docs/ui/
+
+# agent 运行时记忆（本地，禁止入库）
+.workbuddy-ai/
+
+# 已禁用的 GUI 自验脚本（合成点击 / 截屏），不进仓库
+tools/shot_main.py
+tools/ui_act.py
