@@ -117,7 +117,7 @@ impl Tb {
             json!({
                 "protocolVersion": "2025-03-26",
                 "capabilities": {},
-                "clientInfo": {"name": "tbhub", "version": "0.1.0"}
+                "clientInfo": {"name": "tba", "version": "0.1.0"}
             }),
         )?;
         self.notify("notifications/initialized");

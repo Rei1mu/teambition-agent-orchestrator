@@ -1,4 +1,4 @@
-use crate::config::{Config, Switches};
+use crate::config::{Config, Switches, TbMemory};
 use serde::{Deserialize, Serialize};
 
 use std::path::PathBuf;
@@ -16,11 +16,11 @@ pub struct Claim {
     pub cwd: String,
     // 生命周期状态：
     //   running  - agent 正在干（进行中 + 列2），参与心跳超时判定
-    //   waiting  - 已向用户提问，等回复（待处理 + 列2），**永不超时回收**
+    //   waiting  - 已向用户提问，等回复（未完成 + 列2），**永不超时回收**
     //   done     - 已解决（列3）
     //   closed   - 关闭（列4）
-    //   reverted - 会话异常断开，已被 sweep 回滚（待处理 + 列1）
-    //   released - agent 主动放弃（待处理 + 列1）
+    //   reverted - 会话异常断开，已被 sweep 回滚（未完成 + 列1）
+    //   released - agent 主动放弃（未完成 + 列1）
     //   failed   - 记账后移动状态失败
     // 兼容旧台账：早期版本写的是 claimed，等价于 running。
     pub state: String,
@@ -77,6 +77,17 @@ pub struct ClaimLock {
 }
 
 impl Drop for ClaimLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+// 共享记忆目录的写锁持有者。同样是 OS 文件锁，Drop 或进程退出时自动释放。
+pub struct MemoryLock {
+    file: std::fs::File,
+}
+
+impl Drop for MemoryLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
     }
@@ -350,9 +361,77 @@ impl Store {
         let _ = std::fs::remove_file(self.sessions_dir().join(format!("{tag}.hb")));
     }
 
+    // ---- 等待心跳（判断「有人正在等回复」）----
+    //
+    // ask / wait 阻塞期间每轮写一次这个文件，进程被 kill（或者 agent 把命令丢进
+    // 后台、会话结束后被清理）就停止刷新。据此判断「任务在等，但没人接了」。
+    //
+    // 为什么不复用 claims.jsonl 里的 heartbeat_at：
+    //   那个是「会话活着」的信号（agent 在干活也会刷新）；
+    //   这个是「有人正阻塞在等回复」的信号。两者生命周期不同，混用会互相误判。
+    pub fn waits_dir(&self) -> PathBuf {
+        self.root.join("waits")
+    }
+
+    // 记一次「我在等」。内容两行：pid + 时间戳（pid 只用于排查，不参与判定）。
+    pub fn wait_touch(&self, claim_id: &str) {
+        let d = self.waits_dir();
+        let _ = std::fs::create_dir_all(&d);
+        let _ = std::fs::write(
+            d.join(format!("{claim_id}.wait")),
+            format!("{}\n{}", std::process::id(), now()),
+        );
+    }
+
+    pub fn wait_drop(&self, claim_id: &str) {
+        let _ = std::fs::remove_file(self.waits_dir().join(format!("{claim_id}.wait")));
+    }
+
+    // 距上次刷新多少秒。None = 文件不存在（从没等过，或已被清理）。
+    pub fn wait_age(&self, claim_id: &str) -> Option<i64> {
+        let s = std::fs::read_to_string(self.waits_dir().join(format!("{claim_id}.wait"))).ok()?;
+        let ts = s.lines().nth(1)?.trim().to_string();
+        Some(age_secs(&ts))
+    }
+
     // ---- shared project memory ----
+    pub fn project_dir(&self, project_id: &str) -> PathBuf {
+        self.root.join("projects").join(project_id)
+    }
+
+    // ---- tb 共享记忆开关（项目级，独立文件）----
+    //
+    // 读失败/文件不存在一律返回默认（enabled=false），不让开关文件损坏把命令卡死。
+    pub fn load_tb_memory(&self, project_id: &str) -> TbMemory {
+        let path = self.project_dir(project_id).join("tb-memory.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(s) => toml::from_str(&s).unwrap_or_default(),
+            Err(_) => TbMemory::default(),
+        }
+    }
+
+    // 写开关：先写临时文件再 rename，读的一方只会看到完整旧版或完整新版。
+    pub fn save_tb_memory(&self, project_id: &str, m: &TbMemory) -> Result<(), String> {
+        let dir = self.project_dir(project_id);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let s = toml::to_string_pretty(m).map_err(|e| e.to_string())?;
+        let path = dir.join("tb-memory.toml");
+        let tmp = dir.join(".tb-memory.toml.tmp");
+        std::fs::write(&tmp, s).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("保存 tb-memory.toml 失败: {e}")
+        })
+    }
+
     pub fn memory_dir(&self, project_id: &str) -> PathBuf {
         self.root.join("projects").join(project_id).join("memory")
+    }
+
+    // skill / mem 的本地导出目录：data/projects/<id>/skillmem/
+    // 里面就两个文件（skill.md / mem.md），每次导出整份重写。
+    pub fn skillmem_dir(&self, project_id: &str) -> PathBuf {
+        self.project_dir(project_id).join("skillmem")
     }
 
     pub fn write_memory(
@@ -365,23 +444,91 @@ impl Store {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let name = file.unwrap_or("notes.md");
         let path = dir.join(name);
-        std::fs::write(&path, content).map_err(|e| e.to_string())?;
-        Ok(path)
+        let _lock = self.lock_memory(project_id)?;
+        // 先写临时文件再 rename：读的一方只会看到「旧的完整版」或「新的完整版」，
+        // 不会读到写了一半的内容。直接 fs::write 覆盖时并发读会读到截断文件。
+        let tmp = dir.join(format!(".{name}.tmp"));
+        std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
+        // Windows 上 rename 撞到「别人正打开目标文件」会报共享冲突，
+        // 重试几次就过去了（读方只开着文件几毫秒）。
+        let mut last = String::new();
+        for _ in 0..10 {
+            match std::fs::rename(&tmp, &path) {
+                Ok(()) => return Ok(path),
+                Err(e) => {
+                    last = e.to_string();
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+        Err(format!("替换 {name} 失败（可能被别的程序占着）: {last}"))
     }
 
     pub fn append_memory(&self, project_id: &str, content: &str) -> Result<PathBuf, String> {
         let dir = self.memory_dir(project_id);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join("notes.md");
+        let _lock = self.lock_memory(project_id)?;
+        let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        // **先拼成一个字符串，再单次 write_all**。
+        // 以前直接 `writeln!(f, "...")`：格式化会把字面量和参数拆成 5 次 write，
+        // 两个 agent 同时追加时中间就能插进别人的内容，记录会交错成乱码。
+        let block = format!("\n## {stamp}\n{content}\n");
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(|e| e.to_string())?;
-        let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        writeln!(f, "\n## {stamp}\n{content}\n").map_err(|e| e.to_string())?;
+        f.write_all(block.as_bytes()).map_err(|e| e.to_string())?;
+        f.flush().map_err(|e| e.to_string())?;
         Ok(path)
+    }
+
+    // 共享记忆目录的写锁。
+    //
+    // 记忆目录是**按项目**共享的（所有任务、所有 agent 都写同一份 notes.md），
+    // 所以并发写入必须串行。跟台账锁同一个思路：OS 文件锁，进程崩溃自动释放，
+    // 不会留僵尸锁把后续所有命令卡死。
+    fn lock_memory(&self, project_id: &str) -> Result<MemoryLock, String> {
+        let dir = self.memory_dir(project_id);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        self.lock_path(&dir.join(".write.lock"), "共享记忆目录写锁")
+    }
+
+    // 项目级写锁：projects/<id>/<name>。
+    //
+    // 用途之一：两个 agent 同时发现「项目没有记忆任务」→ 各建一条。
+    // 把「查→建」整段包进这把锁，同机就不会重复建（跨机仍可能，靠多条告警兜底）。
+    #[allow(dead_code)] // 保留：通用项目级文件锁，未来并发场景要用
+    pub fn lock_project(&self, project_id: &str, name: &str) -> Result<MemoryLock, String> {
+        let dir = self.project_dir(project_id);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        self.lock_path(&dir.join(name), "项目写锁")
+    }
+
+    fn lock_path(&self, path: &std::path::Path, label: &str) -> Result<MemoryLock, String> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| format!("打开{label}失败: {e}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(MemoryLock { file }),
+                Err(_) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "另一个 tb 进程正占着{label}（等了 10 秒），稍后重试"
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
     }
 
     pub fn read_memory(&self, project_id: &str) -> Vec<(String, String)> {
@@ -397,6 +544,10 @@ impl Store {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
+                    // 跳过锁文件和临时文件：它们不是「记忆」，不该出现在 tb memory 里。
+                    if name.starts_with('.') || name.ends_with(".tmp") {
+                        continue;
+                    }
                     if let Ok(s) = std::fs::read_to_string(&p) {
                         out.push((name, s));
                     }

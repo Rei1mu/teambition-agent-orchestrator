@@ -28,7 +28,7 @@
 #    -StatusFile       also write the result line to this file
 #
 #  Toolchain paths can be overridden by env vars:
-#    TB_MSVC_BIN / TB_MSVC_LIB / TB_SDK_LIB / TB_EXTRA_LIB / TB_CARGO
+#    TBA_MSVC_BIN / TBA_MSVC_LIB / TBA_SDK_LIB / TBA_EXTRA_LIB / TBA_CARGO
 #
 #  NOTE: keep this file pure ASCII. PowerShell 5.1 decodes BOM-less files as
 #  ANSI, and a trailing multi-byte char can swallow the following newline.
@@ -79,11 +79,11 @@ if (-not (Test-Path $TARGET)) { New-Item -ItemType Directory -Force -Path $TARGE
 $LOG = Join-Path $TARGET "reload.log"
 
 # ---- toolchain ----
-$MSVC_BIN = if ($env:TB_MSVC_BIN) { $env:TB_MSVC_BIN } else { "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64" }
-$MSVC_LIB = if ($env:TB_MSVC_LIB) { $env:TB_MSVC_LIB } else { "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.44.35207\lib\x64" }
-$SDK_LIB  = if ($env:TB_SDK_LIB)  { $env:TB_SDK_LIB }  else { "D:\d\winsdk_libs" }
-$EXTRA_LIB = $env:TB_EXTRA_LIB
-$CARGO    = if ($env:TB_CARGO) { $env:TB_CARGO } else { "C:\Users\user\.cargo\bin\cargo.exe" }
+$MSVC_BIN = if ($env:TBA_MSVC_BIN) { $env:TBA_MSVC_BIN } else { "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64" }
+$MSVC_LIB = if ($env:TBA_MSVC_LIB) { $env:TBA_MSVC_LIB } else { "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.44.35207\lib\x64" }
+$SDK_LIB  = if ($env:TBA_SDK_LIB)  { $env:TBA_SDK_LIB }  else { "D:\d\winsdk_libs" }
+$EXTRA_LIB = $env:TBA_EXTRA_LIB
+$CARGO    = if ($env:TBA_CARGO) { $env:TBA_CARGO } else { "C:\Users\user\.cargo\bin\cargo.exe" }
 
 # ---- exe base name: [[bin]] name > default-run > [package] name > dir name ----
 if (-not $Name) {

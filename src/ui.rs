@@ -1,4 +1,7 @@
-use crate::ops::{agent_prompt_from, draft_for_mode, list_skills, CopyMode, SkillItem};
+use crate::ops::{
+    agent_prompt_from, draft_for_mode, ensure_memory_state, export_skill_mem, list_skills,
+    open_folder, CopyMode, Lang, SkillItem,
+};
 use crate::oauth::TOKEN_PAGE;
 use crate::store::Store;
 use eframe::egui;
@@ -28,6 +31,12 @@ enum Ev {
     },
     /// GitButler CLI 后台安装结果
     GbInstalled(Result<(), String>),
+    /// 测试邮件发送结果
+    MailSent(Result<(), String>),
+    /// 记忆分片初始化结果（含状态摘要）
+    MemInit(Result<String, String>),
+    /// 导出 skill / mem 到本地 skillmem 目录的结果
+    SkillMem(Result<String, String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -84,7 +93,7 @@ pub struct App {
     setup_busy: bool,
     projects: Vec<(String, String)>,
     skills: HashMap<String, Vec<SkillItem>>,
-    // 每个项目卡片的「本次任务」草稿。留空 = 让 agent 去队列（列「待处理」）领。
+    // 每个项目卡片的「本次任务」草稿。留空 = 让 agent 去队列（列「未完成」）领。
     task_drafts: HashMap<String, String>,
     open: HashMap<String, bool>,
     loading_projects: bool,
@@ -110,6 +119,107 @@ pub struct App {
     git_ver: Option<String>,
     gb_busy: bool,
     gb_msg: String,
+    // 邮件配置表单（SMTP 发信 / IMAP 收信）。保存时 load-modify-save，不碰 token。
+    mail: MailForm,
+    mail_busy: bool,
+    // 「待回复」等待与轮询参数。同样用表单存，避免输入中间态把 u64 解析搞崩。
+    wait: WaitForm,
+    // 记忆分片初始化在跑（建任务 + 写字段要联网，走后台线程）
+    mem_busy: bool,
+    // 正在导出 skill/mem 的项目 id（导出要联网拉 skill + 记忆，走后台线程）
+    skillmem_busy: Option<String>,
+}
+
+// 设置页的邮件表单。端口用 String 存，方便输入中间态（空/半个数字）。
+#[derive(Clone, Default)]
+struct MailForm {
+    smtp_host: String,
+    smtp_port: String,
+    smtp_user: String,
+    smtp_pass: String,
+    smtp_from: String,
+    mail_to: String,
+    mail_on_ask: bool,
+    imap_host: String,
+    imap_port: String,
+}
+
+impl MailForm {
+    fn from_cfg(cfg: &crate::config::Config) -> MailForm {
+        MailForm {
+            smtp_host: cfg.smtp_host.clone(),
+            smtp_port: cfg.smtp_port.to_string(),
+            smtp_user: cfg.smtp_user.clone(),
+            smtp_pass: cfg.smtp_pass.clone(),
+            smtp_from: cfg.smtp_from.clone(),
+            mail_to: cfg.mail_to.clone(),
+            mail_on_ask: cfg.mail_on_ask,
+            imap_host: cfg.imap_host.clone(),
+            imap_port: cfg.imap_port.to_string(),
+        }
+    }
+
+    // 写回配置（只改邮件字段，其余原样保留）。
+    fn apply_to(&self, cfg: &mut crate::config::Config) {
+        cfg.smtp_host = self.smtp_host.trim().to_string();
+        cfg.smtp_port = self
+            .smtp_port
+            .trim()
+            .parse()
+            .unwrap_or(crate::config::DEFAULT_SMTP_PORT);
+        cfg.smtp_user = self.smtp_user.trim().to_string();
+        cfg.smtp_pass = self.smtp_pass.clone();
+        cfg.smtp_from = self.smtp_from.trim().to_string();
+        cfg.mail_to = self.mail_to.trim().to_string();
+        cfg.mail_on_ask = self.mail_on_ask;
+        cfg.imap_host = self.imap_host.trim().to_string();
+        cfg.imap_port = self
+            .imap_port
+            .trim()
+            .parse()
+            .unwrap_or(crate::config::DEFAULT_IMAP_PORT);
+    }
+}
+
+// 设置页的等待/轮询表单。用 String 存，理由同上：输入「5」再输入「40」的中间态
+// 不能当成非法值直接崩掉。
+#[derive(Clone, Default)]
+struct WaitForm {
+    timeout_secs: String,
+    interval_secs: String,
+    mail_poll_secs: String,
+}
+
+impl WaitForm {
+    fn from_cfg(cfg: &crate::config::Config) -> WaitForm {
+        WaitForm {
+            timeout_secs: cfg.wait_timeout_secs.to_string(),
+            interval_secs: cfg.wait_interval_secs.to_string(),
+            mail_poll_secs: cfg.mail_poll_secs.to_string(),
+        }
+    }
+
+    // 空/非法就回落到默认值，别把配置写成 0；合法但过小的也夹到下限。
+    fn apply_to(&self, cfg: &mut crate::config::Config) {
+        cfg.wait_timeout_secs = self
+            .timeout_secs
+            .trim()
+            .parse()
+            .unwrap_or(crate::config::DEFAULT_WAIT_TIMEOUT_SECS)
+            .max(crate::config::MIN_WAIT_TIMEOUT_SECS);
+        cfg.wait_interval_secs = self
+            .interval_secs
+            .trim()
+            .parse()
+            .unwrap_or(crate::config::DEFAULT_WAIT_INTERVAL_SECS)
+            .max(crate::config::MIN_WAIT_INTERVAL_SECS);
+        cfg.mail_poll_secs = self
+            .mail_poll_secs
+            .trim()
+            .parse()
+            .unwrap_or(crate::config::DEFAULT_MAIL_POLL_SECS)
+            .max(crate::config::MIN_MAIL_POLL_SECS);
+    }
 }
 
 // 按候选顺序找第一个存在的字体装上。中文放字体链最前，
@@ -159,7 +269,7 @@ impl App {
         let reload_root = crate::capability::guess_root();
         let reload_name = crate::capability::guess_name(&reload_root);
         let reload_live = crate::capability::default_live(&reload_root, &reload_name);
-        let reload_args = if reload_name == "tb" {
+        let reload_args = if reload_name == "tba" {
             "ui".to_string()
         } else {
             String::new()
@@ -167,6 +277,8 @@ impl App {
         let last = crate::capability::last_status();
         let prefs = load_prefs(&store);
         let font_size = prefs.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        // 邮件表单要预填，先读一份配置（store 之后会被 move 进 App）。
+        let store_cfg = store.load_config();
         let mut app = App {
             store,
             tx,
@@ -205,6 +317,11 @@ impl App {
             git_ver: None,
             gb_busy: false,
             gb_msg: String::new(),
+            mail: MailForm::from_cfg(&store_cfg),
+            mail_busy: false,
+            wait: WaitForm::from_cfg(&store_cfg),
+            mem_busy: false,
+            skillmem_busy: None,
         };
         if !needs_token {
             app.reload_projects();
@@ -488,11 +605,43 @@ impl eframe::App for App {
                         }
                     }
                 }
+                Ev::MailSent(r) => {
+                    self.mail_busy = false;
+                    self.status = match r {
+                        Ok(()) => "测试邮件已发出，去收件箱看看（没收到就看垃圾箱/端口是否 465/587）。"
+                            .to_string(),
+                        Err(e) => format!("测试邮件发送失败: {e}"),
+                    };
+                }
+                Ev::MemInit(r) => {
+                    self.mem_busy = false;
+                    self.status = match r {
+                        Ok(s) => format!("记忆分片已就绪\n{s}"),
+                        Err(e) => format!("初始化记忆分片失败: {e}"),
+                    };
+                }
+                Ev::SkillMem(r) => {
+                    self.skillmem_busy = None;
+                    self.status = match r {
+                        Ok(s) => s,
+                        Err(e) => format!("导出 skill/mem 失败: {e}"),
+                    };
+                }
             }
         }
         // 后台在工作时保持界面响应
-        if self.loading_projects || self.loading_skill.is_some() || self.setup_busy || self.reload_busy
+        if self.loading_projects
+            || self.loading_skill.is_some()
+            || self.setup_busy
+            || self.reload_busy
+            || self.skillmem_busy.is_some()
         {
+            ctx.request_repaint();
+        }
+        if self.mail_busy {
+            ctx.request_repaint();
+        }
+        if self.mem_busy {
             ctx.request_repaint();
         }
         if self.gb_busy || self.gb.is_none() {
@@ -598,6 +747,23 @@ impl eframe::App for App {
                     if ui.button("重新登录").clicked() {
                         self.logout();
                     }
+                    // 本地一个项目都没有时用这份：发给 agent，让它自己判断
+                    // 它跑的那个仓库在 Teambition 建没建，没建就建。
+                    // 所以这里不带项目名——名字由 agent 用所在目录名决定。
+                    if ui
+                        .button("复制项目初始化文案")
+                        .on_hover_text(
+                            "还没有 Teambition 项目时用：把这段发给 agent，它会在所在仓库跑 \
+                             tb ensure-project，先判断项目建没建，没有就新建（项目名默认取目录名）",
+                        )
+                        .clicked()
+                    {
+                        let text = crate::ops::init_prompt(&self.store, None, Lang::Zh);
+                        ui.ctx().copy_text(text);
+                        self.status = "已复制项目初始化文案：发给 agent，它会自己判断项目建没建、\
+                                       没建就用仓库目录名新建。"
+                            .to_string();
+                    }
                 }
             });
             ui.label(&self.status);
@@ -610,11 +776,21 @@ impl eframe::App for App {
             self.draw_gitbutler_card(ui);
             ui.add_space(6.0);
             if self.view == View::Settings {
-                self.draw_settings(ui);
+                // 设置页比一屏高（尤其字号调到 22+ 时），不套滚动区的话
+                // 下面的「IMAP 主机」和保存/测试按钮会被直接裁掉，看着就像「只有 SMTP」。
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.draw_settings(ui);
+                    });
                 return;
             }
             if self.view == View::Reload {
-                self.draw_reload(ui);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.draw_reload(ui);
+                    });
                 return;
             }
             if self.needs_token {
@@ -632,10 +808,11 @@ impl eframe::App for App {
                 }
                 let projects = self.projects.clone();
                 let mut to_load: Option<String> = None;
-                // Option 三元组: 项目id, 项目名, 复制模式。
+                // Option 四元组: 项目id, 项目名, 复制模式, 文案语言。
                 // CopyMode::Queue => 复制「领列1任务」文案（忽略本次任务草稿）；
                 // CopyMode::ThisTask => 复制「本次任务」文案（有草稿就带草稿）。
-                let mut to_copy: Option<(String, String, CopyMode)> = None;
+                // Lang::Zh 是准本（内容完整），Lang::En 是压缩英文版（省 token）。
+                let mut to_copy: Option<(String, String, CopyMode, Lang)> = None;
                 for (pid, pname) in projects {
                     let pid = pid.clone();
                     let pname = pname.clone();
@@ -655,8 +832,68 @@ impl eframe::App for App {
                         let rows = self.skills.get(&pid).cloned().unwrap_or_default();
                         let loading = self.loading_skill.as_deref() == Some(pid.as_str());
                         ui.indent(pid.clone(), |ui| {
+                            // ---- tb 共享记忆（项目级开关）----
+                            //
+                            // 开关存 projects/<id>/tb-memory.toml，**不碰 config.toml**
+                            // （那里有 token，整体覆写风险太大）。
+                            // 记忆正文存在 Teambition「项目记忆 N · 节名」各分片任务的
+                            // 富文本自定义字段里：云端、跨设备、网页上直接可看可改。
+                            // 分片是必须的——RTF 单字段实测上限 9999 字符。
+                            let mut tbm = self.store.load_tb_memory(&pid);
+                            let mut toggled = None;
+                            ui.horizontal(|ui| {
+                                let r = ui.checkbox(&mut tbm.enabled, "启用 tb 共享记忆");
+                                if r.changed() {
+                                    toggled = Some(tbm.enabled);
+                                }
+                                ui.label("（存 Teambition 状态为 mem 的任务备注，一条记忆一条任务）");
+                            });
+                            if let Some(on) = toggled {
+                                if let Err(e) = self.store.save_tb_memory(&pid, &tbm) {
+                                    self.status = format!("保存开关失败: {e}");
+                                } else {
+                                    self.status = format!(
+                                        "「{}」共享记忆已{}",
+                                        pname,
+                                        if on { "开启" } else { "关闭" }
+                                    );
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label(format!("记忆状态: {}", tbm.state()));
+                                if ui
+                                    .add_enabled(!self.mem_busy, egui::Button::new("初始化状态"))
+                                    .on_hover_text(
+                                        "确保项目里有这个工作流状态（没有就用 taskflow-update 建），幂等",
+                                    )
+                                    .clicked()
+                                {
+                                    self.mem_busy = true;
+                                    let store = self.store.clone();
+                                    let tx = self.tx.clone();
+                                    let pid2 = pid.clone();
+                                    thread::spawn(move || {
+                                        let r = (|| -> Result<String, String> {
+                                            let st = ensure_memory_state(&store, &pid2)?;
+                                            Ok(format!("状态: {st}\n（已就绪，可以 tba memory --append 加记忆）"))
+                                        })();
+                                        let _ = tx.send(Ev::MemInit(r));
+                                    });
+                                }
+                                if self.mem_busy {
+                                    ui.spinner();
+                                }
+                            });
+                            if tbm.enabled {
+                                ui.label(
+                                    "⚠️ 建议同时关闭 agent 自带的记忆（如 .workbuddy-ai/memory/MEMORY.md），\
+                                     否则两份记忆会打架。tb 不会代你改它们的文件。",
+                                );
+                            } else {
+                                ui.label("关着：tb 不读云端记忆，开工文案里也不加读记忆的指令。");
+                            }
                             ui.label(format!(
-                                "共享记忆目录: {}",
+                                "旧本地记忆目录: {}",
                                 self.store.memory_dir(&pid).display()
                             ));
                             ui.add_space(4.0);
@@ -686,7 +923,59 @@ impl eframe::App for App {
                                 }
                             }
                             ui.add_space(6.0);
-                            ui.label("本次任务（留空 = 让 agent 去队列「待处理」领）:");
+                            // 导出：把云端 skill / mem 拉成本地两个 md，人可以直接看
+                            // 「agent 读到的到底是什么样」。下载 = 重新拉一遍覆盖本地。
+                            ui.horizontal_wrapped(|ui| {
+                                let busy = self.skillmem_busy.as_deref() == Some(pid.as_str());
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("下载 skill+mem 到本地"))
+                                    .on_hover_text(
+                                        "从 Teambition 重新拉一次，写成 data/projects/<id>/skillmem/\
+                                         skill.md 和 mem.md（多个 skill、多条记忆都合并进去）",
+                                    )
+                                    .clicked()
+                                {
+                                    self.skillmem_busy = Some(pid.clone());
+                                    let store = self.store.clone();
+                                    let tx = self.tx.clone();
+                                    let pid2 = pid.clone();
+                                    let pname2 = pname.clone();
+                                    thread::spawn(move || {
+                                        let r = export_skill_mem(&store, &pid2, &pname2).map(|r| {
+                                            format!(
+                                                "已下载：skill {} 个（启用 {}）、记忆 {} 条 {} 字\n{}\n{}",
+                                                r.skill_count,
+                                                r.skill_on,
+                                                r.mem_count,
+                                                r.mem_chars,
+                                                r.skill_file.display(),
+                                                r.mem_file.display()
+                                            )
+                                        });
+                                        let _ = tx.send(Ev::SkillMem(r));
+                                    });
+                                }
+                                if busy {
+                                    ui.spinner();
+                                }
+                                if ui
+                                    .button("打开文件夹")
+                                    .on_hover_text("打开 data/projects/<id>/skillmem/")
+                                    .clicked()
+                                {
+                                    let dir = self.store.skillmem_dir(&pid);
+                                    self.status = match open_folder(&dir) {
+                                        Ok(()) => format!("已打开 {}", dir.display()),
+                                        Err(e) => e,
+                                    };
+                                }
+                            });
+                            ui.label(format!(
+                                "本地导出目录: {}",
+                                self.store.skillmem_dir(&pid).display()
+                            ));
+                            ui.add_space(6.0);
+                            ui.label("本次任务（留空 = 让 agent 去队列「未完成」领）:");
                             {
                                 let draft = self.task_drafts.entry(pid.clone()).or_default();
                                 ui.add(
@@ -697,12 +986,42 @@ impl eframe::App for App {
                                 );
                             }
                             ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                if ui.button("复制agent文案(本次任务)").clicked() {
-                                    to_copy = Some((pid.clone(), pname.clone(), CopyMode::ThisTask));
+                            // 两行四按钮：模式（本次任务 / 领列1）× 语言（中文准本 / 英文省 token）。
+                            // 中文是准本，英文由中文压缩而来；两份规则一致，只是长度不同。
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("复制文案(本次任务·中文)").clicked() {
+                                    to_copy = Some((
+                                        pid.clone(),
+                                        pname.clone(),
+                                        CopyMode::ThisTask,
+                                        Lang::Zh,
+                                    ));
                                 }
-                                if ui.button("复制agent文案(领列1任务)").clicked() {
-                                    to_copy = Some((pid.clone(), pname.clone(), CopyMode::Queue));
+                                if ui.button("复制文案(本次任务·英文)").clicked() {
+                                    to_copy = Some((
+                                        pid.clone(),
+                                        pname.clone(),
+                                        CopyMode::ThisTask,
+                                        Lang::En,
+                                    ));
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("复制文案(领列1·中文)").clicked() {
+                                    to_copy = Some((
+                                        pid.clone(),
+                                        pname.clone(),
+                                        CopyMode::Queue,
+                                        Lang::Zh,
+                                    ));
+                                }
+                                if ui.button("复制文案(领列1·英文)").clicked() {
+                                    to_copy = Some((
+                                        pid.clone(),
+                                        pname.clone(),
+                                        CopyMode::Queue,
+                                        Lang::En,
+                                    ));
                                 }
                             });
                         });
@@ -712,14 +1031,18 @@ impl eframe::App for App {
                 if let Some(pid) = to_load {
                     self.load_skills(&pid);
                 }
-                if let Some((pid, pname, mode)) = to_copy {
-                    let (text, has_task) = self.copy_prompt(&pid, &pname, mode);
+                if let Some((pid, pname, mode, lang)) = to_copy {
+                    let (text, has_task) = self.copy_prompt(&pid, &pname, mode, lang);
                     ui.ctx().copy_text(text);
-                    self.status = if has_task {
-                        "已复制 Agent 文案（含本次任务，agent 会新建任务开工）。".to_string()
-                    } else {
-                        "已复制 Agent 文案（agent 会去队列「待处理」领任务）。".to_string()
-                    };
+                    self.status = format!(
+                        "已复制 Agent 文案（{}，{}）。",
+                        lang.label(),
+                        if has_task {
+                            "含本次任务，agent 会新建任务开工"
+                        } else {
+                            "agent 会去队列「未完成」领任务"
+                        }
+                    );
                 }
             });
         });
@@ -727,20 +1050,27 @@ impl eframe::App for App {
 }
 
 impl App {
-    // 两个「复制 agent 文案」按钮共用的动作。
+    // 四个「复制 agent 文案」按钮共用的动作。
     //
     // 抽成方法是为了能直接测：按钮本身只负责把返回值塞进剪贴板，
-    // 「本次任务 vs 领列1任务」的行为差异全在这里，一处说了算。
+    // 「本次任务 vs 领列1任务」的行为差异全在这里，一处说了算；
+    // 语言差异（中文准本 / 英文压缩版）由 agent_prompt_from 按 lang 选，UI 不重复。
     //
     // 返回 (文案, 是否带上了「本次任务」)，第二个值用来决定底部状态提示。
-    fn copy_prompt(&mut self, pid: &str, pname: &str, mode: CopyMode) -> (String, bool) {
+    fn copy_prompt(
+        &mut self,
+        pid: &str,
+        pname: &str,
+        mode: CopyMode,
+        lang: Lang,
+    ) -> (String, bool) {
         let rows = self.skills.get(pid).cloned().unwrap_or_default();
         // 草稿的组装交给 draft_for_mode：Queue 模式强制丢弃界面里的草稿，
         // ThisTask 模式按草稿是否填写决定带不带。UI 不再重复这段逻辑。
         let raw = self.task_drafts.get(pid).cloned().unwrap_or_default();
         let draft = draft_for_mode(&self.store, &raw, mode);
         let has_task = draft.is_some();
-        let text = agent_prompt_from(&self.store, pid, pname, &rows, draft.as_ref());
+        let text = agent_prompt_from(&self.store, pid, pname, &rows, draft.as_ref(), lang);
         (text, has_task)
     }
 
@@ -987,6 +1317,209 @@ impl App {
         ));
         ui.add_space(8.0);
         ui.label("提示: 字号变大后，侧栏、按钮和间距都会按比例放大。");
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.heading("邮件通知");
+        ui.label("到「待回复」这一步自动发邮件给客户，客户直接回邮件也能续上任务。");
+        ui.label(
+            egui::RichText::new(
+                "注意：SMTP 只能发信，收不到回信。要让「邮件回复」也能继续，必须再填 IMAP（不填就只发不收）。",
+            )
+            .small(),
+        );
+        ui.add_space(6.0);
+
+        egui::Grid::new("mail_form")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("SMTP 主机");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.mail.smtp_host)
+                            .desired_width(300.0)
+                            .hint_text("smtp.qq.com"),
+                    );
+                    ui.label("端口");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.mail.smtp_port)
+                            .desired_width(70.0)
+                            .hint_text("465"),
+                    );
+                });
+                ui.end_row();
+
+                ui.label("账号");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.mail.smtp_user)
+                        .desired_width(380.0)
+                        .hint_text("you@example.com"),
+                );
+                ui.end_row();
+
+                ui.label("密码/授权码");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.mail.smtp_pass)
+                        .password(true)
+                        .desired_width(380.0)
+                        .hint_text("邮箱授权码（不是登录密码）"),
+                );
+                ui.end_row();
+
+                ui.label("发件人");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.mail.smtp_from)
+                        .desired_width(380.0)
+                        .hint_text("留空 = 用账号"),
+                );
+                ui.end_row();
+
+                ui.label("收件人");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.mail.mail_to)
+                        .desired_width(380.0)
+                        .hint_text("客户邮箱，多个用逗号分隔"),
+                );
+                ui.end_row();
+
+                ui.label("IMAP 主机");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.mail.imap_host)
+                            .desired_width(300.0)
+                            .hint_text("imap.qq.com"),
+                    );
+                    ui.label("端口");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.mail.imap_port)
+                            .desired_width(70.0)
+                            .hint_text("993"),
+                    );
+                });
+                ui.end_row();
+            });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.mail.mail_on_ask, "到「待回复」时自动发信");
+            if ui.button("保存邮件配置").clicked() {
+                // load-modify-save：只改邮件字段，token / 列名 / 工具映射原样保留。
+                let mut cfg = self.store.load_config();
+                self.mail.apply_to(&mut cfg);
+                self.status = match cfg.save(&self.store.root) {
+                    Ok(()) => "邮件配置已保存到 data/config.toml。".to_string(),
+                    Err(e) => format!("保存失败: {e}"),
+                };
+            }
+            let send = ui.add_enabled(!self.mail_busy, egui::Button::new("发送测试邮件"));
+            if send.clicked() {
+                let mut cfg = self.store.load_config();
+                self.mail.apply_to(&mut cfg);
+                let _ = cfg.save(&self.store.root);
+                self.mail_busy = true;
+                self.status = "正在发送测试邮件...".to_string();
+                let tx = self.tx.clone();
+                // 网络 IO 放后台：SMTP 握手 + 投递可能要好几秒，不能卡住 UI 帧。
+                thread::spawn(move || {
+                    let r = crate::mail::send(
+                        &cfg,
+                        "[TB] 测试邮件",
+                        "这是一封 TBHub 测试邮件，收到即表示 SMTP 配置可用。",
+                    );
+                    let _ = tx.send(Ev::MailSent(r));
+                });
+            }
+            if self.mail_busy {
+                ui.spinner();
+            }
+        });
+        ui.add_space(4.0);
+        // 用表单里的值判断（不读磁盘）：这样改了还没保存也能立刻看到「能不能发/收」。
+        let mut probe = crate::config::Config::default();
+        self.mail.apply_to(&mut probe);
+        ui.label(format!(
+            "能发信: {} / 能收信: {}（收信靠 IMAP，密码跟 SMTP 共用）",
+            if crate::mail::can_send(&probe) { "是" } else { "否" },
+            if crate::mail::can_receive(&probe) {
+                "是"
+            } else {
+                "否"
+            }
+        ));
+        ui.label("命令行也能验：tba mail status / tba mail test / tba mail check");
+
+        // ---- 等待与轮询 ----
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.heading("等待与轮询");
+        ui.label("「待回复」这一步 agent 会一直等。这里的参数决定等多久、多久查一次。");
+        ui.add_space(6.0);
+
+        egui::Grid::new("wait_form")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("单轮最长等待");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.wait.timeout_secs)
+                            .desired_width(70.0)
+                            .hint_text("540"),
+                    );
+                    ui.label("秒　到点返回退出码 2，agent 重跑同一条接着等");
+                });
+                ui.end_row();
+
+                ui.label("评论轮询间隔");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.wait.interval_secs)
+                            .desired_width(70.0)
+                            .hint_text("15"),
+                    );
+                    ui.label("秒　多久查一次你在 Teambition 的回复");
+                });
+                ui.end_row();
+
+                ui.label("邮件轮询间隔");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.wait.mail_poll_secs)
+                            .desired_width(70.0)
+                            .hint_text("20"),
+                    );
+                    ui.label("秒　多久查一次邮箱回信（IMAP 比读评论贵，别设太小）");
+                });
+                ui.end_row();
+            });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("保存等待参数").clicked() {
+                let mut cfg = self.store.load_config();
+                self.wait.apply_to(&mut cfg);
+                self.status = match cfg.save(&self.store.root) {
+                    Ok(()) => "等待参数已保存。下次 tba ask / tba wait 生效。".to_string(),
+                    Err(e) => format!("保存失败: {e}"),
+                };
+            }
+            if ui.button("恢复默认").clicked() {
+                self.wait = WaitForm::from_cfg(&crate::config::Config::default());
+                self.status = "已填回默认值，点「保存等待参数」才写入。".to_string();
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!(
+                "默认 {} / {} / {} 秒。命令行可临时覆盖：tba wait <claim> --timeout 300 --interval 10",
+                crate::config::DEFAULT_WAIT_TIMEOUT_SECS,
+                crate::config::DEFAULT_WAIT_INTERVAL_SECS,
+                crate::config::DEFAULT_MAIL_POLL_SECS
+            ))
+            .small(),
+        );
     }
 }
 
@@ -1015,28 +1548,84 @@ mod tests {
 
     // 造一个没 token 的临时 App：不联网、不起后台线程，纯逻辑测。
     fn tmp_app(tag: &str) -> App {
-        let root = std::env::temp_dir().join(format!("tbhub-ui-test-{tag}"));
+        let root = std::env::temp_dir().join(format!("tba-ui-test-{tag}"));
         // 先清掉上次的残留：否则 ui.toml 里的旧字号会被读回来，断言就飘了。
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
         App::new(Store { root })
     }
 
-    // 「复制agent文案(本次任务)」：界面里有草稿 -> 文案带草稿 + 走 start。
+    // 等待参数：空/非法输入回落默认，别把配置写成 0 把轮询打爆。
+    #[test]
+    fn wait_form_falls_back_on_bad_input() {
+        let mut cfg = crate::config::Config::default();
+        cfg.wait_timeout_secs = 999;
+        let f = WaitForm {
+            timeout_secs: "".into(),
+            interval_secs: "abc".into(),
+            mail_poll_secs: " 25 ".into(),
+        };
+        f.apply_to(&mut cfg);
+        assert_eq!(
+            cfg.wait_timeout_secs,
+            crate::config::DEFAULT_WAIT_TIMEOUT_SECS,
+            "空值该回落默认"
+        );
+        assert_eq!(
+            cfg.wait_interval_secs,
+            crate::config::DEFAULT_WAIT_INTERVAL_SECS,
+            "非法值该回落默认"
+        );
+        assert_eq!(cfg.mail_poll_secs, 25, "合法值该生效（含首尾空格）");
+    }
+
+    // 合法但过小的数字也要夹到下限：填 0 会把轮询变成忙等。
+    #[test]
+    fn wait_form_clamps_tiny_values() {
+        let mut cfg = crate::config::Config::default();
+        let f = WaitForm {
+            timeout_secs: "0".into(),
+            interval_secs: "1".into(),
+            mail_poll_secs: "0".into(),
+        };
+        f.apply_to(&mut cfg);
+        assert_eq!(cfg.wait_timeout_secs, crate::config::MIN_WAIT_TIMEOUT_SECS);
+        assert_eq!(cfg.wait_interval_secs, crate::config::MIN_WAIT_INTERVAL_SECS);
+        assert_eq!(cfg.mail_poll_secs, crate::config::MIN_MAIL_POLL_SECS);
+    }
+
+    // 表单和配置要能来回转，不能改一次就漂。
+    #[test]
+    fn wait_form_roundtrips_through_config() {
+        let mut cfg = crate::config::Config::default();
+        cfg.wait_timeout_secs = 300;
+        cfg.wait_interval_secs = 8;
+        cfg.mail_poll_secs = 30;
+        let f = WaitForm::from_cfg(&cfg);
+        assert_eq!(f.timeout_secs, "300");
+
+        let mut back = crate::config::Config::default();
+        f.apply_to(&mut back);
+        assert_eq!(back.wait_timeout_secs, 300);
+        assert_eq!(back.wait_interval_secs, 8);
+        assert_eq!(back.mail_poll_secs, 30);
+    }
+
+    // 「复制文案(本次任务·中文)」：界面里有草稿 -> 文案带草稿 + 走 start。
     #[test]
     fn copy_prompt_this_task_includes_draft() {
         let mut app = tmp_app("this");
         let pid = "p-1";
         app.task_drafts
             .insert(pid.to_string(), "# 界面里的任务标题\n正文第二行".to_string());
-        let (text, has_task) = app.copy_prompt(pid, "项目一", CopyMode::ThisTask);
+        let (text, has_task) = app.copy_prompt(pid, "项目一", CopyMode::ThisTask, Lang::Zh);
         assert!(has_task, "填了草稿就该带上本次任务");
-        assert!(text.contains("This task"), "文案应有 This task 段");
+        assert!(text.contains("本次任务"), "文案应有本次任务段");
         assert!(text.contains("start"), "应让 agent 跑 start");
         assert!(text.contains("界面里的任务标题"), "标题应进文案");
     }
 
-    // 「复制agent文案(领列1任务)」：即使界面里还留着草稿，也必须丢掉。
+    // 「复制文案(领列1·中文)」：即使界面里还留着草稿，也必须丢掉。
     // 否则 agent 会新建任务，而不是去队列领，行为跑偏。
     #[test]
     fn copy_prompt_queue_ignores_leftover_draft() {
@@ -1044,30 +1633,50 @@ mod tests {
         let pid = "p-2";
         app.task_drafts
             .insert(pid.to_string(), "# 残留草稿\n不该出现".to_string());
-        let (text, has_task) = app.copy_prompt(pid, "项目二", CopyMode::Queue);
+        let (text, has_task) = app.copy_prompt(pid, "项目二", CopyMode::Queue, Lang::Zh);
         assert!(!has_task, "领列1任务 不该带草稿");
         assert!(text.contains("claim"), "应让 agent 跑 claim");
         assert!(!text.contains("残留草稿"), "残留草稿不该进文案");
         assert!(!text.contains("不该出现"), "残留正文不该进文案");
     }
 
-    // 两个按钮的产出必须真的不同。
+    // 两个模式按钮的产出必须真的不同。
     #[test]
     fn two_buttons_produce_different_text() {
         let mut app = tmp_app("diff");
         let pid = "p-3";
         app.task_drafts
             .insert(pid.to_string(), "# 差异任务\n正文".to_string());
-        let (a, _) = app.copy_prompt(pid, "项目三", CopyMode::ThisTask);
-        let (b, _) = app.copy_prompt(pid, "项目三", CopyMode::Queue);
+        let (a, _) = app.copy_prompt(pid, "项目三", CopyMode::ThisTask, Lang::Zh);
+        let (b, _) = app.copy_prompt(pid, "项目三", CopyMode::Queue, Lang::Zh);
         assert_ne!(a, b, "两个按钮不该产出同一份文案");
+    }
+
+    // 中英两版：规则都在（命令 / 阶段名 / 禁自建任务），但英文必须更短（省 token）。
+    #[test]
+    fn language_variants_differ_but_keep_rules() {
+        let mut app = tmp_app("lang");
+        let pid = "p-5";
+        let (zh, _) = app.copy_prompt(pid, "项目五", CopyMode::Queue, Lang::Zh);
+        let (en, _) = app.copy_prompt(pid, "项目五", CopyMode::Queue, Lang::En);
+        assert_ne!(zh, en, "中英两版不该相同");
+        for t in [&zh, &en] {
+            for cmd in ["claim --project", "take <", "beat <claim_id>", "ask <claim_id>"] {
+                assert!(t.contains(cmd), "两版都必须有命令: {cmd}");
+            }
+            // 阶段名两版都保持中文（Teambition 上的真实名字）
+            assert!(t.contains("未完成"), "两版都要写清领的是「未完成」");
+            assert!(t.contains("待回复"), "两版都要有「待回复」");
+            assert!(t.contains("已解决") && t.contains("已完成"), "两版都要有收尾状态名");
+        }
+        // 长度差异由 ops 的 est_tokens 断言守着（中文一字符信息量大，比字符数没意义）。
     }
 
     // 空草稿时，「本次任务」按钮退化成「去队列领」，不报错。
     #[test]
     fn copy_prompt_empty_draft_falls_back_to_queue() {
         let mut app = tmp_app("empty");
-        let (text, has_task) = app.copy_prompt("p-4", "项目四", CopyMode::ThisTask);
+        let (text, has_task) = app.copy_prompt("p-4", "项目四", CopyMode::ThisTask, Lang::Zh);
         assert!(!has_task);
         assert!(text.contains("claim"));
     }

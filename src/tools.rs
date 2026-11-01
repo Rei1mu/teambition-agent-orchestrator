@@ -16,6 +16,8 @@ pub struct ToolInfo {
 #[derive(Clone, Default)]
 pub struct ToolMap {
     pub list_projects: Option<String>,
+    // 建空白项目。tb ensure-project 用它给当前目录开一个新项目。
+    pub create_project: Option<String>,
     pub get_project: Option<String>,
     pub list_taskflows: Option<String>,
     pub get_taskflow: Option<String>,
@@ -102,6 +104,19 @@ const R_LIST_PROJECTS: Rule = Rule {
         "status", "archive", "restore", "sfc",
     ],
     bonus: &[("list", 10), ("query", 9), ("search", 9), ("all", 8), ("get", 3), ("project", 2)],
+    desc: &["项目", "project"],
+};
+
+// 建空白项目。真实工具叫 project.create，只接受 name（传 organizationId 会报 not allowed）。
+// create-from-template 名字更长、语义也不对，用 template 显式排掉，双保险。
+const R_CREATE_PROJECT: Rule = Rule {
+    must: &["project"],
+    deny: &[
+        "task", "taskflow", "tfs", "status", "list", "query", "search",
+        "get", "update", "delete", "archive", "restore", "sfc", "template",
+        "program", "plan", "file", "member", "tag", "column", "role",
+    ],
+    bonus: &[("create", 10), ("add", 9)],
     desc: &["项目", "project"],
 };
 
@@ -302,6 +317,7 @@ impl ToolMap {
         let get = |role: &str| overrides.get(role).cloned();
 
         m.list_projects = get("list_projects").or_else(|| pick(tools, &R_LIST_PROJECTS));
+        m.create_project = get("create_project").or_else(|| pick(tools, &R_CREATE_PROJECT));
         m.get_project = get("get_project").or_else(|| pick(tools, &R_GET_PROJECT));
         m.list_taskflows = get("list_taskflows").or_else(|| pick(tools, &R_LIST_TASKFLOWS));
         m.get_taskflow = get("get_taskflow").or_else(|| pick(tools, &R_GET_TASKFLOW));
@@ -326,8 +342,9 @@ impl ToolMap {
 
     // 人读摘要。tb tools 命令用。
     pub fn summary(&self) -> Vec<(&'static str, String)> {
-        let rows: [(&'static str, &Option<String>); 17] = [
+        let rows: [(&'static str, &Option<String>); 18] = [
             ("list_projects", &self.list_projects),
+            ("create_project", &self.create_project),
             ("get_project", &self.get_project),
             ("list_taskflows", &self.list_taskflows),
             ("get_taskflow", &self.get_taskflow),
@@ -492,10 +509,15 @@ pub struct TaskInfo {
     /// 任务列表 id（看板列）。真实 Teambition 是任务对象上的 stageId。
     /// 取不到就空串（mock 老数据没有这一维）。
     pub list_id: String,
-    /// 任务类型 id（sfc / 任务类型维度）。普通任务用默认 Task 类型，技能用 skill 类型。
+    /// 任务类型 id（sfc / 任务类型维度）。普通任务用默认 Task 类型。
     /// 真实 Teambition 在任务对象上用 sfcId 字段。
+    /// 当前 skill / 记忆都改用工作流状态标记，这个维度暂时不参与判断，但保留解析。
+    #[allow(dead_code)]
     pub sfc_id: String,
     pub created: String,
+    /// 任务标签名（tagNames）。当前流程不用标签识别，保留解析备用。
+    #[allow(dead_code)]
+    pub tags: Vec<String>,
 }
 
 pub fn parse_project(v: &Value) -> Option<ProjectInfo> {
@@ -555,6 +577,7 @@ pub fn parse_task(v: &Value) -> Option<TaskInfo> {
         &["created", "createdAt", "createTime", "created_time", "createdDate"],
     )
     .unwrap_or_default();
+    let tags = parse_tags(v);
     Some(TaskInfo {
         id,
         title,
@@ -563,5 +586,38 @@ pub fn parse_task(v: &Value) -> Option<TaskInfo> {
         list_id,
         sfc_id,
         created,
+        tags,
     })
+}
+
+// 解析任务标签名。`enrichFields=tag` 时返回 `tagNames` 数组，也兼容逗号串。
+// 取不到返回空 vec（= 无标签）。
+fn parse_tags(v: &Value) -> Vec<String> {
+    for key in ["tagNames", "tag_names", "tags"] {
+        if let Some(val) = v.get(key) {
+            if let Some(arr) = val.as_array() {
+                let mut out = Vec::new();
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        out.push(s.to_string());
+                    } else if let Some(name) = get_str(item, &["name", "title"]) {
+                        out.push(name);
+                    }
+                }
+                if !out.is_empty() {
+                    return out;
+                }
+            } else if let Some(s) = val.as_str() {
+                let out: Vec<String> = s
+                    .split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect();
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+        }
+    }
+    Vec::new()
 }

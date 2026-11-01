@@ -2769,13 +2769,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "tbhub"
+name = "tba-cli"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
  "eframe",
  "egui",
+ "native-tls",
  "reqwest",
  "serde",
  "serde_json",

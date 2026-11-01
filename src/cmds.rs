@@ -1,8 +1,10 @@
 use crate::config::*;
+use crate::mail;
 use crate::ops::*;
 use crate::store::Store;
 use crate::Cmd;
 use clap::Parser;
+use std::io::Write;
 
 fn fail_msg(action: &str, r: &crate::capability::Outcome) -> String {
     if r.err.is_empty() {
@@ -21,6 +23,134 @@ fn first_heading(body: &str) -> Option<String> {
         None
     } else {
         Some(h.chars().take(60).collect())
+    }
+}
+
+// 解析 --project：给了就用；没给走 .tba/project 绑定。
+// 两者都没有就报错——绝不猜项目，猜错会把任务领到别的项目里。
+fn resolve_project(project: Option<&str>) -> Result<String, String> {
+    if let Some(p) = project.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(p.to_string());
+    }
+    match read_project_binding() {
+        Some(b) => Ok(b),
+        None => Err(
+            "没指定项目，当前目录也没绑定。先 `tba ensure-project`（项目名取目录名），\
+             或加 --project <id>"
+                .to_string(),
+        ),
+    }
+}
+
+// 阻塞等用户回数字，直到回复 / 超时 / 别处收尾。
+//
+// 抽成独立函数是因为 ask 和 wait 都要用它：ask 问完就地开始等，
+// agent 只需要记一条命令，没有「问完忘了等」的中间态。
+//
+// 退出码约定（agent 靠这个决定下一步，不要改）：
+//   正常返回 = 收到回复，正文和 action 已打印
+//   2        = 单轮超时（默认 540 秒），agent 再跑一次即可，别结束会话
+//   3        = 用户在网页上手动收尾了，停
+fn run_wait_block(
+    store: &Store,
+    claim_id: &str,
+    timeout: Option<u64>,
+    interval: Option<u64>,
+) -> Result<(), String> {
+    let cfg = store.load_config();
+    // 命令行参数优先，没给就用配置里的（data/config.toml，GUI 设置页也能改）。
+    // 无论来源都夹一次下限：0 或 3 秒会让轮询变成忙等，把接口打爆。
+    let t = timeout
+        .unwrap_or(cfg.wait_timeout_secs)
+        .max(crate::config::MIN_WAIT_TIMEOUT_SECS);
+    let iv = interval
+        .unwrap_or(cfg.wait_interval_secs)
+        .max(crate::config::MIN_WAIT_INTERVAL_SECS);
+    match wait(store, claim_id, t, iv)? {
+        WaitOutcome::Replied {
+            claim: c,
+            replies,
+            action,
+            body,
+            waited_secs,
+        } => {
+            if action == ReplyAction::Closed {
+                println!(
+                    "收到回复 0（等了 {waited_secs} 秒）。任务「{}」已收尾：「{}」+ 看板列「{}」。",
+                    c.task_name, STAGE_DONE, cfg.tasklist_done
+                );
+            } else {
+                println!(
+                    "收到回复（等了 {waited_secs} 秒）。任务「{}」已回到「{}」+ 看板列「{}」。",
+                    c.task_name, STAGE_DOING, cfg.tasklist_claim
+                );
+            }
+            // 结构化标记：agent 看 action 决定下一步，不用自己解析中文。
+            let num = action.num().map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+            println!("reply={num} action={} text={:?}", action.tag(), body);
+            println!("\n---- 你的回复 ----");
+            for r in &replies {
+                println!("[{}] {}\n{}", r.created, r.author, r.text);
+            }
+            println!();
+            match &action {
+                ReplyAction::Closed => {
+                    println!("已收尾，停。别再跑 done/close。");
+                }
+                ReplyAction::Summarize => {
+                    println!(
+                        "用户要求先把这次的经验写进项目记忆：\n  tba memory --append --section 踩坑 \"...\"\n写完再进待回复：\n  tba ask {} --done",
+                        c.claim_id
+                    );
+                }
+                ReplyAction::Recheck => {
+                    println!(
+                        "用户说没解决。自查后重新给选项：\n  tba ask {} -q \"...\\n\\n回复数字：\\n0 = 已解决，收尾\\n1 = 已解决，先写进项目记忆\\n2 = 还没好，我再查\\n3 = <你自己的选项>\"",
+                        c.claim_id
+                    );
+                }
+                ReplyAction::Custom(n) => {
+                    println!("用户选了你自定义的选项 {n}，按你在问题里写的语义执行。干完汇报。");
+                }
+                ReplyAction::Free => {
+                    println!("用户没回数字，按原文理解。干完汇报。");
+                }
+            }
+            Ok(())
+        }
+        WaitOutcome::Timeout {
+            claim: c,
+            waited_secs,
+        } => {
+            // 进行中态（等手动收尾）vs 待回复态（等评论），提示要分开。
+            let where_ = if c.state == "waiting" {
+                format!("「{}」+ 看板列「{}」", STAGE_WAIT, cfg.tasklist_wait)
+            } else {
+                format!("「{}」+ 看板列「{}」", STAGE_DOING, cfg.tasklist_claim)
+            };
+            println!(
+                "等了 {waited_secs} 秒还没回复。任务「{}」仍在{where_}，球在你那边。",
+                c.task_name
+            );
+            println!(
+                "继续等就再跑一次: tba wait {}\n\
+                 （退出码 2 = 本轮超时，不是失败。别结束会话，重跑就行。）",
+                c.claim_id
+            );
+            // 退出码 2 = 超时（没回复/没收尾），agent 据此再等一轮。
+            std::process::exit(2);
+        }
+        WaitOutcome::Gone {
+            claim: c,
+            state,
+            waited_secs,
+        } => {
+            println!(
+                "等了 {waited_secs} 秒，任务「{}」在别处被收尾了（{state}），不再等。",
+                c.task_name
+            );
+            std::process::exit(3);
+        }
     }
 }
 
@@ -45,7 +175,7 @@ pub fn run() -> Result<(), String> {
     //   - config/login/logout（引导前置）
     //   - ui（**关键**：窗口本身就是「显示状态 + 一键安装」的入口，
     //     拦掉它用户就没地方点安装了。窗口里会用状态卡自己检测）
-    // TB_SKIP_GITBUTLER=1 可强制跳过（排查问题用）。
+    // TBA_SKIP_GITBUTLER=1 可强制跳过（排查问题用）。
     let gb_exempt = matches!(
         &cmd,
         Cmd::GitButler { .. }
@@ -54,7 +184,7 @@ pub fn run() -> Result<(), String> {
             | Cmd::Logout { .. }
             | Cmd::Ui
     );
-    if !gb_exempt && std::env::var("TB_SKIP_GITBUTLER").is_err() {
+    if !gb_exempt && std::env::var("TBA_SKIP_GITBUTLER").is_err() {
         let gb = crate::gitbutler::detect(&store);
         let git_ver = crate::gitbutler::git_available();
         if !gb.found || git_ver.is_none() {
@@ -119,9 +249,19 @@ pub fn run() -> Result<(), String> {
         Cmd::Logout => {
             crate::oauth::logout(&store)?;
         }
-        Cmd::Config { show, url } => {
+        Cmd::Config { show, url, tool } => {
             let mut cfg = store.load_config();
-            let switched = url.is_some();
+            let switched = url.is_some() || tool.is_some();
+            if let Some(t) = tool {
+                let t = t.trim().to_string();
+                cfg.tool_path = t.clone();
+                store.save_config(&cfg)?;
+                if t.is_empty() {
+                    println!("tool_path 已清空，文案改回用当前 exe 的真实路径。");
+                } else {
+                    println!("tool_path 已设为: {t}（文案里的命令都会写这个路径）");
+                }
+            }
             if let Some(u) = url {
                 let u = u.trim().to_string();
                 if u.is_empty() {
@@ -157,6 +297,14 @@ pub fn run() -> Result<(), String> {
                 if !cfg.tool_overrides.is_empty() {
                     println!("tool_overrides: {} 项", cfg.tool_overrides.len());
                 }
+                println!(
+                    "tool_path:    {}",
+                    if cfg.tool_path.is_empty() {
+                        "(未设，用当前 exe 真实路径)"
+                    } else {
+                        &cfg.tool_path
+                    }
+                );
                 println!("\n配置文件: {}", store.root.join("config.toml").display());
             }
         }
@@ -189,9 +337,23 @@ pub fn run() -> Result<(), String> {
 
             let mut ctx = Ctx::new(store.clone(), false)?;
             let stages = ctx.ensure_stages(&project)?;
-            println!("项目 {project} 的阶段（工作流状态，已自动补齐）:");
+            // skill / mem 平时是懒建的（第一次用才建）。init 一次性补齐，
+            // 让「7 个工作流状态」在建项目时就是齐的，看板上一眼看全。
+            for aux in [SKILL_STATE, MEMORY_STATE] {
+                let _ = ctx.ensure_state(&project, aux);
+            }
+            let stages = ctx.list_stages(&project).unwrap_or(stages);
+            println!("项目 {project} 的工作流状态（7 个已自动补齐）:");
             for s in &stages {
-                println!("  {}\t{}", s.id, s.name);
+                // skill / mem 是「用途状态」不是阶段，标出来免得看混。
+                let tag = if s.name == MEMORY_STATE {
+                    "  ← 用途状态：项目记忆"
+                } else if s.name == SKILL_STATE {
+                    "  ← 用途状态：skill"
+                } else {
+                    ""
+                };
+                println!("  {}\t{}{}", s.id, s.name, tag);
             }
 
             // 看板列：网页 API 不能建/改名列，只能手动建。校验 5 个数字列 1..5 齐全，
@@ -209,13 +371,45 @@ pub fn run() -> Result<(), String> {
             } else {
                 println!("  ✗ 数字列不齐。Teambition 网页 API 建不了列，请手动去项目看板补足，");
                 println!("    名字就用数字、按顺序建（别改中文，太麻烦）:");
-                println!("      列 1 = 待处理  （队列：没人接的任务）");
+                println!("      列 1 = {STAGE_TODO}  （队列：没人接的任务）");
                 println!("      列 2 = 进行中  （agent 正在干）");
                 println!("      列 3 = 待回复  （等用户在 Teambition 评论回复）");
                 println!("      列 4 = 已解决  （已完成）");
-                println!("      列 5 = 关闭    （作废）");
+                println!("      列 5 = {STAGE_CLOSED}  （作废）");
                 println!("    建好后重跑一次 tb init 校验。");
             }
+        }
+        Cmd::EnsureProject { name, project } => {
+            let mut ctx = Ctx::new(store.clone(), false)?;
+            // 没给名字也没给 id 时用当前目录名——这条命令本来就是「给这个目录接项目」，
+            // 显式调用即代表用户同意按目录名新建。
+            let want = name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(cwd_name);
+            let (p, created) = ctx.ensure_project(Some(want.as_str()), project.as_deref(), true)?;
+            // 补齐 5 阶段 + 记忆状态，都幂等。
+            ctx.ensure_stages(&p.id)?;
+            let mem = ctx.ensure_state(&p.id, MEMORY_STATE)?;
+            // 记本地绑定：之后 tb prompt 不带 --project 也能认出本项目。
+            let bound = write_project_binding(&p.id)?;
+            // 刷新本地项目缓存：GUI 启动先用它秒开；点「刷新」还会重新拉。
+            if let Ok(all) = ctx.list_projects() {
+                let _ = store.save_projects_cache(
+                    &all.iter()
+                        .map(|x| (x.id.clone(), x.name.clone()))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            println!(
+                "项目就绪: {}\t{}{}",
+                p.id,
+                p.name,
+                if created { "（新建）" } else { "（复用）" }
+            );
+            println!("记忆状态: {} ({})", mem.name, mem.id);
+            println!("本地绑定: {}", bound.display());
+            println!("下一步: tb prompt --project {}", p.id);
         }
         Cmd::Skills { project } => {
             let skills = list_skills(&store, &project)?;
@@ -257,6 +451,30 @@ pub fn run() -> Result<(), String> {
                     .unwrap_or_else(|| "skill".to_string())
             });
             println!("{}", push_skill(&store, &project, &name, &content)?);
+        }
+        Cmd::SkillMem { project, open } => {
+            // 项目名只用来写文件标题，取不到就用 id，不阻断导出。
+            let mut ctx = Ctx::new(store.clone(), false)?;
+            let pname = ctx
+                .list_projects()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|p| p.id == project)
+                .map(|p| p.name)
+                .unwrap_or_else(|| project.clone());
+            drop(ctx);
+            let r = export_skill_mem(&store, &project, &pname)?;
+            println!(
+                "已导出：skill {} 个（启用 {}）、记忆 {} 条 {} 字",
+                r.skill_count, r.skill_on, r.mem_count, r.mem_chars
+            );
+            println!("目录: {}", r.dir.display());
+            println!("  {}", r.skill_file.display());
+            println!("  {}", r.mem_file.display());
+            if open {
+                open_folder(&r.dir)?;
+                println!("已打开文件夹。");
+            }
         }
         Cmd::Switch { project, skill, on, off } => {
             if !on && !off {
@@ -314,12 +532,74 @@ pub fn run() -> Result<(), String> {
                 );
             }
         }
+        Cmd::Go {
+            project,
+            lang,
+            no_entry,
+        } => {
+            use std::io::Write;
+            let lang = Lang::parse(&lang)
+                .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
+            match go(&store, project.as_deref(), lang, !no_entry)? {
+                GoOutcome::NoBinding { cwd } => {
+                    println!("NO_BINDING {cwd}");
+                    eprintln!("当前目录没有绑定 Teambition 项目（缺 .tba/project）。停，不领任务。");
+                    eprintln!(
+                        "要接入：`tba ensure-project`（项目名取目录名），或 `tba ensure-project --name <名字>`"
+                    );
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(3);
+                }
+                GoOutcome::NoProject { id, name } => {
+                    if id.is_empty() {
+                        println!("NO_PROJECT {name}");
+                        eprintln!(
+                            "当前目录按名字「{name}」在 Teambition 上没找到项目（或撞了多个同名）。"
+                        );
+                    } else {
+                        println!("NO_PROJECT {id}");
+                        eprintln!("本地绑定指向的项目「{id}」在 Teambition 里查不到（可能被删了）。");
+                    }
+                    eprintln!("要初始化：`tba ensure-project --name {name}`（有同名就复用，没有就新建）");
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(4);
+                }
+                GoOutcome::Empty { project_name } => {
+                    println!("EMPTY {project_name}");
+                    eprintln!("队列空：列「{STAGE_TODO}」没有可领任务。停。");
+                }
+                GoOutcome::Claimed { text, entry, .. } => {
+                    print!("{text}");
+                    if let Some(p) = entry {
+                        eprintln!("已补工作空间入口: {}", p.display());
+                    }
+                }
+                GoOutcome::Blocked { msg } => {
+                    println!("BLOCKED");
+                    eprintln!("{msg}");
+                    let _ = std::io::stdout().flush();
+                    // 退出码 5 = 手上有没人接的「待回复」，先处理掉再来领。
+                    std::process::exit(5);
+                }
+            }
+        }
         Cmd::Claim { project, name } => {
+            let project = resolve_project(project.as_deref())?;
             // 领之前先回收死会话，别让一个已经不存在的会话占着任务。
             for m in sweep(&store, false).unwrap_or_default() {
                 eprintln!("{m}");
             }
-            let c = claim(&store, &project, name.as_deref(), &current_agent())?;
+            let c = match claim(&store, &project, name.as_deref(), &current_agent()) {
+                Ok(c) => c,
+                Err(e) if e.starts_with(BLOCKED_PREFIX) => {
+                    // 跟 tba g 一致：手上有没人接的「待回复」，先处理掉再来领。
+                    println!("BLOCKED");
+                    eprintln!("{}", e.trim_start_matches(BLOCKED_PREFIX));
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(5);
+                }
+                Err(e) => return Err(e),
+            };
             println!("claim_id: {}", c.claim_id);
             println!("task_id:   {}", c.task_id);
             println!("task_name: {}", c.task_name);
@@ -356,8 +636,8 @@ pub fn run() -> Result<(), String> {
                     println!("\n---- 任务正文 ----\n{}", t.content);
                 }
             }
-            println!("\n接单完成。需要用户回复时用: tb ask {} --question \"...\"", c.claim_id);
-            println!("干完用: tb done {}  |  放弃用: tb release {}", c.claim_id, c.claim_id);
+            println!("\n接单完成。做完必须交回用户：tba ask {} --done（会就地阻塞等用户回数字，别结束会话）", c.claim_id);
+            println!("自定义问题用: tba ask {} -q \"...\"  |  放弃用: tba release {}", c.claim_id, c.claim_id);
         }
         Cmd::Start {
             project,
@@ -386,6 +666,7 @@ pub fn run() -> Result<(), String> {
                 })
                 .ok_or("需要 --title，或给一个首行是 `# 标题` 的 --file")?;
             let agent = agent.unwrap_or_else(current_agent);
+            let project = resolve_project(project.as_deref())?;
             let r = start(&store, &project, &title, &body, &agent)?;
             for w in &r.warnings {
                 eprintln!("警告: {w}");
@@ -408,23 +689,44 @@ pub fn run() -> Result<(), String> {
                 },
                 r.list_now
             );
-            println!("\n开工完成。需要用户回复时用: tb ask {} --question \"...\"", c.claim_id);
-            println!("干完用: tb done {}  |  放弃用: tb release {}", c.claim_id, c.claim_id);
+            println!("\n开工完成。做完必须交回用户：tba ask {} --done（会就地阻塞等用户回数字，别结束会话）", c.claim_id);
+            println!("自定义问题用: tba ask {} -q \"...\"  |  放弃用: tba release {}", c.claim_id, c.claim_id);
         }
-        Cmd::Ask { claim_id, question } => {
-            let c = ask(&store, &claim_id, &question)?;
+        Cmd::Ask {
+            claim_id,
+            question,
+            done,
+            no_wait,
+        } => {
+            let q = if done {
+                DONE_QUESTION.to_string()
+            } else {
+                question.ok_or(
+                    "要给问题：`-q \"...\"`，或者加 `--done` 用标准的「做完了请确认」三选项",
+                )?
+            };
+            let c = ask(&store, &claim_id, &q)?;
             let cfg = store.load_config();
             println!(
-                "已提问。任务「{}」现在是「{}」，看板列「{}」，球在你那边。",
+                "已提问。任务「{}」现在是「{}」，看板列「{}」，球在用户那边。",
                 c.task_name, STAGE_WAIT, cfg.tasklist_wait
             );
-            println!("问题已写成任务评论，在 Teambition 任务下回复即可。");
-            println!(
-                "\n接着等回复: tb wait {}   （阻塞轮询，你回一句它就返回正文并继续，\n\
-                 不用再回到会话里发消息。单轮默认 540 秒，超时退出码 2，再跑一轮即可。）",
-                c.claim_id
-            );
-            println!("不想等只想看一眼: tb reply {}", c.claim_id);
+            println!("问题已写进任务备注，邮件已发。");
+            if no_wait {
+                println!(
+                    "\n（--no-wait）不等回复。想等就自己跑: tba wait {}",
+                    c.claim_id
+                );
+            } else {
+                // 默认就地等：问完立刻阻塞，agent 没有「问完忘了等」的中间态。
+                // 这是「会话不许断」的关键——只要 agent 跑了 ask，它就卡在这里。
+                println!(
+                    "\n开始等回复（单轮最长 {} 秒，每 {} 秒查一次）。用户回数字后这条命令返回，会话继续。\n\
+                     超时退出码 2 = 本轮没等到，改用 `tba wait {}` 接着等（别重跑 ask，会重复发邮件），别结束会话。",
+                    cfg.wait_timeout_secs, cfg.wait_interval_secs, c.claim_id
+                );
+                run_wait_block(&store, &c.claim_id, None, None)?;
+            }
         }
         Cmd::Reply { claim_id } => {
             let (c, replies) = resume(&store, &claim_id)?;
@@ -448,8 +750,8 @@ pub fn run() -> Result<(), String> {
             println!("会话标识: {tag}");
             println!("已写入:   {}", path.to_string_lossy());
             println!(
-                "\n之后本目录下所有 tb 命令自动用这个标识（也可以用 TB_AGENT 环境变量覆盖）。\n\
-                 同一目录要跑多个会话，用 tb hello --name wb-a / --name wb-b 分别指定，\n\
+                "\n之后本目录下所有 tb 命令自动用这个标识（也可以用 TBA_AGENT 环境变量覆盖）。\n\
+                 同一目录要跑多个会话，用 tba hello --name wb-a / --name wb-b 分别指定，\n\
                  否则两个会话会共用一个标识，会话存活判定会互相顶。"
             );
         }
@@ -461,7 +763,17 @@ pub fn run() -> Result<(), String> {
                 println!("{} 条任务在等你回复（等得最久的在前）:\n", list.len());
                 for c in &list {
                     let ago = human_age(crate::store::age_secs(&c.ask_at));
-                    println!("• {}  [{}]", c.task_name, c.claim_id);
+                    // 等待心跳停了 = agent 没在等（丢后台 / 进程没了）。
+                    let broken = match store.wait_age(&c.claim_id) {
+                        Some(a) => a > ORPHAN_WAIT_SECS,
+                        None => crate::store::age_secs(&c.ask_at) > ORPHAN_WAIT_SECS * 2,
+                    };
+                    println!(
+                        "• {}  [{}]{}",
+                        c.task_name,
+                        c.claim_id,
+                        if broken { "  ⚠ 等待中断（没人在等）" } else { "" }
+                    );
                     println!("  等了 {ago}  ·  会话 {}", c.agent);
                     if !c.question.trim().is_empty() {
                         println!("  问题: {}", c.question.lines().next().unwrap_or(""));
@@ -469,7 +781,11 @@ pub fn run() -> Result<(), String> {
                     println!("  {}", task_url(&c.task_id));
                     println!();
                 }
-                println!("在 Teambition 上回复后，agent 侧执行 tb wait/tb reply <claim_id> 继续。");
+                println!(
+                    "在 Teambition 或邮件里回复后：\n  \
+                     那个会话如果还卡在 `tba ask`，会自动收到回复继续；\n  \
+                     已经断了就手动 `tba reply <claim_id>` 看一眼。"
+                );
             }
         }
         Cmd::Wait {
@@ -477,58 +793,121 @@ pub fn run() -> Result<(), String> {
             timeout,
             interval,
         } => {
-            let t = timeout.unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS);
-            let iv = interval.unwrap_or(DEFAULT_WAIT_INTERVAL_SECS);
-            let cfg = store.load_config();
-            match wait(&store, &claim_id, t, iv)? {
-                WaitOutcome::Replied {
-                    claim: c,
-                    replies,
-                    waited_secs,
-                } => {
-                    println!(
-                        "收到回复（等了 {waited_secs} 秒）。任务「{}」已回到「{}」+ 看板列「{}」。",
-                        c.task_name, STAGE_DOING, cfg.tasklist_claim
-                    );
-                    println!("\n---- 你的回复 ----");
-                    for r in &replies {
-                        println!("[{}] {}\n{}", r.created, r.author, r.text);
-                    }
-                    println!("\n接着干。干完用: tb done {}", c.claim_id);
-                }
-                WaitOutcome::Timeout {
-                    claim: c,
-                    waited_secs,
-                } => {
-                    println!(
-                        "等了 {waited_secs} 秒还没收到回复。任务「{}」仍在「{}」+ 看板列「{}」，球在你那边。",
-                        c.task_name, STAGE_WAIT, cfg.tasklist_wait
-                    );
-                    println!("继续等就再跑一次: tb wait {}", c.claim_id);
-                    // 退出码 2 = 超时（没回复），agent 据此决定是否再等一轮。
-                    std::process::exit(2);
-                }
-                WaitOutcome::Gone {
-                    claim: c,
-                    state,
-                    waited_secs,
-                } => {
-                    println!(
-                        "等了 {waited_secs} 秒，任务「{}」在别处被收尾了（{state}），不再等。",
-                        c.task_name
-                    );
-                    std::process::exit(3);
-                }
-            }
+            run_wait_block(&store, &claim_id, timeout, interval)?;
         }
         Cmd::Beat { claim_id } => {
             let c = beat(&store, &claim_id)?;
             println!("已续命: {} ({})", c.claim_id, c.state);
         }
+        Cmd::Note {
+            claim_id,
+            text,
+            file,
+        } => {
+            // 内容优先取 --file（长会话记录通常是文件），否则 --text。
+            let body = match (&file, &text) {
+                (Some(f), _) => {
+                    std::fs::read_to_string(f).map_err(|e| format!("读文件失败 {f}: {e}"))?
+                }
+                (None, Some(t)) => t.clone(),
+                (None, None) => {
+                    return Err("要给内容：--text \"...\" 或 --file 路径".to_string())
+                }
+            };
+            println!("{}", append_note(&store, &claim_id, &body)?);
+        }
+        Cmd::Mail { action, arg } => {
+            let cfg = store.load_config();
+            match action.as_str() {
+                "status" => {
+                    println!("SMTP: {}:{} 用户={} 发件人={} 收件人={}",
+                        if cfg.smtp_host.is_empty() { "(未配)" } else { &cfg.smtp_host },
+                        cfg.smtp_port,
+                        if cfg.smtp_user.is_empty() { "(未配)" } else { &cfg.smtp_user },
+                        if cfg.smtp_from.is_empty() { "(用账号)" } else { &cfg.smtp_from },
+                        if cfg.mail_to.is_empty() { "(未配)" } else { &cfg.mail_to });
+                    println!("IMAP: {}:{}", if cfg.imap_host.is_empty() { "(未配，收不到回信)" } else { &cfg.imap_host }, cfg.imap_port);
+                    println!("到「待回复」自动发信: {}", if cfg.mail_on_ask { "开" } else { "关" });
+                    println!("能发信: {} / 能收信: {}", mail::can_send(&cfg), mail::can_receive(&cfg));
+                    println!(
+                        "等待: 单轮最长 {} 秒 · 评论轮询 {} 秒 · 邮件轮询 {} 秒（GUI 设置页可改）",
+                        cfg.wait_timeout_secs, cfg.wait_interval_secs, cfg.mail_poll_secs
+                    );
+                }
+                "test" => {
+                    mail::send(&cfg, "[TB] 测试邮件", "这是一封 TBHub 测试邮件。收到即表示 SMTP 配置可用。")?;
+                    println!("已发送测试邮件到 {}", cfg.mail_to);
+                }
+                "check" => {
+                    let msgs = mail::fetch_replies(&cfg, "[TB")?;
+                    if !msgs.is_empty() {
+                        for m in &msgs {
+                            println!("---- 回信 ----\n{m}\n");
+                        }
+                        println!("共 {} 封回信。", msgs.len());
+                    } else {
+                        println!("没有匹配到回信（未读 + 主题/正文带 [TB…] 标记）。");
+                        // 光说「没有」没法定位，顺手把最近几封列出来：
+                        // 能看到「信到了但标记不对」和「信根本没到」的区别。
+                        match mail::recent(&cfg, 5) {
+                            Ok(rows) if !rows.is_empty() => {
+                                println!("\nINBOX 最近 {} 封（核对是不是标记对不上）:", rows.len());
+                                for r in rows {
+                                    println!("  #{} {}", r.uid, r.subject);
+                                    if !r.snippet.is_empty() {
+                                        println!("       {}", r.snippet);
+                                    }
+                                }
+                            }
+                            Ok(_) => println!("INBOX 是空的——确认客户回的是 {} 这个信箱。", cfg.smtp_user),
+                            Err(e) => println!("（顺带读最近邮件也失败了: {e}）"),
+                        }
+                    }
+                }
+                "resend" => {
+                    let cid = arg.ok_or(
+                        "要给 claim_id：`tba mail resend <claim_id>`（用 tba inbox 查）",
+                    )?;
+                    let to = resend_mail(&store, &cid)?;
+                    println!("已重发通知邮件到 {to}（正文带完整任务备注）");
+                }
+                other => {
+                    return Err(format!("不认识的邮件动作: {other}（可用 status / test / check / resend）"))
+                }
+            }
+        }
+        Cmd::Raw { tool, args, list } => {
+            // 调试口：直接调任意 Teambition MCP 工具，打印原始 JSON。
+            // 存在的意义是「查接口不用改代码」——Teambition 的字段语义经常跟
+            // 名字对不上（note 落到标题就是例子），实测比读文档快。
+            let mut ctx = Ctx::new(store.clone(), false)?;
+            if list || tool.is_empty() {
+                let mut names: Vec<&str> = ctx.tb.tools.iter().map(|t| t.name.as_str()).collect();
+                names.sort();
+                println!("共 {} 个工具:", names.len());
+                for n in names {
+                    println!("  {n}");
+                }
+                return Ok(());
+            }
+            let a: serde_json::Value = match args {
+                Some(s) => serde_json::from_str(&s)
+                    .map_err(|e| format!("--args 不是合法 JSON: {e}"))?,
+                None => serde_json::json!({}),
+            };
+            let res = ctx.tb.call(&tool, a)?;
+            println!("{}", serde_json::to_string_pretty(&res).unwrap_or_default());
+        }
         Cmd::Release { claim_id, reason } => {
             let c = release(&store, &claim_id, reason.as_deref().unwrap_or(""))?;
-            println!("任务「{}」已退回队列（待处理 + 列{}）。", c.task_name,
-                store.load_config().tasklist_queue);
+            // 列移不动：Teambition 的 MCP 没有移列工具（move_to_list 映射为空），
+            // 所以只能说状态改回了，列得用户自己拖。以前这里写「+ 列1」，是骗人的。
+            println!(
+                "任务「{}」已退回队列：状态改回「{}」，看板列请手动拖到「{}」。",
+                c.task_name,
+                STAGE_TODO,
+                store.load_config().tasklist_queue
+            );
         }
         Cmd::Sweep { force } => {
             let done = sweep(&store, force)?;
@@ -545,7 +924,7 @@ pub fn run() -> Result<(), String> {
         }
         Cmd::Close { claim_id } => {
             let c = finish(&store, &claim_id, STAGE_CLOSED)?;
-            println!("任务「{}」已转为「关闭」。claim_id: {}", c.task_name, c.claim_id);
+            println!("任务「{}」已转为「{STAGE_CLOSED}」。claim_id: {}", c.task_name, c.claim_id);
         }
         Cmd::Status => {
             // 先回收死会话，让台账反映真实情况。
@@ -564,7 +943,7 @@ pub fn run() -> Result<(), String> {
                     "running" | "claimed" => "执行中".to_string(),
                     "waiting" => "等你回复".to_string(),
                     "done" => "已解决".to_string(),
-                    "closed" => "关闭".to_string(),
+                    "closed" => STAGE_CLOSED.to_string(),
                     "reverted" => "已回收".to_string(),
                     "released" => "已退回".to_string(),
                     "failed" => "失败".to_string(),
@@ -605,16 +984,44 @@ pub fn run() -> Result<(), String> {
         }
         Cmd::Prompt {
             project,
+            name,
             task,
             task_file,
+            lang,
+            init,
         } => {
+            let lang = Lang::parse(&lang)
+                .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
+            // 项目接入文案：只输出指令，不解析、不新建项目——建不建由 agent 自己判断。
+            // 不给 --name 就让 agent 用仓库目录名当项目名。
+            if init {
+                print!("{}", crate::ops::init_prompt(&store, name.as_deref(), lang));
+                return Ok(());
+            }
             let mut ctx = Ctx::new(store.clone(), false)?;
-            let projects = ctx.list_projects().unwrap_or_default();
-            let name = projects
-                .iter()
-                .find(|p| p.id == project)
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| project.clone());
+            // 项目解析：--project 优先；--name 给了就允许新建；都没给则靠 .tba/project 绑定。
+            let (p, created) =
+                ctx.ensure_project(name.as_deref(), project.as_deref(), name.is_some())?;
+            if created {
+                eprintln!(
+                    "已在 Teambition 新建项目「{}」（{}）",
+                    p.name, p.id
+                );
+            }
+            if created || name.is_some() {
+                let _ = write_project_binding(&p.id);
+            }
+            if created {
+                if let Ok(all) = ctx.list_projects() {
+                    let _ = store.save_projects_cache(
+                        &all.iter()
+                            .map(|x| (x.id.clone(), x.name.clone()))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+            let project = p.id;
+            let name = p.name;
 
             // 组装「本次任务」。标题优先 --task 的首行，正文优先 --task-file。
             let mut title = String::new();
@@ -654,31 +1061,111 @@ pub fn run() -> Result<(), String> {
                     body_path: path,
                 })
             };
-            print!("{}", agent_prompt(&store, &project, &name, draft.as_ref())?);
+            print!(
+                "{}",
+                agent_prompt(&store, &project, &name, draft.as_ref(), lang)?
+            );
         }
-        Cmd::Memory { project, write, file } => {
-            match write {
-                Some(text) => match file {
-                    Some(f) => {
-                        let p = store.write_memory(&project, Some(&f), &text)?;
-                        println!("已写入 {}", p.display());
-                    }
-                    None => {
-                        let p = store.append_memory(&project, &text)?;
-                        println!("已追加 {}", p.display());
-                    }
-                },
-                None => {
-                    let files = store.read_memory(&project);
-                    if files.is_empty() {
-                        println!("共享记忆为空。目录: {}", store.memory_dir(&project).display());
-                    }
-                    for (name, content) in files {
-                        println!("===== {name} =====");
-                        println!("{content}");
-                    }
-                }
+        Cmd::Memory {
+            project,
+            append,
+            file,
+            section,
+            overwrite,
+            force,
+            on,
+            off,
+            status,
+            local,
+            import_local,
+            init,
+        } => {
+            let mut m = store.load_tb_memory(&project);
+            // 建记忆状态 + 检查。幂等，可反复跑。
+            if init {
+                println!("记忆状态: {}", ensure_memory_state(&store, &project)?);
+                println!();
+                print!("{}", project_memory_status(&store, &project)?);
+                return Ok(());
             }
+            // 开关。关掉不删任何东西——记忆任务还在，只是 tb 不读了。
+            if on {
+                m.enabled = true;
+                store.save_tb_memory(&project, &m)?;
+                println!("已启用本项目的 tb 共享记忆。");
+                println!(
+                    "记忆 = 状态为「{}」的普通任务：一条记忆一条任务，正文在备注里。",
+                    m.state()
+                );
+                println!(
+                    "⚠️ 建议同时关闭各 agent 自带的记忆（如 WorkBuddy 的 .workbuddy-ai/memory/MEMORY.md），\n\
+                     否则两份记忆会打架。tb 不会代你改它们的文件。"
+                );
+                println!("开工文案里会自动加一句「开工先读项目记忆」。");
+                return Ok(());
+            }
+            if off {
+                m.enabled = false;
+                store.save_tb_memory(&project, &m)?;
+                println!("已关闭本项目的 tb 共享记忆。");
+                println!(
+                    "记忆任务仍在（状态为「{}」），没有删除。重新打开用 tba memory --on。",
+                    m.state()
+                );
+                return Ok(());
+            }
+            if status {
+                print!("{}", project_memory_status(&store, &project)?);
+                return Ok(());
+            }
+            if local {
+                let files = store.read_memory(&project);
+                if files.is_empty() {
+                    println!(
+                        "本地记忆目录为空。目录: {}",
+                        store.memory_dir(&project).display()
+                    );
+                }
+                for (name, content) in files {
+                    println!("===== {name} =====");
+                    println!("{content}");
+                }
+                return Ok(());
+            }
+            if import_local {
+                println!("{}", import_local_memory(&store, &project)?);
+                return Ok(());
+            }
+            // 写：--overwrite 覆盖整节；--append / --file 追加一条。
+            if let Some(text) = overwrite {
+                println!(
+                    "{}",
+                    overwrite_memory(&store, &project, &section, &text, force)?
+                );
+                return Ok(());
+            }
+            // 内容优先取 --file（长文本走文件），否则 --append。
+            let body = match (&file, &append) {
+                (Some(f), _) => {
+                    std::fs::read_to_string(f).map_err(|e| format!("读文件失败 {f}: {e}"))?
+                }
+                (None, Some(t)) => t.clone(),
+                (None, None) => String::new(),
+            };
+            if body.trim().is_empty() {
+                // 都没给 = 读。开关关着会报错（不静默返回空）。
+                let pm = read_project_memory(&store, &project)?;
+                if pm.text.trim().is_empty() {
+                    println!("（记忆任务都是空的。条目数: {}）", pm.entries.len());
+                } else {
+                    println!("{}", pm.text.trim_end());
+                }
+                return Ok(());
+            }
+            println!(
+                "{}",
+                append_memory(&store, &project, &section, &body, force)?
+            );
         }
         Cmd::Tools { refresh, json } => {
             let ctx = Ctx::new(store.clone(), refresh)?;
@@ -727,7 +1214,7 @@ pub fn run() -> Result<(), String> {
             let live = live.unwrap_or_else(|| crate::capability::default_live(&root, &name));
             // 重载 TBHub 自己时默认把窗口开回来
             let args = args.unwrap_or_else(|| {
-                if name == "tb" {
+                if name == "tba" {
                     "ui".to_string()
                 } else {
                     String::new()

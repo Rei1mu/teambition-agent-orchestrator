@@ -29,22 +29,22 @@ fn tool_defs() -> Value {
         },
         {
             "name": "list_tasks",
-            "description": "列出某项目指定阶段(或全部四个阶段)的任务。",
+            "description": "列出某项目指定阶段(或全部)的任务。",
             "inputSchema": {"type": "object", "properties": {
                 "project_id": {"type": "string"},
-                "stage": {"type": "string", "description": "阶段名。留空列全部。可选: 待处理/进行中/已解决/关闭"}
+                "stage": {"type": "string", "description": "阶段名。留空列全部。可选: 未完成/进行中/待回复/已解决/已完成/skill/mem"}
             }, "required": ["project_id"]}
         },
         {
             "name": "ensure_stages",
-            "description": "确保项目有 4 个阶段: 待处理/进行中/已解决/关闭。缺的会自动创建。",
+            "description": "确保项目有 7 个工作流状态: 未完成/进行中/待回复/已解决/已完成/skill/mem。缺的会自动创建。",
             "inputSchema": {"type": "object", "properties": {
                 "project_id": {"type": "string"}
             }, "required": ["project_id"]}
         },
         {
             "name": "claim_task",
-            "description": "领取一条「待处理」任务（只从看板列1的队列里领）。默认取创建时间最早的一条。自动把任务转为「进行中」并挪到看板列2，记录 claim_id。幂等。",
+            "description": "领取一条「未完成」任务（只从看板列1的队列里领）。默认取创建时间最早的一条。自动把任务转为「进行中」并挪到看板列2，记录 claim_id。幂等。",
             "inputSchema": {"type": "object", "properties": {
                 "project_id": {"type": "string"},
                 "task_name": {"type": "string", "description": "可选。按标题包含匹配挑选任务。留空取最早。"}
@@ -70,7 +70,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "ask_user",
-            "description": "提问：把任务状态改回「待处理」但仍留在看板列2，同时把问题写成任务评论。用户在 Teambition 任务下评论回复。",
+            "description": "提问：把任务状态改回「未完成」但仍留在看板列2，同时把问题写成任务评论。用户在 Teambition 任务下评论回复。",
             "inputSchema": {"type": "object", "properties": {
                 "claim_id": {"type": "string"},
                 "question": {"type": "string", "description": "要问用户的话"}
@@ -92,7 +92,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "release_task",
-            "description": "退回队列：状态改「待处理」并挪回看板列1（主动放弃）。",
+            "description": "退回队列：状态改「未完成」并挪回看板列1（主动放弃）。",
             "inputSchema": {"type": "object", "properties": {
                 "claim_id": {"type": "string"},
                 "reason": {"type": "string", "description": "可选。退回原因，会写成任务评论。"}
@@ -100,7 +100,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "sweep_tasks",
-            "description": "回收心跳超时的会话：把它们的任务退回 待处理 + 列1。",
+            "description": "回收心跳超时的会话：把它们的任务退回 未完成 + 列1。",
             "inputSchema": {"type": "object", "properties": {
                 "force": {"type": "boolean", "description": "无视超时，强制回收所有进行中的 claim"}
             }}
@@ -114,7 +114,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "close_task",
-            "description": "把已领取任务转为「关闭」。",
+            "description": "把已领取任务转为「已完成」。",
             "inputSchema": {"type": "object", "properties": {
                 "claim_id": {"type": "string"}
             }, "required": ["claim_id"]}
@@ -142,7 +142,8 @@ fn tool_defs() -> Value {
                 "project_id": {"type": "string"},
                 "project_name": {"type": "string", "description": "可选。项目显示名。"},
                 "task": {"type": "string", "description": "可选。本次任务正文(markdown)。给了就走 start 新建任务。"},
-                "task_title": {"type": "string", "description": "可选。本次任务标题。留空从 task 首行推断。"}
+                "task_title": {"type": "string", "description": "可选。本次任务标题。留空从 task 首行推断。"},
+                "lang": {"type": "string", "enum": ["zh", "en"], "description": "可选。文案语言：zh=中文(准本，默认)，en=英文压缩版(省 token)。"}
             }, "required": ["project_id"]}
         }
     ])
@@ -312,7 +313,7 @@ fn dispatch(store: &Store, name: &str, args: &Value) -> Value {
             let q = arg_str(args, "question")?;
             let c = ask(store, &cid, &q)?;
             Ok(format!(
-                "已提问。任务「{}」现在是「待处理」，仍在看板列「{}」等用户回复；问题已写成任务评论。",
+                "已提问。任务「{}」现在是「未完成」，仍在看板列「{}」等用户回复；问题已写成任务评论。",
                 c.task_name,
                 store.load_config().tasklist_claim
             ))
@@ -345,7 +346,7 @@ fn dispatch(store: &Store, name: &str, args: &Value) -> Value {
             let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             let c = release(store, &cid, reason)?;
             Ok(format!(
-                "任务「{}」已退回队列（待处理 + 列{}）。",
+                "任务「{}」已退回队列：状态改回「未完成」，看板列请手动拖到「{}」（tba 改不了列）。",
                 c.task_name,
                 store.load_config().tasklist_queue
             ))
@@ -371,7 +372,7 @@ fn dispatch(store: &Store, name: &str, args: &Value) -> Value {
             let cid = arg_str(args, "claim_id")?;
             let c = finish(store, &cid, STAGE_CLOSED)?;
             Ok(format!(
-                "任务「{}」已转为「关闭」。claim_id: {}",
+                "任务「{}」已转为「已完成」。claim_id: {}",
                 c.task_name, c.claim_id
             ))
         }
@@ -441,7 +442,13 @@ fn dispatch(store: &Store, name: &str, args: &Value) -> Value {
                     body_path: String::new(),
                 })
             };
-            agent_prompt(store, &pid, &name, draft.as_ref())
+            // 文案语言：默认中文准本；MCP 调用方可传 "en" 换压缩英文版省 token。
+            let lang = args
+                .get("lang")
+                .and_then(|v| v.as_str())
+                .and_then(Lang::parse)
+                .unwrap_or_default();
+            agent_prompt(store, &pid, &name, draft.as_ref(), lang)
         }
         _ => Err(format!("未知工具: {name}")),
     })();
@@ -507,7 +514,7 @@ pub fn serve(store: &Store) -> Result<(), String> {
             "initialize" => Some(json!({
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "tbhub", "version": "0.1.0"}
+                "serverInfo": {"name": "tba", "version": "0.1.0"}
             })),
             "ping" => Some(json!({})),
             "tools/list" => Some(json!({"tools": tool_defs()})),

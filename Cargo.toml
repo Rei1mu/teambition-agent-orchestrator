@@ -1,12 +1,12 @@
 [package]
-name = "tbhub"
+name = "tba-cli"
 version = "0.1.0"
 edition = "2021"
-description = "TBHub - Teambition 共享 Skill / 任务中枢 (CLI + MCP + egui 窗口)"
-default-run = "tb"
+description = "TBA - Teambition Agent (CLI + MCP + egui 窗口)"
+default-run = "tba"
 
 [[bin]]
-name = "tb"
+name = "tba"
 path = "src/main.rs"
 
 [dependencies]
@@ -15,6 +15,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "default-tls"] }
+# 邮件：SMTP 发信 / IMAP 收信。native-tls 走 Windows schannel，
+# 跟 reqwest 的 default-tls 是同一个后端，不额外拉 openssl/ring。
+native-tls = "0.2"
 chrono = { version = "0.4", features = ["clock"] }
 egui = "0.31"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }

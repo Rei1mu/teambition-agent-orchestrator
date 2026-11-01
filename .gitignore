@@ -13,12 +13,24 @@ tools/dlltool-shim/target/
 *.log
 testh.s
 
+# 安装包产物
+/dist/
+
+# tba 自动生成的入口（含本机绝对路径，换机器就失效，不入库）
+/AGENTS.md
+/tba.cmd
+
 # 验证用截图（生成物，不进仓库）
 tools/*.png
 docs/ui/
 
 # agent 运行时记忆（本地，禁止入库）
 .workbuddy-ai/
+
+# 本地项目绑定 / 会话标识（跟机器走，不入库）
+.tba/
+# 旧目录名，读到会自动改名成 .tba，忽略以免误提交
+.tbhub/
 
 # 已禁用的 GUI 自验脚本（合成点击 / 截屏），不进仓库
 tools/shot_main.py

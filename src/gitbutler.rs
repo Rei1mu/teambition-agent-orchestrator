@@ -405,7 +405,7 @@ mod tests {
     use super::*;
 
     fn tmp_store(tag: &str) -> Store {
-        let root = std::env::temp_dir().join(format!("tbhub-gb-test-{tag}"));
+        let root = std::env::temp_dir().join(format!("tba-gb-test-{tag}"));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
         Store { root }

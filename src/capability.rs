@@ -201,7 +201,7 @@ pub fn guess_root() -> String {
 }
 
 // 从 Cargo.toml 猜 exe 基名。优先级：[[bin]] name > default-run > [package] name > 目录名。
-// 注意 [package] name 不一定是产物名（tbhub 的产物是 tb）。
+// 注意 [package] name 不一定是产物名（tba 的产物是 tb）。
 pub fn guess_name(root: &str) -> String {
     let toml = Path::new(root).join("Cargo.toml");
     if let Ok(s) = std::fs::read_to_string(&toml) {

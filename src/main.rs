@@ -4,6 +4,7 @@ mod capability;
 mod cmds;
 mod config;
 mod gitbutler;
+mod mail;
 mod mcp_server;
 mod oauth;
 mod ops;
@@ -14,9 +15,9 @@ mod ui;
 
 #[derive(Parser)]
 #[command(
-    name = "tb",
+    name = "tba",
     version,
-    about = "TBHub - Teambition 共享 Skill / 任务中枢 (CLI + MCP + 窗口)"
+    about = "TBA - Teambition Agent (CLI + MCP + 窗口)"
 )]
 pub struct Cli {
     // 子命令可选：不带参数直接跑 = 打开 GUI（双击 tb / 直接 tb 即窗口）。
@@ -42,6 +43,9 @@ pub enum Cmd {
         /// 切换 MCP 服务地址。已登录的 token 会保留
         #[arg(long)]
         url: Option<String>,
+        /// 文案里的工具路径（可指向短路径的目录联接，省 token）。传空串清除
+        #[arg(long)]
+        tool: Option<String>,
     },
     /// GitButler CLI 绑定：status 看状态 / install 装到运行目录 / path 打印路径。
     /// 优先级高于 Teambition：缺它 TBHub 不干活
@@ -53,10 +57,20 @@ pub enum Cmd {
     },
     /// 列出企业下所有项目
     Projects,
-    /// 确保项目有 5 个阶段: 待处理/进行中/待回复/已解决/关闭。缺的自动补
+    /// 确保项目有 7 个工作流状态: 未完成/进行中/待回复/已解决/已完成 + skill/mem。缺的自动补
     Init {
         #[arg(long)]
         project: String,
+    },
+    /// 给当前目录接一个 Teambition 项目：有就复用，没有就新建，并补齐阶段/记忆状态。
+    /// 幂等，可反复跑。成功后把 project id 记到 .tba/project
+    EnsureProject {
+        /// 项目名。给了但项目不存在就新建；不给则用当前目录名
+        #[arg(long)]
+        name: Option<String>,
+        /// 已有项目 id（跳过按名字查找）
+        #[arg(long)]
+        project: Option<String>,
     },
     /// 列出项目的所有 skill 及本地开关
     Skills {
@@ -78,6 +92,14 @@ pub enum Cmd {
         file: String,
         #[arg(long)]
         name: Option<String>,
+    },
+    /// 把项目 skill / mem 拉成本地两个 md：data/projects/<id>/skillmem/{skill,mem}.md
+    SkillMem {
+        #[arg(long)]
+        project: String,
+        /// 导出后直接打开文件夹
+        #[arg(long)]
+        open: bool,
     },
     /// 打开/关闭本地 skill 开关。开关只存本地
     Switch {
@@ -102,10 +124,25 @@ pub enum Cmd {
         /// 任务链接 https://www.teambition.com/task/<id> 或裸任务 id
         target: String,
     },
-    /// 领一条「待处理」任务。默认取创建时间最早的一条。自动转「进行中」
-    Claim {
+    /// 一句话开工：按当前目录绑定的项目领一条「未完成」任务，打印正文和流程。
+    /// 退出码 3=目录未绑定项目 / 4=项目查不到 / 0=已领到或队列空(EMPTY)
+    #[command(visible_aliases = ["g", "r", "run"])]
+    Go {
+        /// 项目 id。省略则按 .tba/project 绑定解析
         #[arg(long)]
-        project: String,
+        project: Option<String>,
+        /// 文案语言：zh=中文(准本) / en=英文(省 token)
+        #[arg(long, default_value = "zh")]
+        lang: String,
+        /// 不自动往当前目录补 AGENTS.md 入口
+        #[arg(long)]
+        no_entry: bool,
+    },
+    /// 领一条「未完成」任务。默认取创建时间最早的一条。自动转「进行中」
+    Claim {
+        /// 项目 id。省略则按 .tba/project 绑定解析
+        #[arg(long)]
+        project: Option<String>,
         #[arg(long)]
         name: Option<String>,
     },
@@ -119,8 +156,9 @@ pub enum Cmd {
     },
     /// 开工：没有现成任务时新建一条，直接进入「进行中」+ 看板列「进行中」
     Start {
+        /// 项目 id。省略则按 .tba/project 绑定解析
         #[arg(long)]
-        project: String,
+        project: Option<String>,
         /// 任务标题。留空则从 --file 的 `# 标题` 行或文件名推断
         #[arg(long)]
         title: Option<String>,
@@ -134,12 +172,19 @@ pub enum Cmd {
         #[arg(long)]
         agent: Option<String>,
     },
-    /// 提问：改成「待回复」+ 看板列「待回复」，把问题写成任务评论等你回复
+    /// 提问：改成「待回复」+ 看板列「待回复」，问题写进任务备注，发邮件，
+    /// 然后就地阻塞等你回数字（会话不会断）。加 --no-wait 只问不等。
     Ask {
         claim_id: String,
         /// 要问用户的话
         #[arg(long, short = 'q')]
-        question: String,
+        question: Option<String>,
+        /// 用标准的「做完了，请确认」三选项（0 收尾 / 1 先写记忆再收尾 / 2 还有问题）
+        #[arg(long)]
+        done: bool,
+        /// 问完立刻返回，不阻塞等待（默认是就地等到用户回数字）
+        #[arg(long)]
+        no_wait: bool,
     },
     /// 继续（只看一眼）：读回你在 Teambition 任务里的评论，状态改回「进行中」
     Reply { claim_id: String },
@@ -167,7 +212,37 @@ pub enum Cmd {
     },
     /// 续命：刷新心跳。长构建/长测试前后调用，避免被判定会话断开
     Beat { claim_id: String },
-    /// 退回队列：状态改「待处理」并挪回看板列「待处理」（主动放弃）
+    /// 把会话记录 / 结论追加到任务备注（往后追加，不清空）。评论留给用户，agent 不写
+    Note {
+        claim_id: String,
+        /// 要追加的文字
+        #[arg(long)]
+        text: Option<String>,
+        /// 从文件读(和 --text 二选一，同时给以 --file 为准)
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// 邮件：检查配置 / 发一封测试信 / 收一次回信
+    Mail {
+        /// 动作: status(只看配置) | test(发测试信) | check(收一次回信) | resend(重发某条任务的通知)
+        #[arg(default_value = "status")]
+        action: String,
+        /// resend 时指定 claim_id
+        arg: Option<String>,
+    },
+    /// 调试：直接调任意 Teambition MCP 工具，打印原始 JSON
+    Raw {
+        /// 工具名，如 teambition.project.file-list
+        #[arg(default_value = "")]
+        tool: String,
+        /// JSON 参数，如 '{"projectId":"xxx"}'
+        #[arg(long)]
+        args: Option<String>,
+        /// 列出全部可用工具名
+        #[arg(long)]
+        list: bool,
+    },
+    /// 退回队列：状态改「未完成」并挪回看板列「未完成」（主动放弃）
     Release {
         claim_id: String,
         #[arg(long)]
@@ -181,29 +256,69 @@ pub enum Cmd {
     },
     /// 把已领任务转为「已解决」
     Done { claim_id: String },
-    /// 把已领任务转为「关闭」
+    /// 把已领任务转为「已完成」
     Close { claim_id: String },
     /// 查看本地领取台账
     Status,
-    /// 生成给 agent 的调用文案(英文速查表 + 已启用 skill 名字列表，不含 skill 全文)
+    /// 生成给 agent 的调用文案(中文准本 / 英文省 token 版 + 已启用 skill 名字列表，不含 skill 全文)
     Prompt {
+        /// 项目 id。省略则按 .tba/project 绑定解析；和 --name 二选一
         #[arg(long)]
-        project: String,
+        project: Option<String>,
+        /// 项目名。给了但项目不存在就新建（幂等）。--project 优先于 --name
+        #[arg(long)]
+        name: Option<String>,
         /// 本次任务描述。给了就写进文案，agent 会新建任务直接开工；不给就让 agent 去队列领
         #[arg(long)]
         task: Option<String>,
         /// 本次任务正文文件(markdown)。和 --task 同时给时，正文以文件为准
         #[arg(long)]
         task_file: Option<String>,
+        /// 文案语言：zh=中文(准本，默认) / en=英文(压缩版，省 token)
+        #[arg(long, default_value = "zh")]
+        lang: String,
+        /// 只打印「项目接入文案」：让 agent 自己判断项目建没建、没建就建。
+        /// 不解析也不新建项目，用 --name（缺省取当前目录名）当项目名
+        #[arg(long)]
+        init: bool,
     },
-    /// 读写项目共享记忆
+    /// 项目共享记忆（存在 Teambition「项目记忆」任务的备注里，云端跨设备）
     Memory {
         #[arg(long)]
         project: String,
+        /// 追加一条到某节（默认「踩坑」）
         #[arg(long)]
-        write: Option<String>,
+        append: Option<String>,
+        /// 从文件读内容追加（长文本用，和 --append 二选一）
         #[arg(long)]
         file: Option<String>,
+        /// 分节：红线 / 决策 / 踩坑（默认「踩坑」）
+        #[arg(long, default_value = "")]
+        section: String,
+        /// 覆盖整节：归档该节的旧记忆任务，再写一条新的（需配 --force）
+        #[arg(long)]
+        overwrite: Option<String>,
+        /// 红线/决策是价值判断，只有用户能改：写它们或覆盖整段需要这个
+        #[arg(long)]
+        force: bool,
+        /// 打开本项目的 tb 共享记忆
+        #[arg(long)]
+        on: bool,
+        /// 关闭本项目的 tb 共享记忆（记忆任务仍留在 Teambition 上）
+        #[arg(long)]
+        off: bool,
+        /// 看状态：开关 / 记忆状态 / 各节条数与字数
+        #[arg(long)]
+        status: bool,
+        /// 读旧的本地记忆目录（迁移前的 data/projects/<id>/memory/）
+        #[arg(long)]
+        local: bool,
+        /// 把本地旧目录内容一次性并进云端记忆（不删本地）
+        #[arg(long)]
+        import_local: bool,
+        /// 建记忆状态（mem）并检查（幂等，可反复跑）
+        #[arg(long)]
+        init: bool,
     },
     /// 查看 MCP 工具列表和角色识别结果
     Tools {

@@ -30,35 +30,35 @@ PROJECTS = [
 STAGES = {
     "tf-alpha": [
         # 故意只给两个阶段，让 tb init 去补剩下三个
-        {"id": "st-alpha-todo", "name": "待处理", "kind": "start"},
+        {"id": "st-alpha-todo", "name": "未完成", "kind": "start"},
         {"id": "st-alpha-doing", "name": "进行中", "kind": "unset"},
     ],
     "tf-beta": [
-        {"id": "st-beta-todo", "name": "待处理", "kind": "start"},
+        {"id": "st-beta-todo", "name": "未完成", "kind": "start"},
         {"id": "st-beta-doing", "name": "进行中", "kind": "unset"},
         # 待回复 = 球在用户那，但没完成，kind 必须是 unset
         {"id": "st-beta-wait", "name": "待回复", "kind": "unset"},
         {"id": "st-beta-done", "name": "已解决", "kind": "end"},
-        {"id": "st-beta-closed", "name": "关闭", "kind": "end"},
+        {"id": "st-beta-closed", "name": "已完成", "kind": "end"},
     ],
 }
 
 # projectId -> 任务列表(看板列)。真实 API 只能查，不能建、不能改名。
-# 列名用中文，和 config 的默认值一致（1 待处理 / 2 进行中 / 3 待回复 / 4 已解决 / 5 关闭）
+# 列名用中文，和 config 的默认值一致（1 未完成 / 2 进行中 / 3 待回复 / 4 已解决 / 5 已完成）
 TASKLISTS = {
     "p-alpha": [
-        {"id": "lst-alpha-1", "name": "待处理"},
+        {"id": "lst-alpha-1", "name": "未完成"},
         {"id": "lst-alpha-2", "name": "进行中"},
         {"id": "lst-alpha-3", "name": "待回复"},
         {"id": "lst-alpha-4", "name": "已解决"},
-        {"id": "lst-alpha-5", "name": "关闭"},
+        {"id": "lst-alpha-5", "name": "已完成"},
     ],
     "p-beta": [
-        {"id": "lst-beta-1", "name": "待处理"},
+        {"id": "lst-beta-1", "name": "未完成"},
         {"id": "lst-beta-2", "name": "进行中"},
         {"id": "lst-beta-3", "name": "待回复"},
         {"id": "lst-beta-4", "name": "已解决"},
-        {"id": "lst-beta-5", "name": "关闭"},
+        {"id": "lst-beta-5", "name": "已完成"},
     ],
 }
 
@@ -153,12 +153,12 @@ TASKS = {
         "isDone": False,
         "isArchived": False,
     },
-    # 故意放在列2但状态是待处理：模拟「agent 已提问，等用户回复」。
+    # 故意放在列2但状态是未完成：模拟「agent 已提问，等用户回复」。
     # tb claim 必须跳过它，否则会把正在等人的任务又领走。
     "t-beta-wait": {
         "id": "t-beta-wait",
         "content": "等你回复的任务",
-        "note": "在列2但待处理，不该被 claim 领走。",
+        "note": "在列2但未完成，不该被 claim 领走。",
         "tfsId": "st-beta-todo",
         "stageId": "lst-beta-2",
         "created": "2026-10-17T09:00:00+08:00",
