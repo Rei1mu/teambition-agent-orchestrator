@@ -31,6 +31,16 @@
 
 ## 安装包要求（GitHub Actions 打包用）
 
+**产物**：推 `v*` tag 触发 `.github/workflows/release.yml`，两个包挂到 Release：
+
+| 文件 | target | 适用 |
+|---|---|---|
+| `tba-<版本>-x64-setup.exe` | `x86_64-pc-windows-msvc` | 普通 Windows 10/11 |
+| `tba-<版本>-arm64-setup.exe` | `aarch64-pc-windows-msvc` | 骁龙本等 Windows on ARM |
+
+两个都在 `windows-latest` 上用 MSVC 工具链构建（arm64 走交叉编译，VS 自带 ARM64 工具），
+Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出 artifact，不发 Release。
+
 安装时做三件事，缺一个 agent 就找不到命令：
 
 1. 把 `tba.exe` 放到安装目录。
