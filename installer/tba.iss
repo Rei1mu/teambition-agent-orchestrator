@@ -54,7 +54,9 @@ MinVersion=10.0
 Name: "en"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional tasks:"
+; 两个快捷方式都默认勾选，用户可以取消。GroupDescription 相同 -> 同一页同一组。
+Name: "startmenuicon"; Description: "Create a Start Menu shortcut"; GroupDescription: "Shortcuts:"
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 
 [Files]
 Source: "{#SrcExe}"; DestDir: "{app}"; Flags: ignoreversion
@@ -64,7 +66,8 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
   ValueData: "{olddata};{app}"; Check: NeedsAddPath('{app}')
 
 [Icons]
-Name: "{group}\TBA"; Filename: "{app}\tba.exe"
+; 卸载入口无条件创建：取消了开始菜单图标也得留一条卸载的路。
+Name: "{group}\TBA"; Filename: "{app}\tba.exe"; Tasks: startmenuicon
 Name: "{group}\Uninstall TBA"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\TBA"; Filename: "{app}\tba.exe"; Tasks: desktopicon
 

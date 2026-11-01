@@ -53,6 +53,16 @@ Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出
 别装到 `%LOCALAPPDATA%\Programs\tba` 或别的地方——两个位置都进 PATH 会出现两个 `tba.exe`，
 `where tba` 返回两条，agent 和人都分不清跑的是哪一个。
 
+**快捷方式**：安装页有「Shortcuts」一组，两项都默认勾选，可以取消：
+
+| 项 | 位置 | 可取消 |
+|---|---|---|
+| 开始菜单快捷方式 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\TBA\TBA.lnk` | 是 |
+| 桌面快捷方式 | `%USERPROFILE%\Desktop\TBA.lnk` | 是 |
+| 卸载入口 | 同上开始菜单目录 `Uninstall TBA.lnk` | 否，始终创建 |
+
+卸载入口不跟着快捷方式走：取消了开始菜单图标，也得留一条卸载的路。
+
 **PATH 写入（Inno Setup 示例）**
 
 ```ini
