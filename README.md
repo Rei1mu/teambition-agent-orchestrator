@@ -47,7 +47,7 @@ Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出
 2. 把安装目录写进**用户 PATH**。
 3. `data/` 不预置，首次运行自动生成（exe 同目录）。
 
-**安装目录约定：`C:\Users\<用户名>\tba`**（Inno Setup 里写 `{userprofile}\tba`）。
+**安装目录约定：`C:\Users\<用户名>\tba`**（Inno Setup 里写 `{%USERPROFILE}\tba`；没有 `{userprofile}` 这个常量）。
 
 跨设备统一用这个位置，好处是：路径短、不需要管理员权限、`tba` 这个名字和目录名一致。
 别装到 `%LOCALAPPDATA%\Programs\tba` 或别的地方——两个位置都进 PATH 会出现两个 `tba.exe`，

@@ -2,7 +2,7 @@
 ; 由 .github/workflows/release.yml 调用 iscc，用 /D 传入版本号与架构。
 ;
 ; 三条硬要求来自 README「安装包要求」一节，缺一个 agent 就找不到命令：
-;   1. tba.exe 装到 {userprofile}\tba
+;   1. tba.exe 装到 {%USERPROFILE}\tba
 ;   2. 该目录写进用户 PATH（HKCU）
 ;   3. 卸载时从 PATH 移除，但不删 data/（token、台账、项目绑定都在里面）
 ; reload.ps1 等资源已 include_str! 编进 exe，不用单独装。
@@ -32,7 +32,8 @@ AppVersion={#AppVersion}
 AppPublisher=Rei1mu
 AppPublisherURL=https://github.com/Rei1mu/teambition-agent-orchestrator
 ; 路径必须短且固定：换位置会出现两个 tba.exe，where tba 返回两条。
-DefaultDirName={userprofile}\tba
+; Inno 没有 {userprofile} 这个常量，用户主目录要写成环境变量 {%USERPROFILE}。
+DefaultDirName={%USERPROFILE}\tba
 DefaultGroupName=TBA
 DisableProgramGroupPage=yes
 ; 装到用户目录，不需要管理员权限，双击就能装。
