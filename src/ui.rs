@@ -1,6 +1,6 @@
 use crate::ops::{
-    agent_prompt_from, draft_for_mode, ensure_memory_state, export_skill_mem, list_skills,
-    open_folder, CopyMode, Lang, SkillItem,
+    agent_prompt_from, archive_skill, draft_for_mode, ensure_memory_state, export_skill_mem,
+    list_skills, open_folder, push_skill, CopyMode, Lang, SkillItem,
 };
 use crate::oauth::TOKEN_PAGE;
 use crate::store::Store;
@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
-// 默认字号。egui 自带约 14pt，中文在这个尺寸下很吃力，所以默认给 22。
-const DEFAULT_FONT_SIZE: f32 = 22.0;
+// 默认字号。egui 自带约 14pt，中文在这个尺寸下很吃力，所以默认给 18。
+const DEFAULT_FONT_SIZE: f32 = 18.0;
 const MIN_FONT_SIZE: f32 = 12.0;
 const MAX_FONT_SIZE: f32 = 40.0;
 // 按默认字号算的布局基准，用来等比放大控件间距。
@@ -37,6 +37,8 @@ enum Ev {
     MemInit(Result<String, String>),
     /// 导出 skill / mem 到本地 skillmem 目录的结果
     SkillMem(Result<String, String>),
+    /// skill 新建 / 编辑 / 删除的结果。带回项目 id，好重新拉一次列表。
+    SkillSaved(String, Result<String, String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -112,6 +114,9 @@ pub struct App {
     reload_elevate: bool,
     // 界面偏好（字号）
     font_size: f32,
+    // 设置页字号输入框的原始文本。用 String 存中间态：用户会先删空再打新数字，
+    // 直接绑 f32 的话清空瞬间就变 0，再被夹到下限。
+    font_input: String,
     // 已经应用到 egui 的字号，避免每帧重复 set_style
     applied_font: f32,
     // GitButler 绑定（优先级高于 Teambition）：None = 还没检测完
@@ -128,6 +133,20 @@ pub struct App {
     mem_busy: bool,
     // 正在导出 skill/mem 的项目 id（导出要联网拉 skill + 记忆，走后台线程）
     skillmem_busy: Option<String>,
+    // skill 编辑窗。Some 时显示；保存/删除都在后台线程，写完重拉列表。
+    skill_edit: Option<SkillEdit>,
+    skill_saving: bool,
+}
+
+// skill 编辑窗的编辑态。正文是整段 markdown，直接存 String。
+#[derive(Clone)]
+struct SkillEdit {
+    project_id: String,
+    project_name: String,
+    name: String,
+    content: String,
+    // true = 新建（保存时若同名已存在，push_skill 会当成更新）
+    is_new: bool,
 }
 
 // 设置页的邮件表单。端口用 String 存，方便输入中间态（空/半个数字）。
@@ -222,39 +241,47 @@ impl WaitForm {
     }
 }
 
-// 按候选顺序找第一个存在的字体装上。中文放字体链最前，
-// 英文和数字仍可回退到 egui 内置字体。
+// 装中文字体。
+//
+// 只装一个字体时，它缺的字形会渲染成豆腐块（口）——这就是界面上「好多口」的原因：
+// 等线缺符号和 emoji，遇到 ⚠ ▾ ✓ 这类字符就没字形了。
+// 所以这里按覆盖度排一条链：雅黑 -> 等线 -> 宋体 -> Segoe UI Symbol。
+// 内置英文字体留在链首，英文和数字仍用它渲染。
 fn install_cjk_font(ctx: &egui::Context) {
-    let candidates: &[&str] = &[
-        "C:/Windows/Fonts/Deng.ttf",
-        "C:/Windows/Fonts/simhei.ttf",
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/simsun.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    let candidates: &[(&str, &str)] = &[
+        ("msyh", "C:/Windows/Fonts/msyh.ttc"),
+        ("deng", "C:/Windows/Fonts/Deng.ttf"),
+        ("simsun", "C:/Windows/Fonts/simsun.ttc"),
+        ("seguisym", "C:/Windows/Fonts/seguisym.ttf"),
+        ("pingfang", "/System/Library/Fonts/PingFang.ttc"),
+        ("notocjk", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        ("notocjktruetype", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
     ];
     let mut fonts = egui::FontDefinitions::default();
-    for path in candidates {
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(_) => continue,
+    let mut loaded: Vec<&str> = Vec::new();
+    for (key, path) in candidates {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
         };
         if bytes.len() < 1024 {
             continue;
         }
         fonts.font_data.insert(
-            "cjk".to_owned(),
+            (*key).to_owned(),
             std::sync::Arc::new(egui::FontData::from_owned(bytes)),
         );
+        loaded.push(key);
+    }
+    if !loaded.is_empty() {
         for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             let chain = fonts.families.entry(fam).or_default();
-            if !chain.iter().any(|f| f == "cjk") {
-                chain.insert(0, "cjk".to_owned());
+            for key in &loaded {
+                if !chain.iter().any(|f| f == key) {
+                    chain.push((*key).to_string());
+                }
             }
         }
-        eprintln!("[tb ui] 已加载中文字体: {path}");
-        break;
+        eprintln!("[tb ui] 已加载字体: {}", loaded.join(", "));
     }
     ctx.set_fonts(fonts);
 }
@@ -312,6 +339,7 @@ impl App {
             reload_busy: false,
             reload_elevate: false,
             font_size,
+            font_input: format!("{}", font_size as i32),
             applied_font: 0.0,
             gb: None,
             git_ver: None,
@@ -322,6 +350,8 @@ impl App {
             wait: WaitForm::from_cfg(&store_cfg),
             mem_busy: false,
             skillmem_busy: None,
+            skill_edit: None,
+            skill_saving: false,
         };
         if !needs_token {
             app.reload_projects();
@@ -417,10 +447,12 @@ impl App {
             let missing = gb.as_ref().map(|g| !g.found).unwrap_or(false);
             if missing && !self.gb_busy {
                 ui.horizontal(|ui| {
+                    // 两个都是主操作，用同一种按钮：之前一个 button 一个 small_button，
+                    // 并排看着一大一小像层级关系，其实不是。
                     if ui.button("安装到运行目录 (data/bin)").clicked() {
                         want_install = true;
                     }
-                    if ui.small_button("复制官方安装命令").clicked() {
+                    if ui.button("复制官方安装命令").clicked() {
                         ui.ctx()
                             .copy_text(crate::gitbutler::OFFICIAL_INSTALL_CMD.to_string());
                     }
@@ -627,6 +659,21 @@ impl eframe::App for App {
                         Err(e) => format!("导出 skill/mem 失败: {e}"),
                     };
                 }
+                Ev::SkillSaved(pid, r) => {
+                    self.skill_saving = false;
+                    match r {
+                        Ok(msg) => {
+                            self.status = msg;
+                            self.skill_edit = None;
+                            // 重新拉一次，让新内容立刻出现在列表里。
+                            self.skills.remove(&pid);
+                            self.load_skills(&pid);
+                        }
+                        Err(e) => {
+                            self.status = format!("保存 skill 失败: {e}");
+                        }
+                    }
+                }
             }
         }
         // 后台在工作时保持界面响应
@@ -716,7 +763,7 @@ impl eframe::App for App {
                 ui.add_space(12.0);
                 ui.label(egui::RichText::new("设置").small().weak());
                 if ui
-                    .selectable_label(self.view == View::Settings, "⚙ 设置")
+                    .selectable_label(self.view == View::Settings, "设置")
                     .on_hover_text("字体大小等界面偏好")
                     .clicked()
                 {
@@ -794,7 +841,13 @@ impl eframe::App for App {
                 return;
             }
             if self.needs_token {
-                self.draw_setup(ui);
+                // 登录页比一屏高（字号 18+ 时尤其），不套滚动区底部的「创建步骤」
+                // 会被直接裁掉，看着就像「页面只有一半」。
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.draw_setup(ui);
+                    });
                 return;
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -831,6 +884,10 @@ impl eframe::App for App {
                         }
                         let rows = self.skills.get(&pid).cloned().unwrap_or_default();
                         let loading = self.loading_skill.as_deref() == Some(pid.as_str());
+                        // 卡片里点出来的动作，攒到闭包外统一处理（闭包里改 self 会打架）。
+                        // (名字, 正文, 是否新建)
+                        let mut edit_req: Option<(String, String, bool)> = None;
+                        let mut del_req: Option<String> = None;
                         ui.indent(pid.clone(), |ui| {
                             // ---- tb 共享记忆（项目级开关）----
                             //
@@ -886,7 +943,7 @@ impl eframe::App for App {
                             });
                             if tbm.enabled {
                                 ui.label(
-                                    "⚠️ 建议同时关闭 agent 自带的记忆（如 .workbuddy-ai/memory/MEMORY.md），\
+                                    "注意：建议同时关闭 agent 自带的记忆（如 .workbuddy-ai/memory/MEMORY.md），\
                                      否则两份记忆会打架。tb 不会代你改它们的文件。",
                                 );
                             } else {
@@ -906,21 +963,44 @@ impl eframe::App for App {
                             });
                             for row in &rows {
                                 let mut on = row.on;
-                                if ui.checkbox(&mut on, &row.name).changed() {
-                                    let _ = self.store.set_switch(&pid, &row.name, on);
-                                    if let Some(list) = self.skills.get_mut(&pid) {
-                                        if let Some(r) =
-                                            list.iter_mut().find(|r| r.name == row.name)
-                                        {
-                                            r.on = on;
+                                ui.horizontal(|ui| {
+                                    if ui.checkbox(&mut on, &row.name).changed() {
+                                        let _ = self.store.set_switch(&pid, &row.name, on);
+                                        if let Some(list) = self.skills.get_mut(&pid) {
+                                            if let Some(r) =
+                                                list.iter_mut().find(|r| r.name == row.name)
+                                            {
+                                                r.on = on;
+                                            }
                                         }
+                                        self.status = format!(
+                                            "skill「{}」已{}",
+                                            row.name,
+                                            if on { "开启" } else { "关闭" }
+                                        );
                                     }
-                                    self.status = format!(
-                                        "skill「{}」已{}",
-                                        row.name,
-                                        if on { "开启" } else { "关闭" }
-                                    );
-                                }
+                                    // 编辑 / 删除都走后台线程：要联网写 Teambition。
+                                    if ui.button("编辑").clicked() {
+                                        edit_req = Some((
+                                            row.name.clone(),
+                                            row.content.clone(),
+                                            false,
+                                        ));
+                                    }
+                                    if ui.button("删除").clicked() {
+                                        del_req = Some(row.name.clone());
+                                    }
+                                });
+                            }
+                            if ui
+                                .button("+ 新建 skill")
+                                .on_hover_text(
+                                    "写一段 markdown 存到 Teambition 的 skill 状态任务里。\
+                                     agent 用 `tba skills` 看到名字，用到才读正文（省 token）",
+                                )
+                                .clicked()
+                            {
+                                edit_req = Some((String::new(), String::new(), true));
                             }
                             ui.add_space(6.0);
                             // 导出：把云端 skill / mem 拉成本地两个 md，人可以直接看
@@ -1025,6 +1105,26 @@ impl eframe::App for App {
                                 }
                             });
                         });
+                        // 编辑 / 删除攒到这里再动 self：在卡片闭包里改会和 ui 的借用打架。
+                        if let Some((name, content, is_new)) = edit_req {
+                            self.skill_edit = Some(SkillEdit {
+                                project_id: pid.clone(),
+                                project_name: pname.clone(),
+                                name,
+                                content,
+                                is_new,
+                            });
+                        }
+                        if let Some(name) = del_req {
+                            self.skill_saving = true;
+                            let store = self.store.clone();
+                            let tx = self.tx.clone();
+                            let pid2 = pid.clone();
+                            thread::spawn(move || {
+                                let r = archive_skill(&store, &pid2, &name);
+                                let _ = tx.send(Ev::SkillSaved(pid2, r));
+                            });
+                        }
                     }
                     ui.separator();
                 }
@@ -1046,10 +1146,93 @@ impl eframe::App for App {
                 }
             });
         });
+
+        // 编辑窗画在最上层，不受侧栏/中央面板影响。
+        self.draw_skill_editor(ctx);
     }
 }
 
 impl App {
+    // skill 编辑窗。新建和编辑共用一套：is_new 只影响标题文字。
+    // 保存走 push_skill（同名则更新），删除走 archive_skill。
+    fn draw_skill_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut ed) = self.skill_edit.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new(if ed.is_new {
+            "新建 skill"
+        } else {
+            "编辑 skill"
+        })
+        .collapsible(false)
+        .resizable(true)
+        .default_width(620.0)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(format!("项目: {}", ed.project_name));
+            ui.add_space(4.0);
+            ui.label("名字（agent 用它来 `tba skill <名字>` 取正文，短一点省 token）:");
+            ui.add(
+                egui::TextEdit::singleline(&mut ed.name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("例如 release-push"),
+            );
+            ui.add_space(6.0);
+            ui.label("正文（markdown，写给 agent 看的操作步骤）:");
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut ed.content)
+                            .desired_rows(14)
+                            .desired_width(f32::INFINITY)
+                            .code_editor(),
+                    );
+                });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let ok = !ed.name.trim().is_empty() && !self.skill_saving;
+                if ui
+                    .add_enabled(ok, egui::Button::new("保存"))
+                    .on_hover_text("写进 Teambition 的 skill 状态任务；同名会覆盖旧正文")
+                    .clicked()
+                {
+                    save = true;
+                }
+                if ui.button("取消").clicked() {
+                    cancel = true;
+                }
+                if self.skill_saving {
+                    ui.spinner();
+                    ui.label("正在写 Teambition...");
+                }
+            });
+        });
+
+        if cancel || !open {
+            self.skill_edit = None;
+            return;
+        }
+        // 用户正在打字的中间态要留住，否则每帧都被上一帧覆盖。
+        self.skill_edit = Some(ed.clone());
+        if save {
+            let name = ed.name.trim().to_string();
+            let content = ed.content;
+            let pid = ed.project_id;
+            self.skill_saving = true;
+            let store = self.store.clone();
+            let tx = self.tx.clone();
+            thread::spawn(move || {
+                let r = push_skill(&store, &pid, &name, &content);
+                let _ = tx.send(Ev::SkillSaved(pid, r));
+            });
+        }
+    }
+
     // 四个「复制 agent 文案」按钮共用的动作。
     //
     // 抽成方法是为了能直接测：按钮本身只负责把返回值塞进剪贴板，
@@ -1290,13 +1473,24 @@ impl App {
             .show(ui, |ui| {
                 ui.label("字号 (px)");
                 let resp = ui.add(
-                    egui::Slider::new(&mut self.font_size, MIN_FONT_SIZE..=MAX_FONT_SIZE)
-                        .step_by(1.0)
-                        .text(""),
+                    egui::TextEdit::singleline(&mut self.font_input)
+                        .desired_width(90.0)
+                        .hint_text("18"),
                 );
                 // 改动即时落盘。字号应用由 update() 的 applied_font 差异逻辑负责。
+                // 空/半截数字不落盘，等用户打完；合法值夹到范围内。
                 if resp.changed() {
-                    save_prefs(&self.store, &UiPrefs { font_size: self.font_size });
+                    if let Ok(v) = self.font_input.trim().parse::<f32>() {
+                        let v = v.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+                        if (v - self.font_size).abs() > 0.01 {
+                            self.font_size = v;
+                            save_prefs(&self.store, &UiPrefs { font_size: v });
+                        }
+                    }
+                }
+                // 失焦回写实际生效值，别让「999」留在框里骗人。
+                if resp.lost_focus() {
+                    self.font_input = format!("{}", self.font_size as i32);
                 }
                 ui.end_row();
 
@@ -1523,7 +1717,28 @@ impl App {
     }
 }
 
+// 双击 exe 时 Windows 会先给一个控制台黑窗，再弹 GUI，很难看。
+// exe 是 console 子系统（CLI 要 stdout），没法靠 windows_subsystem 属性关掉——
+// 那会把所有子命令的输出也吞了。只能在进 GUI 之前主动 FreeConsole。
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn FreeConsole() -> i32;
+}
+
+#[cfg(windows)]
+pub fn hide_console() {
+    // 没有控制台时返回 0，无害。
+    unsafe {
+        FreeConsole();
+    }
+}
+
+#[cfg(not(windows))]
+pub fn hide_console() {}
+
 pub fn run(store: &Store) -> Result<(), String> {
+    hide_console();
     let store = store.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

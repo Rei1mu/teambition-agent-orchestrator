@@ -41,6 +41,10 @@
 两个都在 `windows-latest` 上用 MSVC 工具链构建（arm64 走交叉编译，VS 自带 ARM64 工具），
 Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出 artifact，不发 Release。
 
+**界面语言**：中英双语，默认中文。中文用 `installer/ChineseSimplified.isl`（跟着仓库走，不依赖 CI 环境），
+英文用 Inno 自带的 `Default.isl`。任务描述走 `{cm:...}` 自定消息，两种语言各自正确。
+`.iss` 带 UTF-8 BOM，否则中文会按 ANSI 解析成乱码。
+
 安装时做三件事，缺一个 agent 就找不到命令：
 
 1. 把 `tba.exe` 放到安装目录。
@@ -198,9 +202,37 @@ tba skills --project <id>
 tba skill <名字> --project <id>          :: 打印单个 skill 全文（agent 文案按需读它）
 tba switch --project <id> --skill <名> --on
 tba switch --project <id> --skill <名> --off
+tba skill-init --project <id>            :: 推内置模板（release-push / shot）
+tba skill-init --project <id> --name shot
 ```
 
 开关只存本地 `data/switches.toml`。不回写 Teambition。
+
+**GUI 里能编辑**：项目卡片展开后，每条 skill 后面有「编辑」「删除」，底下有「+ 新建 skill」。
+编辑窗写名字 + markdown 正文，保存即推到 Teambition（同名覆盖）。删除 = 归档那条任务。
+
+**内置模板**（`tba skill-init` 推上去，也可以自己在 GUI 里改）：
+
+| 名字 | 内容 |
+|---|---|
+| `release-push` | 发版步骤：升版本号 → 打 tag → 推 → 等 CI 绿 → 才给下载地址。含红线：CI 没绿不许说「已发布」 |
+| `shot` | 截图：`tba shot --out shot.png`，说明 BitBlt 能截后台窗口，禁止自己写 PowerShell |
+
+**省 token 的用法**：开工文案里只列 skill 名字（一行一个），agent 判断要用哪个才去
+`tba skill <名字>` 读全文。所以正文可以写长，但名字要短。
+
+## 截图
+
+```bat
+tba shot --out shot.png                    :: 全屏
+tba shot --title "记事本" --out n.png      :: 按窗口标题（包含匹配）
+tba shot --hwnd 123456 --out n.png         :: 直接给句柄
+```
+
+- BitBlt 抓屏，带 `CAPTUREBLT`，**后台窗口也能截**，不用把窗口提到前台。
+- 指定窗口时先 `PrintWindow(PW_RENDERFULLCONTENT)`，失败回落窗口 DC。
+- 输出 8 位 RGBA PNG，不压缩。全屏 1920x1080 约 8 MB。
+- 目录不存在会自动建。
 
 ## 接单 / 提问 / 等回复 / 收尾
 
@@ -560,15 +592,23 @@ tba skill 部署流程 --project <id>   :: 打印该 skill 全文
 
 ## 窗口设置（字号）
 
-窗口左侧栏 → `⚙ 设置`，可以调字号（12–40，默认 **22**）。egui 自带约 14pt，中文在这个尺寸下很吃力，所以默认给 22。
+窗口左侧栏 → `设置`，填字号（12–40，默认 **18**）。egui 自带约 14pt，中文在这个尺寸下很吃力，所以默认给 18。
+
+输入框直接打数字，失焦后回写实际生效值（打 999 会变成 40，框里也显示 40）。
 
 改完立刻生效（正文、侧栏、按钮一起等比放大），并落盘到 `data/ui.toml`：
 
 ```toml
-font_size = 22.0
+font_size = 18.0
 ```
 
 > 界面偏好单独存 `data/ui.toml`，不写 `config.toml`——后者存着访问令牌和工具映射，整体覆写风险太大。
+
+**中文字体**：按 `msyh.ttc`（微软雅黑）→ `Deng.ttf`（等线）→ `simsun.ttc` → `seguisym.ttf`（符号）排一条链。
+只装一个字体时，它缺的字形会渲染成豆腐块（口）——之前只装等线，界面上到处是口，就是这个原因。
+
+**控制台窗口**：exe 是 console 子系统（CLI 要 stdout），双击时 Windows 会先给一个黑窗。
+进 GUI 前调 `FreeConsole()` 把它摘掉，所以双击只看到窗口。CLI 子命令不受影响。
 
 ## MCP 接入
 

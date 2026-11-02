@@ -452,6 +452,12 @@ pub fn run() -> Result<(), String> {
             });
             println!("{}", push_skill(&store, &project, &name, &content)?);
         }
+        Cmd::SkillInit { project, name } => {
+            println!(
+                "{}",
+                crate::ops::init_builtin_skills(&store, &project, name.as_deref())?
+            );
+        }
         Cmd::SkillMem { project, open } => {
             // 项目名只用来写文件标题，取不到就用 id，不阻断导出。
             let mut ctx = Ctx::new(store.clone(), false)?;
@@ -1199,6 +1205,9 @@ pub fn run() -> Result<(), String> {
         }
         Cmd::Ui => {
             crate::ui::run(&store)?;
+        }
+        Cmd::Shot { out, title, hwnd } => {
+            println!("{}", crate::shot::capture(&out, title.as_deref(), hwnd)?);
         }
         Cmd::Reload {
             action,

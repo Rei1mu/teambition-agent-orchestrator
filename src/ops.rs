@@ -2893,6 +2893,106 @@ pub fn push_skill(
     Ok(format!("已创建 skill: {name} ({id})"))
 }
 
+// ---- 内置 skill 模板 ----
+//
+// 为什么要内置：skill 的价值在于「agent 不用自己找路」。让用户手写一遍再粘进 GUI，
+// 十有八九写成「自己拼 PowerShell」，下次还得找。这两条直接推上去，名字短、正文短。
+pub const SKILL_RELEASE: &str = "\
+# 推 release
+
+## 什么时候用
+用户说「发版」「推 release」「出安装包」时。别自己猜流程，按下面走。
+
+## 步骤
+1. `git status --short` + `git log --oneline -5`，确认工作区干净、当前分支对。
+2. 有未提交改动先提交。不要带脏工作区发版。
+3. 升版本号：改 `Cargo.toml` 的 `version`。有 `CHANGELOG.md` 就同步加一条。
+4. `git commit -am \"chore: bump to vX.Y.Z\"`。
+5. `git tag -a vX.Y.Z -m \"vX.Y.Z\"`。
+6. `git push origin HEAD` 和 `git push origin vX.Y.Z`。
+7. 等 CI 绿。有 gh 就 `gh run list --limit 3`；没有就让用户看一眼。
+8. CI 绿了再给下载地址：`<repo>/releases/tag/vX.Y.Z`。
+
+## 红线
+- CI 没绿不许说「已发布」。
+- 不许 force push 已有 tag，除非用户明确要求。
+- 版本号只升不降。
+- 打包脚本改了要先本地跑一次再打 tag。
+";
+
+pub const SKILL_SHOT: &str = "\
+# 截图
+
+## 一条命令
+`tba shot --out shot.png`
+
+## 参数
+- `--out <路径>`：默认 `shot.png`。目录不存在会自动建。
+- `--title <标题片段>`：截指定窗口，标题包含匹配，取第一个可见窗口。
+- `--hwnd <句柄>`：直接给句柄，优先于 `--title`。
+
+## 要点
+- 用 BitBlt 抓屏，**不需要把窗口提到前台**，后台窗口也能截。
+- **不要自己写 PowerShell 截图脚本**，也不要找第三方工具。就这一条命令。
+- 截完用图片查看工具看 `shot.png`，不要凭想象描述界面。
+
+## 典型用法
+1. 全屏：`tba shot --out .tmp/full.png`
+2. 某个窗口：`tba shot --title \"记事本\" --out .tmp/notepad.png`
+3. 只要局部：先全屏截，再让用户说坐标，或直接截窗口。
+";
+
+pub const BUILTIN_SKILLS: &[(&str, &str)] = &[
+    ("release-push", SKILL_RELEASE),
+    ("shot", SKILL_SHOT),
+];
+
+// 把内置模板推成项目 skill。同名会覆盖旧正文（push_skill 的行为）。
+pub fn init_builtin_skills(
+    store: &Store,
+    project_id: &str,
+    only: Option<&str>,
+) -> Result<String, String> {
+    let mut out: Vec<String> = Vec::new();
+    for (name, body) in BUILTIN_SKILLS {
+        if let Some(o) = only {
+            if o != *name {
+                continue;
+            }
+        }
+        out.push(push_skill(store, project_id, name, body)?);
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "没有这个内置 skill: {}（可选 {}）",
+            only.unwrap_or(""),
+            BUILTIN_SKILLS
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        ));
+    }
+    Ok(out.join("\n"))
+}
+
+// 删除 skill：归档那条任务。Teambition 没有硬删除，归档就是不显示。
+pub fn archive_skill(store: &Store, project_id: &str, name: &str) -> Result<String, String> {
+    let mut ctx = Ctx::new(store.clone(), false)?;
+    let Some(state) = ctx.find_state(project_id, SKILL_STATE)? else {
+        return Err("项目还没有 skill 状态".to_string());
+    };
+    let tasks = ctx.list_tasks(project_id, &state)?;
+    let Some(t) = tasks.iter().find(|t| t.title == name) else {
+        return Err(format!("没找到 skill: {name}"));
+    };
+    let tool = ctx
+        .find_tool("teambition.task.archive")
+        .ok_or("MCP 工具集里找不到归档工具（task.archive）")?;
+    ctx.tb.call(&tool, json!({ "taskId": t.id }))?;
+    Ok(format!("已删除 skill: {name}"))
+}
+
 // ---- 导出：把项目 skill / mem 拉成本地两个 md ----
 //
 // 目的：让人在本地直接看到「agent 读到的 skill / mem 到底长什么样」，

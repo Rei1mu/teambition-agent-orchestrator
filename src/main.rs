@@ -8,6 +8,7 @@ mod mail;
 mod mcp_server;
 mod oauth;
 mod ops;
+mod shot;
 mod store;
 mod tb;
 mod tools;
@@ -90,6 +91,14 @@ pub enum Cmd {
         project: String,
         #[arg(long)]
         file: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// 把内置 skill 模板推到项目里（release-push / shot）。同名覆盖
+    SkillInit {
+        #[arg(long)]
+        project: String,
+        /// 只推某一个。不给就推全部
         #[arg(long)]
         name: Option<String>,
     },
@@ -332,6 +341,18 @@ pub enum Cmd {
     Serve,
     /// 打开 egui 窗口
     Ui,
+    /// 截图存 png。BitBlt 抓屏，后台窗口也能截，不用把窗口提到前台
+    Shot {
+        /// 输出路径。目录不存在会自动建
+        #[arg(long, default_value = "shot.png")]
+        out: String,
+        /// 窗口标题（包含匹配，取第一个可见窗口）。不给就截全屏
+        #[arg(long)]
+        title: Option<String>,
+        /// 直接给窗口句柄，优先于 --title
+        #[arg(long)]
+        hwnd: Option<isize>,
+    },
     /// 通用能力：重载。编译 -> 杀旧 -> 复制校验 -> 启动
     Reload {
         /// build | restart | kill | status
