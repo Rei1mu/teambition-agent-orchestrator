@@ -71,7 +71,14 @@ pub fn repo_root() -> Result<PathBuf, String> {
 // 是不是 GitButler 项目。判据是 `but status --json` 能跑通——
 // 比看 .git/but 目录靠谱：`but setup` 之后目录结构会变，命令不会骗人。
 pub fn is_gb_project(dir: &Path) -> bool {
-    matches!(but(dir, &["status", "--json"]), Ok(o) if o.code == 0)
+    // 注意：不能只看 code == 0。目录没 setup 时 but 也返回 0，错误在 stdout 的 JSON 里。
+    match but(dir, &["status", "--json"]) {
+        Ok(o) => matches!(
+            crate::gitbutler::project_setup_from(o.code == 0, &o.out, &o.err),
+            Some(true)
+        ),
+        Err(_) => false,
+    }
 }
 
 fn porcelain(dir: &Path) -> Result<(String, Vec<String>), String> {

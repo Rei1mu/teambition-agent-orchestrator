@@ -121,14 +121,23 @@ pub fn version_from_output(s: &str) -> Option<String> {
         .map(|t| t.trim().to_string())
 }
 
-/// `but status --json` 的退出情况 → 当前目录是不是 GitButler 项目（纯函数，可单测）。
-/// 成功 = true；报 Setup required = false；其它（环境异常等）= None（宁可漏判不误判）。
-pub fn project_setup_from(ok: bool, stderr: &str) -> Option<bool> {
+/// `but status --json` 的输出 → 这个目录是不是 GitButler 项目（纯函数，可单测）。
+///
+/// **不能只看退出码**：目录没 setup 时 `but status --json` 退出码仍是 0，
+/// 错误写在 stdout 的 JSON 里：`{"error":"setup_required","message":"No GitButler
+/// project found at ."}`。早期只看退出码，把「没配置」误判成「已配置」。
+/// 返回：明确是项目 = true；明确没配置 = false；其它（环境异常等）= None（宁可漏判）。
+pub fn project_setup_from(ok: bool, stdout: &str, stderr: &str) -> Option<bool> {
+    let all = format!("{stdout}
+{stderr}");
+    if all.contains("setup_required")
+        || all.contains("Setup required")
+        || all.contains("No GitButler project")
+    {
+        return Some(false);
+    }
     if ok {
         return Some(true);
-    }
-    if stderr.contains("Setup required") || stderr.contains("No GitButler project") {
-        return Some(false);
     }
     None
 }
@@ -185,8 +194,9 @@ fn run_version(path: &Path) -> Option<String> {
 
 fn run_project_setup(path: &Path) -> Option<bool> {
     let out = Command::new(path).args(["status", "--json"]).output().ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    project_setup_from(out.status.success(), &stderr)
+    project_setup_from(out.status.success(), &stdout, &stderr)
 }
 
 /// 检测 GitButler CLI。顺序：**运行目录 > PATH > 桌面安装目录**。
@@ -432,13 +442,23 @@ mod tests {
     }
 
     #[test]
-    fn project_setup_from_maps_exit_and_stderr() {
-        assert_eq!(project_setup_from(true, ""), Some(true));
+    fn project_setup_from_maps_exit_and_output() {
+        assert_eq!(project_setup_from(true, "", ""), Some(true));
         assert_eq!(
-            project_setup_from(false, "Error: Setup required: No GitButler project found at ."),
+            project_setup_from(false, "", "Error: Setup required: No GitButler project found at ."),
             Some(false)
         );
-        assert_eq!(project_setup_from(false, "some other failure"), None);
+        assert_eq!(project_setup_from(false, "", "some other failure"), None);
+        // 真实情况：没 setup 时退出码是 0，错误只在 stdout 的 JSON 里。
+        // 只看退出码会把「没配置」误判成「已配置」（踩过）。
+        assert_eq!(
+            project_setup_from(
+                true,
+                r#"{"error":"setup_required","message":"No GitButler project found at ."}"#,
+                ""
+            ),
+            Some(false)
+        );
     }
 
     #[test]

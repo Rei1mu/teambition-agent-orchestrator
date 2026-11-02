@@ -506,20 +506,18 @@ impl App {
                     }
                     Some(g) if g.found => {
                         let ver = g.version.clone().unwrap_or_else(|| "版本未知".to_string());
-                        ui.colored_label(
+                        let resp = ui.colored_label(
                             egui::Color32::from_rgb(0x2e, 0x7d, 0x32),
                             format!("✓ but {ver}"),
                         );
-                        ui.label(format!("来源: {}", g.source.map(|s| s.label()).unwrap_or("?")));
-                        match g.project_setup {
-                            Some(true) => {
-                                ui.label("· 工作区已配置");
-                            }
-                            Some(false) => {
-                                ui.label("· 当前目录未配置（but setup）");
-                            }
-                            None => {}
+                        if let Some(p) = &g.path {
+                            resp.on_hover_text(format!("路径: {}", p.display()));
                         }
+                        ui.label(format!("来源: {}", g.source.map(|s| s.label()).unwrap_or("?")));
+                        // 这里以前显示「当前目录未配置（but setup）」，纯属误导：
+                        // GUI 是全局窗口，它的启动目录（快捷方式/开始菜单）不是任何项目目录，
+                        // 这个状态既不该在窗口里看、也没法在这儿修。真正用到 but 的是
+                        // `tba git`，它按你执行命令的那个项目目录自己判断。
                         if ui.small_button("重新检测").clicked() {
                             want_check = true;
                         }
