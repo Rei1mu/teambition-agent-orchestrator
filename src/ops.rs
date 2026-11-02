@@ -2950,7 +2950,9 @@ pub const SKILL_RELEASE_TBA: &str = "\
 已有同名文件且内容不同时会拒绝，确认覆盖加 `--force`。
 
 ## 1. 升版本号
-改 `Cargo.toml` 的 `version`，有 CHANGELOG 就加一条，然后提交。
+改 `Cargo.toml` 的 `version`，**然后跑一次 `cargo build` 让 Cargo.lock 跟上**，
+有 CHANGELOG 就加一条，然后提交。
+（CI 用 `--locked`，lock 里还是旧版本号会直接失败：`cannot update the lock file ... --locked`）
 
 ## 2. 一条命令发版
 `tba publish --tag vX.Y.Z --watch`
