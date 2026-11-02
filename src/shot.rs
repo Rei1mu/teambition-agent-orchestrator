@@ -8,13 +8,23 @@
 //!   全屏   BitBlt(GetDC(NULL))，带 CAPTUREBLT 能截到分层窗口
 //!   窗口   PrintWindow(PW_RENDERFULLCONTENT) 优先，失败回落 BitBlt(GetWindowDC)
 //! 两条路都不需要把窗口提到前台，后台窗口也能截。
+//!
+//! 编码：png crate + 自适应行滤波 + fdeflate（`Compression::Fast`）。
+//! 不透明截图自动丢掉 alpha 通道（存 RGB），白捡 25% 体积且完全无损。
+//! 实测 1920x1080 桌面：无压缩 8.0 MB -> fast 约 0.3–0.8 MB。
 
 use std::path::Path;
 
 #[cfg(windows)]
-pub fn capture(out: &str, title: Option<&str>, hwnd: Option<isize>) -> Result<String, String> {
+pub fn capture(
+    out: &str,
+    title: Option<&str>,
+    hwnd: Option<isize>,
+    level: &str,
+) -> Result<String, String> {
     let (w, h, rgba, what) = win::grab(title, hwnd)?;
-    let png = png_encode(w as u32, h as u32, &rgba);
+    let raw = w as usize * h as usize * 4;
+    let png = png_encode(w as u32, h as u32, &rgba, level)?;
     let p = Path::new(out);
     if let Some(dir) = p.parent() {
         if !dir.as_os_str().is_empty() {
@@ -22,96 +32,81 @@ pub fn capture(out: &str, title: Option<&str>, hwnd: Option<isize>) -> Result<St
         }
     }
     std::fs::write(p, &png).map_err(|e| format!("写文件失败 {}: {e}", p.display()))?;
+    let ratio = if png.is_empty() {
+        0.0
+    } else {
+        raw as f64 / png.len() as f64
+    };
     Ok(format!(
-        "已截图: {} ({}x{}, {:.1} KB)\n{}",
+        "已截图: {} ({}x{}, {:.0} KB, 压缩 {:.1}x, level={})\n{}",
         p.display(),
         w,
         h,
         png.len() as f64 / 1024.0,
+        ratio,
+        level,
         what
     ))
 }
 
 #[cfg(not(windows))]
-pub fn capture(_out: &str, _title: Option<&str>, _hwnd: Option<isize>) -> Result<String, String> {
+pub fn capture(
+    _out: &str,
+    _title: Option<&str>,
+    _hwnd: Option<isize>,
+    _level: &str,
+) -> Result<String, String> {
     Err("截图只在 Windows 上可用".to_string())
 }
 
-// ---- 最小 PNG 编码 ----
+// ---- PNG 编码 ----
 //
-// 只为截图服务：不压缩（deflate stored 块），不滤波，8 位 RGBA。
-// 加 image / png crate 要多编一堆代码，而截图对体积不敏感。
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                0xEDB8_8320 ^ (crc >> 1)
-            } else {
-                crc >> 1
-            };
+// 之前是手写「deflate stored 块」（完全不压），全屏 8 MB。agent 每次读图都吃 token，
+// 体积直接等于成本，所以换成真压缩。
+//
+// 三条无损优化，按收益排：
+//   1. 不透明 -> 存 RGB 而不是 RGBA，少 25% 原始字节
+//   2. 自适应行滤波（png crate 的 Adaptive）：截图大面积纯色，滤波后几乎全是 0
+//   3. fdeflate：专门给 PNG 调的 deflate，比 zlib 快一个量级，压缩率还更好
+//
+// level 只影响第 3 步：fast = fdeflate（毫秒级）/ balanced / high = 通用 deflate（慢但更小）。
+fn png_encode(w: u32, h: u32, rgba: &[u8], level: &str) -> Result<Vec<u8>, String> {
+    // 截图基本都是不透明的（BitBlt 不保留 alpha）。真有透明像素才存 RGBA。
+    let opaque = rgba.chunks_exact(4).all(|px| px[3] == 255);
+    let (data, color) = if opaque {
+        let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
+        for px in rgba.chunks_exact(4) {
+            rgb.extend_from_slice(&px[..3]);
         }
+        (rgb, png::ColorType::Rgb)
+    } else {
+        (rgba.to_vec(), png::ColorType::Rgba)
+    };
+
+    let compression = match level {
+        "fast" => png::Compression::Fast,
+        "balanced" => png::Compression::Balanced,
+        "high" => png::Compression::High,
+        other => return Err(format!("未知压缩级别: {other}（可选 fast|balanced|high）")),
+    };
+
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(color);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(compression);
+        // 显式指定自适应滤波：Compression::Fast 默认也是它，但别指望默认值不变。
+        enc.set_filter(png::Filter::Adaptive);
+        let mut writer = enc.write_header().map_err(|e| format!("PNG 头写入失败: {e}"))?;
+        writer
+            .write_image_data(&data)
+            .map_err(|e| format!("PNG 数据写入失败: {e}"))?;
+        writer
+            .finish()
+            .map_err(|e| format!("PNG 收尾失败: {e}"))?;
     }
-    crc ^ 0xFFFF_FFFF
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    let (mut a, mut b) = (1u32, 0u32);
-    for &x in data {
-        a = (a + x as u32) % 65521;
-        b = (b + a) % 65521;
-    }
-    (b << 16) | a
-}
-
-fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(data.len() + 12);
-    v.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    v.extend_from_slice(kind);
-    v.extend_from_slice(data);
-    let mut both = Vec::with_capacity(4 + data.len());
-    both.extend_from_slice(kind);
-    both.extend_from_slice(data);
-    v.extend_from_slice(&crc32(&both).to_be_bytes());
-    v
-}
-
-fn png_encode(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
-    // 每行前面加一个 filter 字节（0 = None）。
-    let stride = (w as usize) * 4;
-    let mut raw = Vec::with_capacity((stride + 1) * h as usize);
-    for y in 0..h as usize {
-        raw.push(0);
-        raw.extend_from_slice(&rgba[y * stride..(y + 1) * stride]);
-    }
-
-    // zlib 头 + deflate stored 块 + adler32
-    let mut z = vec![0x78u8, 0x01];
-    let mut pos = 0usize;
-    while pos < raw.len() {
-        let n = (raw.len() - pos).min(65535);
-        let last = pos + n == raw.len();
-        z.push(if last { 1 } else { 0 });
-        z.extend_from_slice(&(n as u16).to_le_bytes());
-        z.extend_from_slice(&(!(n as u16)).to_le_bytes());
-        z.extend_from_slice(&raw[pos..pos + n]);
-        pos += n;
-    }
-    z.extend_from_slice(&adler32(&raw).to_be_bytes());
-
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&w.to_be_bytes());
-    ihdr.extend_from_slice(&h.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8 位 / RGBA / deflate / 无滤波 / 无隔行
-
-    let mut out = Vec::with_capacity(z.len() + 64);
-    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-    out.extend_from_slice(&chunk(b"IHDR", &ihdr));
-    out.extend_from_slice(&chunk(b"IDAT", &z));
-    out.extend_from_slice(&chunk(b"IEND", &[]));
-    out
+    Ok(out)
 }
 
 #[cfg(windows)]

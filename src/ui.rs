@@ -54,6 +54,10 @@ enum View {
 struct UiPrefs {
     #[serde(default = "default_font_size")]
     font_size: f32,
+    /// 中文字体 key（见 FONT_CHOICES）。空 = 自动（雅黑优先）。
+    /// 存 key 不存路径：路径换机器就失效，key 还能回落。
+    #[serde(default)]
+    font: String,
 }
 
 fn default_font_size() -> f32 {
@@ -64,6 +68,7 @@ impl Default for UiPrefs {
     fn default() -> Self {
         UiPrefs {
             font_size: DEFAULT_FONT_SIZE,
+            font: String::new(),
         }
     }
 }
@@ -114,9 +119,9 @@ pub struct App {
     reload_elevate: bool,
     // 界面偏好（字号）
     font_size: f32,
-    // 设置页字号输入框的原始文本。用 String 存中间态：用户会先删空再打新数字，
-    // 直接绑 f32 的话清空瞬间就变 0，再被夹到下限。
-    font_input: String,
+    // 中文字体 key（空 = 自动）。改了要重装字体，所以记一份已生效的值做差异判断。
+    font_choice: String,
+    applied_font_choice: String,
     // 已经应用到 egui 的字号，避免每帧重复 set_style
     applied_font: f32,
     // GitButler 绑定（优先级高于 Teambition）：None = 还没检测完
@@ -241,25 +246,61 @@ impl WaitForm {
     }
 }
 
+// 可选的中文字体。key 存进 ui.toml，label 给人看，path 是本机路径。
+//
+// 顺序就是默认回退顺序：黑体排第一（用户要求「中文用黑体」），
+// 后面按覆盖度排，最后是符号字体（Segoe UI Symbol），专治 ⚠ ✓ ▾ 这类字符。
+const FONT_CHOICES: &[(&str, &str, &str)] = &[
+    ("simhei", "黑体 SimHei", "C:/Windows/Fonts/simhei.ttf"),
+    ("msyh", "微软雅黑 Microsoft YaHei", "C:/Windows/Fonts/msyh.ttc"),
+    ("deng", "等线 DengXian", "C:/Windows/Fonts/Deng.ttf"),
+    ("simsun", "宋体 SimSun", "C:/Windows/Fonts/simsun.ttc"),
+    ("msjh", "微軟正黑體 JhengHei", "C:/Windows/Fonts/msjh.ttc"),
+    ("pingfang", "苹方 PingFang", "/System/Library/Fonts/PingFang.ttc"),
+    (
+        "notocjk",
+        "Noto Sans CJK",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ),
+];
+
+// 符号字体放链尾。缺了它，界面上的 ⚠ ✓ 会渲染成豆腐块（口）。
+const SYMBOL_FONT: (&str, &str) = ("seguisym", "C:/Windows/Fonts/seguisym.ttf");
+
+fn font_path(key: &str) -> Option<&'static str> {
+    FONT_CHOICES
+        .iter()
+        .find(|c| c.0 == key)
+        .map(|c| c.2)
+        .or_else(|| (SYMBOL_FONT.0 == key).then_some(SYMBOL_FONT.1))
+}
+
 // 装中文字体。
 //
 // 只装一个字体时，它缺的字形会渲染成豆腐块（口）——这就是界面上「好多口」的原因：
 // 等线缺符号和 emoji，遇到 ⚠ ▾ ✓ 这类字符就没字形了。
-// 所以这里按覆盖度排一条链：雅黑 -> 等线 -> 宋体 -> Segoe UI Symbol。
-// 内置英文字体留在链首，英文和数字仍用它渲染。
-fn install_cjk_font(ctx: &egui::Context) {
-    let candidates: &[(&str, &str)] = &[
-        ("msyh", "C:/Windows/Fonts/msyh.ttc"),
-        ("deng", "C:/Windows/Fonts/Deng.ttf"),
-        ("simsun", "C:/Windows/Fonts/simsun.ttc"),
-        ("seguisym", "C:/Windows/Fonts/seguisym.ttf"),
-        ("pingfang", "/System/Library/Fonts/PingFang.ttc"),
-        ("notocjk", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-        ("notocjktruetype", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
-    ];
+// 所以这里按覆盖度排一条链：首选字体 -> 其余中文字体 -> Segoe UI Symbol。
+// 内置英文字体留在链首，英文和数字仍用它渲染，中文落到链上的第一个有字形的字体。
+fn install_cjk_font(ctx: &egui::Context, pref: &str) {
+    let mut order: Vec<(&'static str, &'static str)> = Vec::new();
+    if let Some(p) = font_path(pref) {
+        if let Some(key) = FONT_CHOICES.iter().find(|c| c.0 == pref).map(|c| c.0) {
+            order.push((key, p));
+        }
+    }
+    for c in FONT_CHOICES {
+        if c.0 != pref {
+            order.push((c.0, c.2));
+        }
+    }
+    order.push(SYMBOL_FONT);
+
     let mut fonts = egui::FontDefinitions::default();
     let mut loaded: Vec<&str> = Vec::new();
-    for (key, path) in candidates {
+    for (key, path) in order {
+        if loaded.contains(&key) {
+            continue;
+        }
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
@@ -267,7 +308,7 @@ fn install_cjk_font(ctx: &egui::Context) {
             continue;
         }
         fonts.font_data.insert(
-            (*key).to_owned(),
+            key.to_owned(),
             std::sync::Arc::new(egui::FontData::from_owned(bytes)),
         );
         loaded.push(key);
@@ -324,7 +365,12 @@ impl App {
             } else {
                 "正在连接 Teambition...".to_string()
             },
-            view: View::Projects,
+            view: if std::env::var("TBA_UI_VIEW").as_deref() == Ok("settings") {
+                // 截图验证用：GUI 没法用命令行点按钮，起个指定页才好自查界面。
+                View::Settings
+            } else {
+                View::Projects
+            },
             reload_root,
             reload_name,
             reload_live,
@@ -339,7 +385,8 @@ impl App {
             reload_busy: false,
             reload_elevate: false,
             font_size,
-            font_input: format!("{}", font_size as i32),
+            font_choice: prefs.font.clone(),
+            applied_font_choice: prefs.font.clone(),
             applied_font: 0.0,
             gb: None,
             git_ver: None,
@@ -695,9 +742,15 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        // 字体选择变了就重装字体链。set_fonts 有代价（要重建字形图集），
+        // 所以只在 key 真的变了才做，不能每帧来一次。
+        if self.applied_font_choice != self.font_choice {
+            install_cjk_font(ctx, &self.font_choice);
+            self.applied_font_choice = self.font_choice.clone();
+        }
+
         // 字号变了才重设样式。egui 默认约 14pt，中文在这个尺寸下很吃力。
-        if (self.applied_font - self.font_size).abs() > 0.01 {
-            let s = self.font_size;
+        if (self.applied_font - self.font_size).abs() > 0.01 {            let s = self.font_size;
             let mut style = (*ctx.style()).clone();
             style.text_styles = [
                 (
@@ -1472,26 +1525,98 @@ impl App {
             .spacing([12.0, 10.0])
             .show(ui, |ui| {
                 ui.label("字号 (px)");
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.font_input)
-                        .desired_width(90.0)
-                        .hint_text("18"),
-                );
-                // 改动即时落盘。字号应用由 update() 的 applied_font 差异逻辑负责。
-                // 空/半截数字不落盘，等用户打完；合法值夹到范围内。
-                if resp.changed() {
-                    if let Ok(v) = self.font_input.trim().parse::<f32>() {
-                        let v = v.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+                ui.horizontal(|ui| {
+                    // DragValue：按住左右拖就增减，点一下也能直接打字。
+                    // 不用 Slider——滑块占一整行，拖到 18 这种精确值很难。
+                    let mut size = self.font_size;
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut size)
+                            .speed(1.0)
+                            .range(MIN_FONT_SIZE..=MAX_FONT_SIZE)
+                            .fixed_decimals(0)
+                            .suffix(" px"),
+                    );
+                    if resp.changed() {
+                        let v = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
                         if (v - self.font_size).abs() > 0.01 {
                             self.font_size = v;
-                            save_prefs(&self.store, &UiPrefs { font_size: v });
+                            save_prefs(
+                                &self.store,
+                                &UiPrefs {
+                                    font_size: v,
+                                    font: self.font_choice.clone(),
+                                },
+                            );
                         }
                     }
-                }
-                // 失焦回写实际生效值，别让「999」留在框里骗人。
-                if resp.lost_focus() {
-                    self.font_input = format!("{}", self.font_size as i32);
-                }
+                    if ui.button("-").on_hover_text("小一号").clicked() {
+                        self.font_size = (self.font_size - 1.0).max(MIN_FONT_SIZE);
+                        save_prefs(
+                            &self.store,
+                            &UiPrefs {
+                                font_size: self.font_size,
+                                font: self.font_choice.clone(),
+                            },
+                        );
+                    }
+                    if ui.button("+").on_hover_text("大一号").clicked() {
+                        self.font_size = (self.font_size + 1.0).min(MAX_FONT_SIZE);
+                        save_prefs(
+                            &self.store,
+                            &UiPrefs {
+                                font_size: self.font_size,
+                                font: self.font_choice.clone(),
+                            },
+                        );
+                    }
+                });
+                ui.end_row();
+
+                ui.label("中文字体");
+                let cur_label = FONT_CHOICES
+                    .iter()
+                    .find(|c| c.0 == self.font_choice)
+                    .map(|c| c.1.to_string())
+                    .unwrap_or_else(|| "自动（黑体优先）".to_string());
+                egui::ComboBox::from_id_salt("font_pick")
+                    .selected_text(cur_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(self.font_choice.is_empty(), "自动（黑体优先）")
+                            .clicked()
+                        {
+                            self.font_choice.clear();
+                            save_prefs(
+                                &self.store,
+                                &UiPrefs {
+                                    font_size: self.font_size,
+                                    font: self.font_choice.clone(),
+                                },
+                            );
+                        }
+                        for (key, label, path) in FONT_CHOICES {
+                            // 本机没装的字体也列出来，但标一下，免得选了没反应还不知道为什么。
+                            let ok = std::path::Path::new(path).exists();
+                            let text = if ok {
+                                (*label).to_string()
+                            } else {
+                                format!("{label}（未安装）")
+                            };
+                            if ui
+                                .selectable_label(self.font_choice == *key, text)
+                                .clicked()
+                            {
+                                self.font_choice = (*key).to_string();
+                                save_prefs(
+                                    &self.store,
+                                    &UiPrefs {
+                                        font_size: self.font_size,
+                                        font: self.font_choice.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    });
                 ui.end_row();
 
                 ui.label("预览");
@@ -1750,7 +1875,9 @@ pub fn run(store: &Store) -> Result<(), String> {
         "TBHub",
         options,
         Box::new(move |cc| {
-            install_cjk_font(&cc.egui_ctx);
+            // 先读偏好再装字体：用户选过黑体就别硬上雅黑。
+            let prefs = load_prefs(&store);
+            install_cjk_font(&cc.egui_ctx, &prefs.font);
             Ok(Box::new(App::new(store)))
         }),
     )
@@ -1896,15 +2023,16 @@ mod tests {
         assert!(text.contains("claim"));
     }
 
-    // 字号偏好：默认 22，落盘到 ui.toml，读回来还是 22；越界要被夹住。
+    // 字号偏好：默认 18，落盘到 ui.toml，读回来还是 18；越界要被夹住。
     #[test]
     fn ui_prefs_roundtrip_keeps_font_size() {
         let app = tmp_app("prefs");
-        assert_eq!(app.font_size, DEFAULT_FONT_SIZE, "默认字号应为 22");
+        assert_eq!(app.font_size, DEFAULT_FONT_SIZE, "默认字号应为 18");
         save_prefs(
             &app.store,
             &UiPrefs {
                 font_size: DEFAULT_FONT_SIZE,
+                ..UiPrefs::default()
             },
         );
         let back = load_prefs(&app.store);
@@ -1915,6 +2043,7 @@ mod tests {
             &app.store,
             &UiPrefs {
                 font_size: 999.0,
+                ..UiPrefs::default()
             },
         );
         let app2 = App::new(app.store.clone());
@@ -1923,9 +2052,34 @@ mod tests {
             &app.store,
             &UiPrefs {
                 font_size: 1.0,
+                ..UiPrefs::default()
             },
         );
         let app3 = App::new(app.store.clone());
         assert_eq!(app3.font_size, MIN_FONT_SIZE, "低于下限应夹到 12");
+    }
+
+    // 字体选择要落盘、读回来、且默认是「自动」（空串）。
+    // 存 key 不存路径：换机器路径会变，key 还能回落。
+    #[test]
+    fn ui_prefs_keeps_font_choice() {
+        let app = tmp_app("fontpref");
+        assert!(app.font_choice.is_empty(), "默认应为自动");
+        save_prefs(
+            &app.store,
+            &UiPrefs {
+                font_size: 18.0,
+                font: "simhei".to_string(),
+            },
+        );
+        let back = load_prefs(&app.store);
+        assert_eq!(back.font, "simhei");
+        let app2 = App::new(app.store.clone());
+        assert_eq!(app2.font_choice, "simhei");
+        // 老 ui.toml 只有 font_size 时不能因为缺 font 字段解析失败。
+        std::fs::write(prefs_path(&app.store), "font_size = 20.0\n").unwrap();
+        let old = load_prefs(&app.store);
+        assert_eq!(old.font_size, 20.0);
+        assert!(old.font.is_empty(), "缺字段应回落空串");
     }
 }

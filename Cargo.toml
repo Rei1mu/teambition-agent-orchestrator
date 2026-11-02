@@ -1,6 +1,6 @@
 [package]
 name = "tba-cli"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "TBA - Teambition Agent (CLI + MCP + egui 窗口)"
 default-run = "tba"
@@ -19,6 +19,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # 跟 reqwest 的 default-tls 是同一个后端，不额外拉 openssl/ring。
 native-tls = "0.2"
 chrono = { version = "0.4", features = ["clock"] }
+# 截图压缩：png 0.18 内置 fdeflate（专为 PNG 调的 deflate），
+# 自适应滤波 + 极快压缩，比手写 stored 块小一个数量级。
+png = "0.18"
 egui = "0.31"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 

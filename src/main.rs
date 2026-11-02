@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod capability;
 mod cmds;
 mod config;
+mod git;
 mod gitbutler;
 mod mail;
 mod mcp_server;
@@ -352,7 +353,68 @@ pub enum Cmd {
         /// 直接给窗口句柄，优先于 --title
         #[arg(long)]
         hwnd: Option<isize>,
+        /// 压缩级别: fast(默认，毫秒级) | balanced | high(更小更慢)。都是无损
+        #[arg(long, default_value = "fast")]
+        level: String,
     },
+    /// 通用能力：git。status 看状态 / main 提交并推送 / tag 打标签
+    Git {
+        /// status | main | tag
+        #[arg(default_value = "status")]
+        action: String,
+        /// main 的提交信息
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+        /// 推到哪个分支（默认 origin/HEAD 指向的，再默认 main）
+        #[arg(long)]
+        branch: Option<String>,
+        /// GitButler 项目里额外跑 but land，直接落到目标分支
+        #[arg(long)]
+        land: bool,
+        /// tag 动作的参数，如 v0.2.0（可省略 v）
+        #[arg(long)]
+        tag: Option<String>,
+        /// 只打印将要执行的命令，不执行
+        #[arg(long)]
+        dry: bool,
+    },
+    /// 通用能力：发版。打 tag -> 推 -> (--watch) 等 CI 并列出产物。
+    /// 注意：`release <claim_id>` 是「退回队列」，发版是 `publish`
+    #[command(name = "publish", visible_alias = "rel")]
+    Publish {
+        /// 版本号或 tag，如 0.2.0 / v0.2.0。缺省读 Cargo.toml 的 version
+        #[arg(long)]
+        tag: Option<String>,
+        /// 等 CI 跑完并列出产物（要 GitHub token：GH_TOKEN 或 git 凭据）
+        #[arg(long)]
+        watch: bool,
+        /// owner/repo。缺省从 origin 解析
+        #[arg(long)]
+        repo: Option<String>,
+        /// 只打 tag，不推送
+        #[arg(long)]
+        no_push: bool,
+        /// 只生成 .github/workflows/release.yml（windows x64 + arm64 MSVC）
+        #[arg(long)]
+        init: bool,
+        /// --init 时覆盖已存在的 workflow
+        #[arg(long)]
+        force: bool,
+        /// --watch 最多等多少秒（默认 300，别超过 shell 工具上限）
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+    },
+    /// 删除 skill（归档那条任务，Teambition 没有硬删除）
+    SkillRm {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// 列出内置 skill 模板（不联网，agent 先看有哪些再决定推哪个）
+    SkillTpl,
+    /// 自检：令牌 / PATH / git / GitButler / 字体 / 轮询参数一次全列出来
+    Doctor,
     /// 通用能力：重载。编译 -> 杀旧 -> 复制校验 -> 启动
     Reload {
         /// build | restart | kill | status

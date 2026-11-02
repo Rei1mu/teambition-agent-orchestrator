@@ -2896,55 +2896,119 @@ pub fn push_skill(
 // ---- 内置 skill 模板 ----
 //
 // 为什么要内置：skill 的价值在于「agent 不用自己找路」。让用户手写一遍再粘进 GUI，
-// 十有八九写成「自己拼 PowerShell」，下次还得找。这两条直接推上去，名字短、正文短。
-pub const SKILL_RELEASE: &str = "\
-# 推 release
-
-## 什么时候用
-用户说「发版」「推 release」「出安装包」时。别自己猜流程，按下面走。
-
-## 步骤
-1. `git status --short` + `git log --oneline -5`，确认工作区干净、当前分支对。
-2. 有未提交改动先提交。不要带脏工作区发版。
-3. 升版本号：改 `Cargo.toml` 的 `version`。有 `CHANGELOG.md` 就同步加一条。
-4. `git commit -am \"chore: bump to vX.Y.Z\"`。
-5. `git tag -a vX.Y.Z -m \"vX.Y.Z\"`。
-6. `git push origin HEAD` 和 `git push origin vX.Y.Z`。
-7. 等 CI 绿。有 gh 就 `gh run list --limit 3`；没有就让用户看一眼。
-8. CI 绿了再给下载地址：`<repo>/releases/tag/vX.Y.Z`。
-
-## 红线
-- CI 没绿不许说「已发布」。
-- 不许 force push 已有 tag，除非用户明确要求。
-- 版本号只升不降。
-- 打包脚本改了要先本地跑一次再打 tag。
-";
-
+// 十有八九写成「自己拼 PowerShell」，下次还得找。下面几条直接推上去，名字短、正文短。
+//
+// 每条都对应一个已固化的命令（tba shot / tba git / tba publish），
+// skill 只写「什么时候用、参数是什么、红线在哪」，不写实现细节——实现细节在代码里。
 pub const SKILL_SHOT: &str = "\
 # 截图
 
 ## 一条命令
-`tba shot --out shot.png`
+`tba shot --out .tmp/s.png`
 
 ## 参数
 - `--out <路径>`：默认 `shot.png`。目录不存在会自动建。
 - `--title <标题片段>`：截指定窗口，标题包含匹配，取第一个可见窗口。
 - `--hwnd <句柄>`：直接给句柄，优先于 `--title`。
+- `--level fast|balanced|high`：压缩级别，**都是无损**。默认 fast（毫秒级，全屏约 0.3–0.8 MB）；嫌大用 high。
 
 ## 要点
 - 用 BitBlt 抓屏，**不需要把窗口提到前台**，后台窗口也能截。
 - **不要自己写 PowerShell 截图脚本**，也不要找第三方工具。就这一条命令。
-- 截完用图片查看工具看 `shot.png`，不要凭想象描述界面。
-
-## 典型用法
-1. 全屏：`tba shot --out .tmp/full.png`
-2. 某个窗口：`tba shot --title \"记事本\" --out .tmp/notepad.png`
-3. 只要局部：先全屏截，再让用户说坐标，或直接截窗口。
+- 截完用图片查看工具看 `.tmp/s.png`，不要凭想象描述界面。
 ";
 
-pub const BUILTIN_SKILLS: &[(&str, &str)] = &[
-    ("release-push", SKILL_RELEASE),
-    ("shot", SKILL_SHOT),
+pub const SKILL_GIT: &str = "\
+# 提交并推送
+
+## 先看状态
+`tba git status` —— 分支、脏文件、远端领先/落后、是不是 GitButler 项目。
+
+## 一步提交推送
+`tba git main -m \"feat: 改了什么\"`
+
+- GitButler 项目自动走 `but commit` + `but push`；普通仓库走 `git add -A` + `commit` + `push origin HEAD:<分支>`。
+- 默认推到 origin/HEAD 指向的分支（通常是 main）。要指定加 `--branch`。
+- GitButler 里要直接落到目标分支：加 `--land`。
+- 只想看会跑什么：`--dry`。
+- 只打 tag：`tba git tag --tag v1.2.3`
+
+## 红线
+- 不 force push。push 被拒先 `git pull --rebase`。
+- 不提交 `.env`、token、`data/`。
+- 提交信息写清「改了什么」，别用「update」。
+";
+
+pub const SKILL_RELEASE_TBA: &str = "\
+# 发版（GitHub Actions）
+
+## 0. 仓库还没有 release 流程
+`tba publish --init`
+
+生成 `.github/workflows/release.yml`：windows x64 + windows arm64（MSVC 交叉编译）
+两个 job，有 `installer/*.iss` 就出 setup.exe，没有就出 zip，tag 推上去自动发 Release。
+已有同名文件且内容不同时会拒绝，确认覆盖加 `--force`。
+
+## 1. 升版本号
+改 `Cargo.toml` 的 `version`，有 CHANGELOG 就加一条，然后提交。
+
+## 2. 一条命令发版
+`tba publish --tag vX.Y.Z --watch`
+
+打 tag -> 推 tag -> 等 CI -> 列产物。没有 `--tag` 时读 Cargo.toml 的 version。
+`--watch` 需要 GitHub token（`GH_TOKEN` 环境变量，或 git 凭据里存过）；
+拿不到就只打 tag，自己开 Actions 页看。
+
+## 3. 收尾
+CI 绿了再给用户地址：`https://github.com/<owner>/<repo>/releases/tag/vX.Y.Z`
+
+## 红线
+- CI 没绿不许说「已发布」。
+- 版本号只升不降；已有 tag 默认拒绝重打。
+- 打包脚本改了，先本地打一次包再打 tag。
+";
+
+pub const SKILL_GUI: &str = "\
+# 写 GUI 的注意事项
+
+## 字体
+- **中文用黑体**：SimHei（simhei.ttf）或 Microsoft YaHei（msyh.ttc）。别用默认字体，中文会掉成方框。
+- 字体链要有回退：首选 -> 备用中文字体 -> 符号字体（seguisym.ttf）。只装一个字体必然缺字形。
+- 字体要**可配置**：设置里列本机已装字体让用户选，选不到就回落链首。
+
+## 别出豆腐块（口）
+- 符号（⚠ ✓ ▾ ⚙ emoji）先确认目标字体有字形，没有就换成文字，比如「注意：」「设置」。
+- 上线前把所有符号渲染一遍看结果，别只看代码。
+
+## 控件
+- 字号可调，默认 18px。数字用可左右拖的 DragValue，**不要滑块**，也不要只能打字的输入框。
+- 同一区域按钮尺寸统一，`button` 和 `small_button` 别混用。
+- 内容超出窗口要能滚动，底部按钮不能被裁。
+
+## 其它
+- 启动声明 DPI 感知，否则 125%/150% 缩放下整个界面糊。
+- 打包成 GUI 程序别弹控制台黑窗（Windows 上 `FreeConsole`，别改 subsystem，会吞掉 CLI 输出）。
+
+## 验证
+改完必须 `tba shot --title <窗口标题> --out .tmp/ui.png` 截图自己看，不要凭想象说「已修好」。
+";
+
+// (名字, 一句话说明, 正文)。说明给 `tba skill-tpl` 用，agent 先看目录再决定推哪个。
+pub const BUILTIN_SKILLS: &[(&str, &str, &str)] = &[
+    ("shot", "截图：一条命令出 png，后台窗口也能截", SKILL_SHOT),
+    ("git-main", "提交并推送（GitButler 项目自动走 but）", SKILL_GIT),
+    (
+        "release",
+        "发版：生成 workflow / 打 tag / 等 CI / 列产物",
+        SKILL_RELEASE_TBA,
+    ),
+    (
+        "gui-notes",
+        "写 GUI 的注意事项：黑体、字体可选、别出豆腐块",
+        SKILL_GUI,
+    ),
+    // 老名字，保留给已经推过 release-push 的项目（同名覆盖成新版内容）
+    ("release-push", "老名字，等同 release", SKILL_RELEASE_TBA),
 ];
 
 // 把内置模板推成项目 skill。同名会覆盖旧正文（push_skill 的行为）。
@@ -2954,7 +3018,7 @@ pub fn init_builtin_skills(
     only: Option<&str>,
 ) -> Result<String, String> {
     let mut out: Vec<String> = Vec::new();
-    for (name, body) in BUILTIN_SKILLS {
+    for (name, _, body) in BUILTIN_SKILLS {
         if let Some(o) = only {
             if o != *name {
                 continue;
@@ -2968,7 +3032,7 @@ pub fn init_builtin_skills(
             only.unwrap_or(""),
             BUILTIN_SKILLS
                 .iter()
-                .map(|(n, _)| *n)
+                .map(|(n, _, _)| *n)
                 .collect::<Vec<_>>()
                 .join(" / ")
         ));
@@ -3817,7 +3881,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          退出码：0=收到回复；2=超时，改用 `{exe} wait <claim_id>`（别重跑 ask，会重发信）；\
          3=已收尾。\n\
          **禁止 run_in_background，绝不结束会话**——断了没人接你回复。\
-         只有用户能 `done`/`close`，放弃用 `{exe} release`。\n"
+         只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
+         **通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git main -m` 提交推送 / \
+         `publish` 发版 / `shot` 截图 / `reload` 重载。先 `{exe} --help`。\n"
     );
 
     // 四条编码纪律。来自 Karpathy 对 LLM 编码陷阱的总结，专治三种毛病：
@@ -3845,12 +3911,13 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
 
     let mut old = std::fs::read_to_string(&path).unwrap_or_default();
 
-    // 已经是新版就不用动：入口段只有一份、带绝对路径、带「交回」和「流转」。
-    // 「流转」是后加的，用它当版本号——老入口没这句，会被整段替换成新版。
+    // 已经是新版就不用动：入口段只有一份、带绝对路径、带「交回」「流转」「通用能力」。
+    // 这三句当版本号用——老入口缺哪句，就整段替换成新版（不会重复追加）。
     let entry_ok = old.matches(ENTRY_MARK).count() == 1
         && old.contains(&exe)
         && old.contains("**交回**")
-        && old.contains("**流转**");
+        && old.contains("**流转**")
+        && old.contains("**通用能力**");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
 
     // 转发脚本：PATH 没生效时 agent 也能直接跑 `tba.cmd g`，不用找 exe。

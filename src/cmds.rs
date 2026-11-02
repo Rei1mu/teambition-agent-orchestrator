@@ -6,6 +6,99 @@ use crate::Cmd;
 use clap::Parser;
 use std::io::Write;
 
+// 自检：一条命令把「环境到底缺什么」全列出来。
+//
+// 为什么值得单独做：agent 排查「为什么跑不通」时会一个个试（which git / 看 token /
+// 找 exe 路径 / 猜 data 在哪），每次都烧十几秒和一堆 token。这里一次全给。
+fn doctor(store: &Store) -> String {
+    let cfg = store.load_config();
+    let mut s = String::new();
+
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    s.push_str(&format!("exe:   {exe}\n"));
+    s.push_str(&format!("版本:  {}\n", env!("CARGO_PKG_VERSION")));
+    // PATH 里有没有 exe 所在目录：没有的话 agent 只能用绝对路径，`tba` 会报「找不到命令」。
+    let exe_dir = std::path::Path::new(&exe)
+        .parent()
+        .map(|p| p.display().to_string().to_lowercase())
+        .unwrap_or_default();
+    let in_path = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(';')
+        .any(|p| p.trim_end_matches('\\').to_lowercase() == exe_dir.trim_end_matches('\\'));
+    s.push_str(&format!(
+        "PATH:  {}\n",
+        if in_path {
+            "已包含 exe 目录（新终端可直接 tba）"
+        } else {
+            "不含 exe 目录（要么用绝对路径，要么重装/重启终端）"
+        }
+    ));
+
+    s.push_str(&format!(
+        "令牌:  {}\n",
+        match cfg.token() {
+            Some(t) => format!("有（{}…，{} 位）", &t[..t.len().min(6)], t.len()),
+            None => "没有（先 tba login --token <令牌>）".to_string(),
+        }
+    ));
+    s.push_str(&format!("MCP:   {}\n", cfg.mcp_url));
+    s.push_str(&format!("数据:  {}\n", store.root.display()));
+
+    // git / GitButler：这两个是通用能力的地基，缺了 agent 会以为是自己的问题。
+    match crate::gitbutler::git_available() {
+        Some(v) => s.push_str(&format!("git:   {v}\n")),
+        None => s.push_str("git:   没装（提交推送全不可用）\n"),
+    }
+    let gb = crate::gitbutler::detect(store);
+    s.push_str(&format!(
+        "but:   {}\n",
+        match (&gb.version, gb.found) {
+            (Some(v), _) => format!("{v}（{}）", gb.source.map(|x| x.label()).unwrap_or("?")),
+            (None, true) => "装了但取不到版本".to_string(),
+            (None, false) => "没装（tba gitbutler install 可装到运行目录）".to_string(),
+        }
+    ));
+    if let Ok(root) = crate::git::repo_root() {
+        s.push_str(&format!(
+            "仓库:  {}（GitButler 项目: {}）\n",
+            root.display(),
+            if crate::git::is_gb_project(&root) { "是" } else { "否" }
+        ));
+    } else {
+        s.push_str("仓库:  当前目录不在 git 仓库里\n");
+    }
+
+    // 字体：中文界面缺字体就会满屏口口，这条能直接定位。
+    let fonts: Vec<&str> = [
+        ("黑体", "C:/Windows/Fonts/simhei.ttf"),
+        ("雅黑", "C:/Windows/Fonts/msyh.ttc"),
+        ("等线", "C:/Windows/Fonts/Deng.ttf"),
+        ("宋体", "C:/Windows/Fonts/simsun.ttc"),
+    ]
+    .iter()
+    .filter(|(_, p)| std::path::Path::new(p).exists())
+    .map(|(n, _)| *n)
+    .collect();
+    s.push_str(&format!(
+        "字体:  {}\n",
+        if fonts.is_empty() {
+            "一个中文字体都没找到（界面会显示方块）".to_string()
+        } else {
+            fonts.join(" / ")
+        }
+    ));
+
+    // 等待参数：这几个值配错会让「等回复」提前返回，是常见坑。
+    s.push_str(&format!(
+        "轮询:  ask 超时 {}s / 间隔 {}s / 邮件 {}s\n",
+        cfg.wait_timeout_secs, cfg.wait_interval_secs, cfg.mail_poll_secs
+    ));
+    s.trim_end().to_string()
+}
+
 fn fail_msg(action: &str, r: &crate::capability::Outcome) -> String {
     if r.err.is_empty() {
         format!("reload {action} 失败 (exit {})", r.code)
@@ -457,6 +550,16 @@ pub fn run() -> Result<(), String> {
                 "{}",
                 crate::ops::init_builtin_skills(&store, &project, name.as_deref())?
             );
+        }
+        Cmd::SkillRm { project, name } => {
+            println!("{}", crate::ops::archive_skill(&store, &project, &name)?);
+        }
+        Cmd::SkillTpl => {
+            // 只列名字 + 一句说明：agent 先看目录，需要哪个再 --name 单独推。
+            println!("内置 skill 模板（tba skill-init --project <id> [--name <名>]）：");
+            for (n, desc, _) in crate::ops::BUILTIN_SKILLS {
+                println!("  {n:<12} {desc}");
+            }
         }
         Cmd::SkillMem { project, open } => {
             // 项目名只用来写文件标题，取不到就用 id，不阻断导出。
@@ -1206,8 +1309,68 @@ pub fn run() -> Result<(), String> {
         Cmd::Ui => {
             crate::ui::run(&store)?;
         }
-        Cmd::Shot { out, title, hwnd } => {
-            println!("{}", crate::shot::capture(&out, title.as_deref(), hwnd)?);
+        Cmd::Shot {
+            out,
+            title,
+            hwnd,
+            level,
+        } => {
+            println!(
+                "{}",
+                crate::shot::capture(&out, title.as_deref(), hwnd, &level)?
+            );
+        }
+        Cmd::Doctor => {
+            println!("{}", doctor(&store));
+        }
+        Cmd::Git {
+            action,
+            message,
+            branch,
+            land,
+            tag,
+            dry,
+        } => match action.as_str() {
+            "status" | "st" => println!("{}", crate::git::status()?),
+            "main" | "push" => println!(
+                "{}",
+                crate::git::main_push(message.as_deref(), branch.as_deref(), land, dry)?
+            ),
+            "tag" => {
+                let t = tag
+                    .as_deref()
+                    .ok_or("git tag 需要 --tag v1.2.3（或用 tba release）")?;
+                println!("{}", crate::git::tag_push(t, message.as_deref(), dry, false)?);
+            }
+            other => {
+                return Err(format!(
+                    "未知动作: {other}（可选 status | main | tag）"
+                ))
+            }
+        },
+        Cmd::Publish {
+            tag,
+            watch,
+            repo,
+            no_push,
+            init,
+            force,
+            timeout,
+        } => {
+            if init {
+                println!("{}", crate::git::init_workflow(None, force)?);
+            } else {
+                println!(
+                    "{}",
+                    crate::git::release(
+                        tag.as_deref(),
+                        watch,
+                        repo.as_deref(),
+                        no_push,
+                        timeout
+                    )?
+                );
+            }
         }
         Cmd::Reload {
             action,

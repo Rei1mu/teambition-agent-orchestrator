@@ -197,26 +197,31 @@ tba config --url <地址>   :: 切换 MCP 服务地址，token 不动
 `tba claim` 只查「未完成」状态，skill / mem 根本不在查询范围内，不会被领走。
 
 ```bat
-tba skill-push --project <id> --file SKILL.md
-tba skills --project <id>
-tba skill <名字> --project <id>          :: 打印单个 skill 全文（agent 文案按需读它）
+tba skill-push --project <id> --file SKILL.md   :: 新建或更新（同名覆盖）
+tba skills --project <id>                       :: 列出名字 + 开关 + 任务 id
+tba skill <名字> --project <id>                 :: 打印单个 skill 全文（agent 文案按需读它）
+tba skill-rm --project <id> --name <名>         :: 删除（归档那条任务）
 tba switch --project <id> --skill <名> --on
 tba switch --project <id> --skill <名> --off
-tba skill-init --project <id>            :: 推内置模板（release-push / shot）
-tba skill-init --project <id> --name shot
+tba skill-tpl                                   :: 看内置模板有哪些（不联网）
+tba skill-init --project <id>                   :: 推全部内置模板
+tba skill-init --project <id> --name shot       :: 只推一个
 ```
 
 开关只存本地 `data/switches.toml`。不回写 Teambition。
 
-**GUI 里能编辑**：项目卡片展开后，每条 skill 后面有「编辑」「删除」，底下有「+ 新建 skill」。
-编辑窗写名字 + markdown 正文，保存即推到 Teambition（同名覆盖）。删除 = 归档那条任务。
+**GUI 里能编辑**：项目卡片展开后，每条 skill 后面有「编辑」「删除」和开关勾选框，
+底下有「+ 新建 skill」。编辑窗写名字 + markdown 正文，保存即推到 Teambition（同名覆盖）。
+删除 = 归档那条任务。
 
 **内置模板**（`tba skill-init` 推上去，也可以自己在 GUI 里改）：
 
-| 名字 | 内容 |
-|---|---|
-| `release-push` | 发版步骤：升版本号 → 打 tag → 推 → 等 CI 绿 → 才给下载地址。含红线：CI 没绿不许说「已发布」 |
-| `shot` | 截图：`tba shot --out shot.png`，说明 BitBlt 能截后台窗口，禁止自己写 PowerShell |
+| 名字 | 一句话 | 内容 |
+|---|---|---|
+| `shot` | 截图 | `tba shot` 一条命令出图，说明压缩级别、禁止自己写 PowerShell |
+| `git-main` | 提交并推送 | `tba git status` / `tba git main -m`，GitButler 项目自动走 `but` |
+| `release` | 发版 | `tba publish --init` 生成 workflow，`--tag --watch` 打 tag 等 CI |
+| `gui-notes` | 写 GUI 的注意事项 | 中文用黑体、字体要可选、防豆腐块、字号用 DragValue、改完必须截图自查 |
 
 **省 token 的用法**：开工文案里只列 skill 名字（一行一个），agent 判断要用哪个才去
 `tba skill <名字>` 读全文。所以正文可以写长，但名字要短。
@@ -224,14 +229,17 @@ tba skill-init --project <id> --name shot
 ## 截图
 
 ```bat
-tba shot --out shot.png                    :: 全屏
-tba shot --title "记事本" --out n.png      :: 按窗口标题（包含匹配）
-tba shot --hwnd 123456 --out n.png         :: 直接给句柄
+tba shot --out shot.png                        :: 全屏（默认 fast 压缩）
+tba shot --title "记事本" --out n.png          :: 按窗口标题（包含匹配）
+tba shot --hwnd 123456 --out n.png             :: 直接给句柄
+tba shot --level high --out n.png              :: 更小（更慢），仍然无损
 ```
 
 - BitBlt 抓屏，带 `CAPTUREBLT`，**后台窗口也能截**，不用把窗口提到前台。
 - 指定窗口时先 `PrintWindow(PW_RENDERFULLCONTENT)`，失败回落窗口 DC。
-- 输出 8 位 RGBA PNG，不压缩。全屏 1920x1080 约 8 MB。
+- 编码走 `png` crate + 自适应行滤波 + `fdeflate`；不透明截图自动丢 alpha 存 RGB。
+  实测 1920x1080 桌面：8 MB → **465 KB（fast，约 1.7 秒）** / **308 KB（high）**。
+  两个级别都是无损，`fast` 已经是「极致压缩 + 快」的甜点。
 - 目录不存在会自动建。
 
 ## 接单 / 提问 / 等回复 / 收尾
@@ -503,7 +511,60 @@ tba hello                 :: 不介意共用就自动生成（s-3f2a1c）
 
 强杀（进程被直接终止）时第 3 层不执行，靠第 4 层兜底；如果之后**再也没有任何 tba 命令被调用**，回滚会等到下次有人跑 `tba` 时才发生——这是没有常驻进程时的固有限制。
 
-## 通用能力：重载
+## 通用能力
+
+「通用」= 跟 Teambition 无关，任何项目都能用。目的都是**别让 agent 现场摸索**：
+分支叫什么、远端是哪个、CI 跑没跑完、截图怎么截、环境缺什么。
+
+### git / GitButler
+
+```bat
+tba git status                        :: 分支 / 脏文件 / 远端领先落后 / 是不是 GitButler 项目
+tba git main -m "feat: xxx"           :: 提交并推送（默认推到 origin/HEAD 指向的分支）
+tba git main -m "xxx" --land          :: GitButler 项目里再跑 but land，直接落到目标分支
+tba git main -m "xxx" --dry           :: 只打印会跑哪些命令
+tba git tag --tag v1.2.3              :: 打 tag 并推
+```
+
+自动判断走哪条路：
+
+| 仓库 | 执行的命令 |
+|---|---|
+| GitButler 项目（`but status` 能跑通） | `but commit -m` → `but push` →（`--land` 时）`but land` |
+| 普通仓库 | `git add -A` → `git commit -m` → `git push origin HEAD:<分支>` |
+
+为什么不统一走裸 git：GitButler 的改动挂在虚拟分支上，裸 `git commit` 会让工作区
+在 GUI 里显示成游离提交，用户下次打开会看到一堆怪东西。
+
+### 发版（GitHub Actions）
+
+```bat
+tba publish --init                    :: 生成 .github/workflows/release.yml
+tba publish --tag v0.2.0 --watch      :: 打 tag -> 推 -> 等 CI -> 列产物
+tba publish                           :: 不给 --tag 就读 Cargo.toml 的 version
+```
+
+`--init` 生成的 workflow 就是本仓库在用的那套：**windows x64 + windows arm64（MSVC 交叉编译）**
+两个 job，有 `installer/*.iss` 就出 `setup.exe`，没有就出 zip，tag 推上去自动发 Release。
+已有同名文件且内容不同时会拒绝覆盖，确认加 `--force`。
+
+`--watch` 会轮询 GitHub API（token 取 `GH_TOKEN` / `GITHUB_TOKEN`，再退回 git 凭据），
+默认最多等 300 秒，然后打印每个 job 的结论和 Release 产物清单。
+拿不到 token 或查不到时不报错退出——tag 已经推成功了，只提示「自己去 Actions 页看」。
+
+> 名字是 `publish` 不是 `release`：`tba release <claim_id>` 是「退回队列」，占着这个名字。
+
+### 自检
+
+```bat
+tba doctor
+```
+
+一次列出：exe 路径 / 版本 / PATH 里有没有它 / 令牌有没有 / MCP 地址 / 数据目录 /
+git 版本 / `but` 版本 / 当前是不是 GitButler 项目 / 有哪些中文字体 / 三个轮询参数。
+排查「为什么跑不通」时先跑这个，别一个个试。
+
+### 重载
 
 关键流程不靠文字描述，固化成一个命令：**编译 → 杀旧 → 复制校验 → 启动**。
 
@@ -590,22 +651,28 @@ tba skill 部署流程 --project <id>   :: 打印该 skill 全文
 
 `--task` / `--task-file` 的正文会落盘到 `data/tasks/<标题>.md`，文案里给出绝对路径，agent 直接用 `tba start --file` 读，不用你贴正文。
 
-## 窗口设置（字号）
+## 窗口设置（字号 / 字体）
 
-窗口左侧栏 → `设置`，填字号（12–40，默认 **18**）。egui 自带约 14pt，中文在这个尺寸下很吃力，所以默认给 18。
+窗口左侧栏 → `设置`。
 
-输入框直接打数字，失焦后回写实际生效值（打 999 会变成 40，框里也显示 40）。
+**字号**：可左右拖的数字框（DragValue），按住往右拖就变大、往左拖变小，一格 1px；
+旁边还有 `-` / `+` 各一号。范围 12–40，默认 **18**。不用滑块——滑块拖到 18 这种精确值很难。
 
 改完立刻生效（正文、侧栏、按钮一起等比放大），并落盘到 `data/ui.toml`：
 
 ```toml
 font_size = 18.0
+font = ""          # 空 = 自动（黑体优先）；也可填 simhei / msyh / deng / simsun / msjh ...
 ```
 
 > 界面偏好单独存 `data/ui.toml`，不写 `config.toml`——后者存着访问令牌和工具映射，整体覆写风险太大。
 
-**中文字体**：按 `msyh.ttc`（微软雅黑）→ `Deng.ttf`（等线）→ `simsun.ttc` → `seguisym.ttf`（符号）排一条链。
-只装一个字体时，它缺的字形会渲染成豆腐块（口）——之前只装等线，界面上到处是口，就是这个原因。
+**中文字体可选**：设置页「中文字体」下拉列本机已装的中文字体，没装的标「（未安装）」。
+选中后整窗立刻换字体。存的是 key 不是路径，换机器不会因为路径不同而失效。
+
+字体链：**选中的字体** → 其余中文字体（黑体 / 雅黑 / 等线 / 宋体 / 正黑 / 苹方 / Noto）
+→ `seguisym.ttf`（符号）。只装一个字体时，它缺的字形会渲染成豆腐块（口）——
+之前只装等线，界面上到处是口，就是这个原因。
 
 **控制台窗口**：exe 是 console 子系统（CLI 要 stdout），双击时 Windows 会先给一个黑窗。
 进 GUI 前调 `FreeConsole()` 把它摘掉，所以双击只看到窗口。CLI 子命令不受影响。
