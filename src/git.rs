@@ -306,8 +306,14 @@ pub fn tag_push(name: &str, msg: Option<&str>, no_push: bool, force: bool) -> Re
     Ok(format!("已打 tag 并推送: {tag}"))
 }
 
-fn normalize_tag(s: &str) -> String {
-    let t = s.trim();
+fn tag_exists(root: &Path, tag: &str) -> bool {
+    matches!(
+        git(root, &["rev-parse", "--verify", &format!("refs/tags/{tag}")]),
+        Ok(o) if o.code == 0
+    )
+}
+
+fn normalize_tag(s: &str) -> String {    let t = s.trim();
     if t.starts_with('v') || t.contains('-') || t.contains('/') {
         t.to_string()
     } else {
@@ -433,8 +439,15 @@ pub fn release(
             }
         },
     };
-    let mut log = tag_push(&tag, None, no_push, false)?;
-    log.push('\n');
+    let mut log = if tag_exists(&root, &tag) && watch && !no_push {
+        // 打 tag 已经做过了（比如上次 --watch 等到超时），这时不该再报「tag 已存在」，
+        // 直接接着看 CI——超时提示里让用户重跑的就是这条命令。
+        format!("tag {tag} 已存在，跳过打 tag，直接看 CI\n")
+    } else {
+        let mut l = tag_push(&tag, None, no_push, false)?;
+        l.push('\n');
+        l
+    };
     let slug = repo
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty())
