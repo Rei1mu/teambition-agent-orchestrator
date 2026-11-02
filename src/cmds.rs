@@ -414,7 +414,12 @@ pub fn run() -> Result<(), String> {
     }
 
     match cmd {
-        Cmd::GitButler { action } => match action.as_str() {
+        Cmd::GitButler { action, path } => match action.as_str() {
+            "set" => {
+                let p = path.ok_or("要指定 --path <but.exe 路径，或它所在目录>")?;
+                println!("{}", crate::gitbutler::set_path(&store, &p)?);
+            }
+            "clear" => println!("{}", crate::gitbutler::clear_path(&store)?),
             "status" => {
                 let gb = crate::gitbutler::detect(&store);
                 if gb.found {

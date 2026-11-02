@@ -477,6 +477,37 @@ impl App {
         });
     }
 
+    /// 让用户手选 but.exe。选完写 config.toml 并重新检测。
+    ///
+    /// 为什么不做扫盘：扫 Program Files/盘符既慢（实测 1.3 秒起）又可能挑到旧副本，
+    /// 让用户指一次最准；指过一次就记住，下次直接命中。
+    fn pick_but_path(&mut self) {
+        let start = self
+            .gb
+            .as_ref()
+            .and_then(|g| g.path.as_ref())
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(|| self.store.root.clone());
+        let mut dlg = rfd::FileDialog::new()
+            .set_title("选择 GitButler CLI（but.exe）")
+            .set_directory(start);
+        if cfg!(windows) {
+            dlg = dlg.add_filter("but.exe", &["exe"]);
+        }
+        let Some(p) = dlg.pick_file() else {
+            return; // 用户取消，什么都不改
+        };
+        match crate::gitbutler::set_path(&self.store, &p.display().to_string()) {
+            Ok(msg) => {
+                self.status = msg;
+                self.gb = None;
+                self.check_gitbutler();
+            }
+            Err(e) => self.status = format!("指定 but 失败: {e}"),
+        }
+    }
+
     /// 后台把 GitButler CLI 装到运行目录（下载 MSI 约 36MB + 抽取，比较慢）。
     fn install_gitbutler(&mut self) {
         self.gb_busy = true;
@@ -496,6 +527,7 @@ impl App {
         let gb = self.gb.clone();
         let mut want_check = false;
         let mut want_install = false;
+        let mut want_pick = false;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("GitButler").strong());
@@ -506,14 +538,24 @@ impl App {
                     }
                     Some(g) if g.found => {
                         let ver = g.version.clone().unwrap_or_else(|| "版本未知".to_string());
-                        let resp = ui.colored_label(
-                            egui::Color32::from_rgb(0x2e, 0x7d, 0x32),
-                            format!("✓ but {ver}"),
-                        );
+                        // 跑不出 --version 多半是选错了文件（比如桌面版主程序），标黄别标绿。
+                        let (mark, color) = if g.version.is_some() {
+                            ("✓", egui::Color32::from_rgb(0x2e, 0x7d, 0x32))
+                        } else {
+                            ("!", egui::Color32::from_rgb(0xb2, 0x6a, 0x00))
+                        };
+                        let resp = ui.colored_label(color, format!("{mark} but {ver}"));
                         if let Some(p) = &g.path {
                             resp.on_hover_text(format!("路径: {}", p.display()));
                         }
                         ui.label(format!("来源: {}", g.source.map(|s| s.label()).unwrap_or("?")));
+                        if ui
+                            .small_button("指定位置")
+                            .on_hover_text("自动检测不对？手动选一次 but.exe，记住后下次直接用")
+                            .clicked()
+                        {
+                            want_pick = true;
+                        }
                         // 这里以前显示「当前目录未配置（but setup）」，纯属误导：
                         // GUI 是全局窗口，它的启动目录（快捷方式/开始菜单）不是任何项目目录，
                         // 这个状态既不该在窗口里看、也没法在这儿修。真正用到 but 的是
@@ -530,7 +572,7 @@ impl App {
                         ui.label("（优先级高于 Teambition，agent 靠它管分支/提交）");
                         ui.label(
                             egui::RichText::new(
-                                "已找过：环境变量 TBA_BUT / data/bin / PATH / 常见安装目录（含扫盘）",
+                                "已找过：环境变量 TBA_BUT / data/bin / PATH / 常见安装目录（不扫盘）",
                             )
                             .small()
                             .weak(),
@@ -557,8 +599,15 @@ impl App {
             let missing = gb.as_ref().map(|g| !g.found).unwrap_or(false);
             if missing && !self.gb_busy {
                 ui.horizontal(|ui| {
-                    // 两个都是主操作，用同一种按钮：之前一个 button 一个 small_button，
+                    // 三个都是主操作，用同一种按钮：之前一个 button 一个 small_button，
                     // 并排看着一大一小像层级关系，其实不是。
+                    if ui
+                        .button("选择 but.exe 位置")
+                        .on_hover_text("已经装了 GitButler、但装在别处？手动选一次，记到 config.toml")
+                        .clicked()
+                    {
+                        want_pick = true;
+                    }
                     if ui.button("安装到运行目录 (data/bin)").clicked() {
                         want_install = true;
                     }
@@ -590,6 +639,9 @@ impl App {
         }
         if want_install {
             self.install_gitbutler();
+        }
+        if want_pick {
+            self.pick_but_path();
         }
     }
 

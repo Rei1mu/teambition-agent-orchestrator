@@ -54,9 +54,12 @@ pub enum Cmd {
     /// 优先级高于 Teambition：缺它 TBHub 不干活
     #[command(name = "gitbutler")]
     GitButler {
-        /// status | install | path
+        /// status | install | path | set | clear
         #[arg(default_value = "status")]
         action: String,
+        /// set 用：but.exe 路径，或它所在的目录
+        #[arg(long)]
+        path: Option<String>,
     },
     /// 列出企业下所有项目
     Projects,

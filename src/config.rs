@@ -175,6 +175,14 @@ pub struct Config {
     #[serde(default)]
     pub tool_path: String,
 
+    // ---- GitButler CLI 路径 ----
+    //
+    // 自动检测（环境变量 / 运行目录 / PATH / 已知安装目录）都没命中时，
+    // 由用户在窗口里选一次 but.exe，存这里。**不扫盘**：扫盘又慢又容易挑到
+    // 错误的副本，让用户指一次最准。环境变量仍然优先（临时覆盖/脚本用）。
+    #[serde(default)]
+    pub but_path: String,
+
     // 会话心跳阈值（秒）。running 超时未续命 -> 判定会话断开 -> 回滚到 未完成+列1。
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout_secs: u64,
@@ -243,6 +251,7 @@ impl Default for Config {
             tasklist_done: default_tasklist_done(),
             tasklist_closed: default_tasklist_closed(),
             tool_path: String::new(),
+            but_path: String::new(),
             heartbeat_timeout_secs: default_heartbeat_timeout(),
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),

@@ -121,13 +121,16 @@ TBA 每次启动**先过 GitButler 这一关**，再连 Teambition——agent �
 tba gitbutler status     :: 看 CLI 装没装、什么版本、当前目录配没配
 tba gitbutler install    :: 自动装到运行目录 data/bin（无需管理员）
 tba gitbutler path       :: 打印 CLI 路径（脚本用）
+tba gitbutler set --path "D:\gitbutler\but.exe"   :: 手选一次位置（目录也行），记住
+tba gitbutler clear      :: 清掉手选路径，回到自动检测
 ```
 
-- **检测顺序**（前面的赢）：环境变量 `TBA_BUT` / `GITBUTLER_BIN` / `BUT_BIN` → 运行目录 `data/bin` → PATH → 已知安装目录（`Program Files`、`%LOCALAPPDATA%`、`%APPDATA%`、`%PROGRAMDATA%` 下的 `GitButler`）→ 兜底扫这些根目录按名字找 `GitButler*`（最多两层，找到目录再往里 4 层找 `but.exe`）。最后一步只在前面全落空时才做，正常机器不付这个代价。装到运行目录不抢用户自己装的版本，删 `data/bin` 即卸载。
+- **检测顺序**（前面的赢）：环境变量 `TBA_BUT` / `GITBUTLER_BIN` / `BUT_BIN` → `config.toml` 里手选的 `but_path` → 运行目录 `data/bin` → PATH → 已知安装目录（`Program Files`、`%LOCALAPPDATA%`、`%APPDATA%`、`%PROGRAMDATA%` 下的 `GitButler`）。装到运行目录不抢用户自己装的版本，删 `data/bin` 即卸载。
+- **不扫盘**：自动检测只覆盖上面这些常见位置，不会遍历 Program Files/盘符（又慢又可能挑到旧副本）。装在别处（比如 `D:\gitbutler`）就指定一次：窗口状态卡点「选择 but.exe 位置」，或 `tba gitbutler set --path D:\gitbutler\but.exe`（给目录也行）。会跑一次 `but --version` 验活，选错文件（比如桌面版主程序）当场提示；记住后来源显示「手动指定」，`tba gitbutler clear` 可回到自动检测。
 - **Windows 官方只发 MSI**（没有独立 CLI 二进制，官方 `curl -fsSL https://gitbutler.com/install.sh | sh` 也只支持 mac/linux）。自动安装走：下载 MSI zip → `Expand-Archive` 解压 → `msiexec /a /qn TARGETDIR=…` 管理抽取 → 拷贝 `but.exe` → `but --version` 验活。**不需要 UAC、不动注册表**，实测 10 秒左右装完。
 - **git 是系统级依赖**，TBA 不自动装（Git for Windows 装 Program Files 要提权），检测到缺失时引导去 <https://git-scm.com/download/win>。
 - 缺 GitButler/git 时，任何 `tba` 命令都会先打印引导再退出；排查问题可用 `TBA_SKIP_GITBUTLER=1` 强制跳过。
-- 窗口里 CentralPanel 置顶有一张 GitButler 状态卡（版本 + 来源 + 一键安装），悬停版本号可看完整路径。窗口是全局的，「当前目录配没配」不在窗口里判断——真正用到 `but` 的是 `tba git`，它按你执行命令的那个项目目录自己判断（普通仓库走 git，GitButler 项目走 `but commit`）。
+- 窗口里 CentralPanel 置顶有一张 GitButler 状态卡（版本 + 来源 + 一键安装 + 指定位置），悬停版本号可看完整路径。窗口是全局的，「当前目录配没配」不在窗口里判断——真正用到 `but` 的是 `tba git`，它按你执行命令的那个项目目录自己判断（普通仓库走 git，GitButler 项目走 `but commit`）。
 
 ## 快速开始
 
