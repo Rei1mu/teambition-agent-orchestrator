@@ -528,6 +528,13 @@ impl App {
                             "✗ 未检测到 GitButler CLI",
                         );
                         ui.label("（优先级高于 Teambition，agent 靠它管分支/提交）");
+                        ui.label(
+                            egui::RichText::new(
+                                "已找过：环境变量 TBA_BUT / data/bin / PATH / 常见安装目录（含扫盘）",
+                            )
+                            .small()
+                            .weak(),
+                        );
                     }
                 }
             });

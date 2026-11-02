@@ -46,17 +46,20 @@ pub fn run_dir_bin(store: &Store) -> PathBuf {
 /// GitButler CLI 是从哪找到的。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GbSource {
+    /// 环境变量显式指定（TBA_BUT / GITBUTLER_BIN / BUT_BIN）
+    Env,
     /// 运行目录 data/bin（TBHub 自己装的）
     RunDir,
     /// PATH 里（用户自己装的）
     Path,
-    /// GitButler 桌面版默认安装目录里带的 CLI
+    /// GitButler 桌面版安装目录里带的 CLI（固定位置或扫描找到）
     DesktopApp,
 }
 
 impl GbSource {
     pub fn label(self) -> &'static str {
         match self {
+            GbSource::Env => "环境变量",
             GbSource::RunDir => "运行目录",
             GbSource::Path => "PATH",
             GbSource::DesktopApp => "桌面安装",
@@ -157,6 +160,139 @@ fn path_lookup(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// 可以指定 but 路径的环境变量。TBA_BUT 是本项目约定（跟 TBA_MSVC_BIN 一套），
+/// 另外两个是社区常见写法，认一下不亏。值可以是 exe，也可以是目录。
+pub const BUT_ENV_KEYS: &[&str] = &["TBA_BUT", "GITBUTLER_BIN", "BUT_BIN"];
+
+/// 环境变量值 -> but 可执行文件。文件直接用；目录则拼 but 文件名；空/不存在 = None。
+/// 纯函数，方便单测（不读真实环境）。
+pub fn path_from_value(v: &str) -> Option<PathBuf> {
+    let v = v.trim().trim_matches('"');
+    if v.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(v);
+    if p.is_file() {
+        return Some(p);
+    }
+    if p.is_dir() {
+        let c = p.join(but_name());
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// 按 BUT_ENV_KEYS 的顺序读环境变量，第一个有效的算数。
+fn env_but() -> Option<PathBuf> {
+    for k in BUT_ENV_KEYS {
+        let Ok(v) = std::env::var(k) else {
+            continue;
+        };
+        if let Some(p) = path_from_value(&v) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 目录名像不像 GitButler 的安装目录（大小写不敏感）。
+/// 除了 GitButler 本身，也认 `but`（CLI 单独解压时常见）。
+fn is_gb_dir_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("gitbutler") || n == "but"
+}
+
+/// 本机存在的盘符根（C:\ D:\ ...）。只用来扫一层目录名，代价很小，
+/// 但能覆盖 `D:\gitbutler` 这种不在用户目录/Program Files 的装法。
+#[cfg(windows)]
+fn drive_roots() -> Vec<PathBuf> {
+    ('C'..='Z')
+        .map(|c| PathBuf::from(format!("{c}:\\")))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// 在 root 下按目录名找 GitButler（最多 max_depth 层），找到就收、不再往下钻。
+/// 跳过几个明显无关的大目录：扫 Program Files 时不能把时间耗在 WindowsApps 上。
+fn collect_gb_dirs(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > max_depth {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let low = name.to_ascii_lowercase();
+        if matches!(
+            low.as_str(),
+            "node_modules" | "$recycle.bin" | "system volume information" | "windowsapps" | "cache"
+        ) {
+            continue;
+        }
+        if is_gb_dir_name(&name) {
+            out.push(p);
+        } else {
+            collect_gb_dirs(&p, depth + 1, max_depth, out);
+        }
+    }
+}
+
+/// 扫常见根目录，返回找到的 GitButler 安装目录（最多 8 个，防病态目录树）。
+/// 扫常见根目录，返回找到的 GitButler 安装目录（最多 8 个，最多花 1.5 秒）。
+///
+/// 深度按根分开：用户目录要两层（`%LOCALAPPDATA%\Programs\GitButler`），
+/// 系统目录和盘符根只扫一层（`Program Files\GitButler`、`D:\gitbutler`）。
+/// 盘符根扫两层会把整个 D 盘翻一遍，不值当。
+fn scan_gitbutler_dirs() -> Vec<PathBuf> {
+    use std::time::Instant;
+    let start = Instant::now();
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut roots: Vec<(PathBuf, usize)> = Vec::new();
+    #[cfg(windows)]
+    {
+        for k in ["LOCALAPPDATA", "APPDATA"] {
+            if let Ok(v) = std::env::var(k) {
+                if !v.trim().is_empty() {
+                    roots.push((PathBuf::from(v), 2));
+                }
+            }
+        }
+        for k in ["PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA"] {
+            if let Ok(v) = std::env::var(k) {
+                if !v.trim().is_empty() {
+                    roots.push((PathBuf::from(v), 1));
+                }
+            }
+        }
+        for d in drive_roots() {
+            roots.push((d, 1));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        roots.push((PathBuf::from("/usr/local"), 2));
+        roots.push((PathBuf::from("/opt"), 2));
+        roots.push((PathBuf::from("/Applications"), 1));
+    }
+    for (root, depth) in roots {
+        if out.len() >= 8 || start.elapsed().as_millis() > 1500 {
+            break;
+        }
+        collect_gb_dirs(&root, 0, depth, &mut out);
+    }
+    out
+}
+
 /// GitButler 桌面版默认安装位置（MSI 装到 Program Files\GitButler，
 /// 用户目录安装是 %LOCALAPPDATA%\Programs\GitButler）。
 fn desktop_app_dirs() -> Vec<PathBuf> {
@@ -180,6 +316,10 @@ fn desktop_app_dirs() -> Vec<PathBuf> {
             std::env::var("PROGRAMFILES(X86)").unwrap_or_default(),
             "GitButler",
         );
+        // 桌面版不同版本装过这些位置（用户级安装 / 漫游配置 / ProgramData）。
+        push(std::env::var("LOCALAPPDATA").unwrap_or_default(), "GitButler");
+        push(std::env::var("APPDATA").unwrap_or_default(), "GitButler");
+        push(std::env::var("PROGRAMDATA").unwrap_or_default(), "GitButler");
     }
     out
 }
@@ -199,33 +339,58 @@ fn run_project_setup(path: &Path) -> Option<bool> {
     project_setup_from(out.status.success(), &stdout, &stderr)
 }
 
-/// 检测 GitButler CLI。顺序：**运行目录 > PATH > 桌面安装目录**。
+/// 检测 GitButler CLI。顺序（前面的赢）：
+/// **环境变量 > 运行目录 > PATH > 已知安装目录 > 扫常见根目录**。
+///
+/// 最后一步是兜底：桌面版不同版本装的位置不一样（Program Files / LOCALAPPDATA /
+/// ProgramData 都见过），固定路径猜不全，就按目录名找。这一步要遍历目录，所以
+/// 只有前面全落空才做，正常机器不会付出这个代价。
+///
 /// 纯本地操作（最多跑两个子进程取版本/工作区状态），不联网。
 pub fn detect(store: &Store) -> GbStatus {
-    let mut candidates: Vec<(PathBuf, GbSource)> = vec![(run_dir_bin(store), GbSource::RunDir)];
+    let mut quick: Vec<(PathBuf, GbSource)> = Vec::new();
+    if let Some(p) = env_but() {
+        quick.push((p, GbSource::Env));
+    }
+    quick.push((run_dir_bin(store), GbSource::RunDir));
     for name in [but_name(), "git-butler", "git-butler.exe"] {
         if let Some(p) = path_lookup(name) {
-            candidates.push((p, GbSource::Path));
+            quick.push((p, GbSource::Path));
         }
     }
     for d in desktop_app_dirs() {
-        candidates.push((d.join(but_name()), GbSource::DesktopApp));
+        quick.push((d.join(but_name()), GbSource::DesktopApp));
     }
-    for (p, src) in candidates {
+    if let Some(st) = probe(&quick) {
+        return st;
+    }
+
+    // 兜底：扫盘找安装目录。找到目录后再按文件名找 exe（最多 4 层）。
+    for d in scan_gitbutler_dirs() {
+        if let Some(p) = find_by_name_depth(&d, but_name(), 4) {
+            if let Some(st) = probe(&[(p, GbSource::DesktopApp)]) {
+                return st;
+            }
+        }
+    }
+    GbStatus::missing()
+}
+
+/// 按顺序试候选路径，第一个存在的就取版本/工作区状态。
+fn probe(cands: &[(PathBuf, GbSource)]) -> Option<GbStatus> {
+    for (p, src) in cands {
         if !p.is_file() {
             continue;
         }
-        let version = run_version(&p);
-        let project_setup = run_project_setup(&p);
-        return GbStatus {
+        return Some(GbStatus {
             found: true,
-            path: Some(p),
-            source: Some(src),
-            version,
-            project_setup,
-        };
+            path: Some(p.clone()),
+            source: Some(*src),
+            version: run_version(p),
+            project_setup: run_project_setup(p),
+        });
     }
-    GbStatus::missing()
+    None
 }
 
 /// git 在不在（GitButler CLI 依赖 git）。返回版本号，如 2.47.1。
@@ -238,6 +403,26 @@ pub fn git_available() -> Option<String> {
         .split_whitespace()
         .last()
         .map(|v| v.trim().to_string())
+}
+
+/// 带深度限制的 find_by_name。扫安装目录时用：桌面版可能把 CLI 埋在
+/// resources/bin 下，但目录树再深就不该无脑钻了。
+fn find_by_name_depth(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let rd = std::fs::read_dir(dir).ok()?;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if let Some(f) = find_by_name_depth(&p, name, depth - 1) {
+                return Some(f);
+            }
+        } else if p.file_name().map(|n| n == name).unwrap_or(false) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// 递归找目录下第一个指定文件名的文件。
@@ -401,6 +586,8 @@ pub fn print_missing_guidance(gb: &GbStatus, git_ver: &Option<String>) {
         eprintln!("  自动安装（装到运行目录 data/bin，无需管理员、不动注册表）:");
         eprintln!("      tb gitbutler install");
         eprintln!("  Windows 官方只发 MSI，自动安装走「下载 MSI -> 抽取 but.exe」，上面的命令即可。");
+        eprintln!("  已经找过: 环境变量 TBA_BUT/GITBUTLER_BIN/BUT_BIN、data/bin、PATH、常见安装目录（含扫盘）。");
+        eprintln!("  but 在别处的话直接指定: set TBA_BUT=D:\\tools\\but.exe（目录也行）");
         eprintln!("  也可以自己装: {GB_DOWNLOAD_URL}");
         eprintln!("  官方一键安装（仅 mac/linux）: {OFFICIAL_INSTALL_CMD}");
     }
@@ -479,6 +666,59 @@ mod tests {
         assert!(st.found, "运行目录有 but 就算找到");
         assert_eq!(st.source, Some(GbSource::RunDir));
         assert_eq!(st.path.as_ref(), Some(&bin));
+    }
+
+    // 环境变量的值可以是 exe，也可以是目录；空/带引号/不存在都要处理对。
+    #[test]
+    fn path_from_value_accepts_file_and_dir() {
+        let s = tmp_store("envpath");
+        let bin = s.root.join("x").join(but_name());
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"fake").unwrap();
+
+        assert_eq!(path_from_value(&bin.display().to_string()), Some(bin.clone()));
+        // 给目录也行：自动拼 but 文件名
+        assert_eq!(
+            path_from_value(&bin.parent().unwrap().display().to_string()),
+            Some(bin.clone())
+        );
+        // 环境变量里常带引号（Windows 路径有空格时）
+        assert_eq!(
+            path_from_value(&format!("\"{}\"", bin.display())),
+            Some(bin.clone())
+        );
+        assert_eq!(path_from_value("   "), None);
+        assert_eq!(path_from_value(r"D:\definitely\not\here.exe"), None);
+    }
+
+    #[test]
+    fn gb_dir_name_is_case_insensitive() {
+        assert!(is_gb_dir_name("GitButler"));
+        assert!(is_gb_dir_name("gitbutler"));
+        assert!(is_gb_dir_name("GitButler Nightly"));
+        assert!(is_gb_dir_name("but"));
+        assert!(!is_gb_dir_name("Google"));
+    }
+
+    // 扫盘兜底：桌面版把 but.exe 埋在 resources/bin 下，固定路径猜不到。
+    #[test]
+    fn scan_finds_but_under_gitbutler_dir() {
+        let s = tmp_store("scan");
+        let dir = s
+            .root
+            .join("Apps")
+            .join("GitButler")
+            .join("resources")
+            .join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join(but_name());
+        std::fs::write(&exe, b"fake").unwrap();
+
+        let mut found = Vec::new();
+        collect_gb_dirs(&s.root, 0, 2, &mut found);
+        assert_eq!(found.len(), 1, "应该认出 Apps/GitButler: {found:?}");
+        let hit = find_by_name_depth(&found[0], but_name(), 4).expect("目录里应该能找到 but");
+        assert_eq!(hit, exe);
     }
 
     #[test]
