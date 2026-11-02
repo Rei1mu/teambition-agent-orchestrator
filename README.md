@@ -219,17 +219,13 @@ tba skill-init --project <id> --name shot       :: 只推一个
 底下有「+ 新建 skill」。编辑窗写名字 + markdown 正文，保存即推到 Teambition（同名覆盖）。
 删除 = 归档那条任务。
 
-**内置模板**（`tba skill-init` 推上去，也可以自己在 GUI 里改）：
+**内置模板不再往项目里推。** `shot` / `git-main` / `release` / `gui-notes` 这些是
+跟项目无关的通用能力，现在放在本地「能力」库里（见上一节 `tba cap`），所有项目共用，
+窗口里能直接改。`tba skill-init` 仍然保留，只在「确实要把某条流程钉在云端这个项目」
+时才用（比如团队里别人也要看）。
 
-| 名字 | 一句话 | 内容 |
-|---|---|---|
-| `shot` | 截图 | `tba shot` 一条命令出图，说明压缩级别、禁止自己写 PowerShell |
-| `git-main` | 提交并推送 | `tba git status` / `tba git main -m`，GitButler 项目自动走 `but` |
-| `release` | 发版 | `tba publish --init` 生成 workflow，`--tag --watch` 打 tag 等 CI |
-| `gui-notes` | 写 GUI 的注意事项 | 中文用黑体、字体要可选、防豆腐块、字号用 DragValue、改完必须截图自查 |
-
-**省 token 的用法**：开工文案里只列 skill 名字（一行一个），agent 判断要用哪个才去
-`tba skill <名字>` 读全文。所以正文可以写长，但名字要短。
+**省 token 的用法**：开工文案里只列 skill / 能力的名字（一行一个），agent 判断要用
+哪个才去 `tba skill <名字>` / `tba cap <名字>` 读全文。所以正文可以写长，但名字要短。
 
 ## 截图
 
@@ -520,6 +516,31 @@ tba hello                 :: 不介意共用就自动生成（s-3f2a1c）
 
 「通用」= 跟 Teambition 无关，任何项目都能用。目的都是**别让 agent 现场摸索**：
 分支叫什么、远端是哪个、CI 跑没跑完、截图怎么截、环境缺什么。
+
+### 能力（本地文本库，可增删改查）
+
+**能力**是「这台机器上的 tba 能干什么」，存本地 `data/caps.toml`，**跨项目共享**。
+项目 skill 是另一套（存 Teambition 云端、按项目隔离），两者别混：项目 skill 写
+「这个项目怎么干活」，能力写「本机有哪些固化的流程」。
+
+```bat
+tba cap list                                   :: 目录：名字 + 一句话 + 开关
+tba cap shot                                   :: 读正文（等同 tba cap show shot）
+tba cap add deploy-web --summary "部署：打包并上传" --body DEPLOY.md
+tba cap add deploy-web --summary "..." --body -  :: 正文从 stdin 读（可管道/重定向）
+tba cap edit shot --body new.md                :: 改正文（不给 --body 保留原文）
+tba cap on shot  /  tba cap off shot           :: 开关（关掉不进 agent 文案）
+tba cap rm shot                                :: 删除
+tba cap restore                                :: 补齐缺失的内置能力
+tba cap path                                   :: 打印 caps.toml 路径
+```
+
+窗口里在 **通用能力 → 能力（可编辑）**：列表带开关，每条能「编辑」「删除」，
+顶部「新增」「恢复内置」。改完立刻落盘，agent 下次 `tba cap <名字>` 读到的就是新正文。
+
+内置 5 条：`reload`（重载）/ `shot`（截图）/ `git-main`（提交推送）/ `release`（发版）/
+`gui-notes`（写 GUI 的注意事项）。内置条目正文可改、删了能恢复（`tba cap restore`）。
+「重载」页顶上也能直接跳到这条能力的编辑窗。
 
 ### git / GitButler
 

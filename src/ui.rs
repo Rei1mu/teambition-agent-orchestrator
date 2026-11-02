@@ -2,6 +2,7 @@ use crate::ops::{
     agent_prompt_from, archive_skill, draft_for_mode, ensure_memory_state, export_skill_mem,
     list_skills, open_folder, push_skill, CopyMode, Lang, SkillItem,
 };
+use crate::caps::{self, Cap};
 use crate::oauth::TOKEN_PAGE;
 use crate::store::Store;
 use eframe::egui;
@@ -44,6 +45,8 @@ enum Ev {
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Projects,
+    /// 通用能力：本地、跨项目的文本能力库，可增删改查
+    Caps,
     Reload,
     Settings,
 }
@@ -141,6 +144,11 @@ pub struct App {
     // skill 编辑窗。Some 时显示；保存/删除都在后台线程，写完重拉列表。
     skill_edit: Option<SkillEdit>,
     skill_saving: bool,
+    // 通用能力：本地文件（data/caps.toml），读写都是同步的，不用后台线程。
+    caps: Vec<Cap>,
+    cap_edit: Option<CapEdit>,
+    // 删除前的二次确认（存名字）
+    cap_del: Option<String>,
 }
 
 // skill 编辑窗的编辑态。正文是整段 markdown，直接存 String。
@@ -152,6 +160,45 @@ struct SkillEdit {
     content: String,
     // true = 新建（保存时若同名已存在，push_skill 会当成更新）
     is_new: bool,
+}
+
+// 通用能力编辑窗的编辑态。on / builtin 是原值，保存时原样带回——
+// 编辑正文不该顺手把用户关掉的开关打开，也不该把内置标记丢掉。
+#[derive(Clone)]
+struct CapEdit {
+    name: String,
+    summary: String,
+    body: String,
+    on: bool,
+    builtin: bool,
+    is_new: bool,
+    err: String,
+}
+
+impl CapEdit {
+    fn new() -> CapEdit {
+        CapEdit {
+            name: String::new(),
+            summary: String::new(),
+            body: String::new(),
+            on: true,
+            builtin: false,
+            is_new: true,
+            err: String::new(),
+        }
+    }
+
+    fn from(c: &Cap) -> CapEdit {
+        CapEdit {
+            name: c.name.clone(),
+            summary: c.summary.clone(),
+            body: c.body.clone(),
+            on: c.on,
+            builtin: c.builtin,
+            is_new: false,
+            err: String::new(),
+        }
+    }
 }
 
 // 设置页的邮件表单。端口用 String 存，方便输入中间态（空/半个数字）。
@@ -347,6 +394,13 @@ impl App {
         let font_size = prefs.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         // 邮件表单要预填，先读一份配置（store 之后会被 move 进 App）。
         let store_cfg = store.load_config();
+        // 通用能力是本地文件，窗口打开时读一次即可（不存在会灌一份内置模板）。
+        let caps_rows = caps::list(&store);
+        // 截图验证用：TBA_UI_CAP=shot 直接打开那条能力的编辑窗（GUI 没法用命令行点按钮）。
+        let cap_edit0 = std::env::var("TBA_UI_CAP")
+            .ok()
+            .and_then(|n| caps::get(&store, &n))
+            .map(|c| CapEdit::from(&c));
         let mut app = App {
             store,
             tx,
@@ -365,11 +419,12 @@ impl App {
             } else {
                 "正在连接 Teambition...".to_string()
             },
-            view: if std::env::var("TBA_UI_VIEW").as_deref() == Ok("settings") {
+            view: match std::env::var("TBA_UI_VIEW").as_deref() {
                 // 截图验证用：GUI 没法用命令行点按钮，起个指定页才好自查界面。
-                View::Settings
-            } else {
-                View::Projects
+                Ok("settings") => View::Settings,
+                Ok("caps") => View::Caps,
+                Ok("reload") => View::Reload,
+                _ => View::Projects,
             },
             reload_root,
             reload_name,
@@ -399,6 +454,9 @@ impl App {
             skillmem_busy: None,
             skill_edit: None,
             skill_saving: false,
+            caps: caps_rows,
+            cap_edit: cap_edit0,
+            cap_del: None,
         };
         if !needs_token {
             app.reload_projects();
@@ -806,6 +864,13 @@ impl eframe::App for App {
                 ui.add_space(12.0);
                 ui.label(egui::RichText::new("通用能力").small().weak());
                 if ui
+                    .selectable_label(self.view == View::Caps, "能力（可编辑）")
+                    .on_hover_text("本地、跨项目的文本能力库：增删改查 + 开关")
+                    .clicked()
+                {
+                    self.view = View::Caps;
+                }
+                if ui
                     .selectable_label(self.view == View::Reload, "重载")
                     .on_hover_text("编译 -> 杀旧 -> 复制校验 -> 启动")
                     .clicked()
@@ -839,7 +904,7 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("TBHub · Teambition 共享 Skill");
+                ui.heading("TBHub · 项目与能力");
                 if !self.needs_token {
                     if ui.button("刷新").clicked() {
                         self.reload_projects();
@@ -875,6 +940,15 @@ impl eframe::App for App {
             // 缺 CLI 时给一键安装（装到运行目录，无需管理员）。
             self.draw_gitbutler_card(ui);
             ui.add_space(6.0);
+            if self.view == View::Caps {
+                // 能力列表可能很长（尤其字号大时），必须套滚动区，否则底部行被裁掉。
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.draw_caps(ui);
+                    });
+                return;
+            }
             if self.view == View::Settings {
                 // 设置页比一屏高（尤其字号调到 22+ 时），不套滚动区的话
                 // 下面的「IMAP 主机」和保存/测试按钮会被直接裁掉，看着就像「只有 SMTP」。
@@ -1202,10 +1276,262 @@ impl eframe::App for App {
 
         // 编辑窗画在最上层，不受侧栏/中央面板影响。
         self.draw_skill_editor(ctx);
+        self.draw_cap_editor(ctx);
+        self.draw_cap_delete(ctx);
     }
 }
 
 impl App {
+    // 通用能力页：本地、跨项目的文本能力库。
+    //
+    // 和「项目列表」里的 skill 是两套东西：项目 skill 存 Teambition 云端、按项目隔离，
+    // 换台设备/换个项目就没了；能力是这台机器上的 tba 能干什么，存 data/caps.toml，
+    // 所有项目共用，也正因为如此才需要在这里直接改，而不是每次都发版改代码。
+    fn draw_caps(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("能力");
+            if ui.button("新增").on_hover_text("新建一条本地能力").clicked() {
+                self.cap_edit = Some(CapEdit::new());
+            }
+            if ui
+                .button("恢复内置")
+                .on_hover_text("补齐缺失的内置能力；已存在的只把正文拉回默认，开关不动")
+                .clicked()
+            {
+                self.status = match caps::restore(&self.store, None) {
+                    Ok(s) => s,
+                    Err(e) => format!("恢复失败: {e}"),
+                };
+                self.caps = caps::list(&self.store);
+            }
+            if ui.button("打开数据目录").clicked() {
+                if let Err(e) = crate::ops::open_folder(&self.store.root) {
+                    self.status = format!("打开目录失败: {e}");
+                }
+            }
+        });
+        ui.label(
+            "本地、跨项目：不跟着 Teambition 项目走，换项目也还在。agent 用 `tba cap list` \
+             看目录、`tba cap <名字>` 读正文；关掉的能力不会进 agent 文案。",
+        );
+        ui.add_space(6.0);
+
+        let total = self.caps.len();
+        let on = self.caps.iter().filter(|c| c.on).count();
+        ui.label(egui::RichText::new(format!("{total} 条，启用 {on} 条")).weak());
+        ui.separator();
+
+        if total == 0 {
+            ui.label("还没有能力。点「新增」写一条，或「恢复内置」找回默认的几条。");
+            return;
+        }
+
+        // 行内动作攒到循环外统一处理：闭包里同时改 self 会打架。
+        let mut toggle: Option<(String, bool)> = None;
+        let mut edit: Option<Cap> = None;
+        let mut del: Option<String> = None;
+        for c in self.caps.clone() {
+            ui.horizontal(|ui| {
+                let mut is_on = c.on;
+                if ui
+                    .checkbox(&mut is_on, "")
+                    .on_hover_text("开关：关掉后不进 agent 文案，但正文还在")
+                    .changed()
+                {
+                    toggle = Some((c.name.clone(), is_on));
+                }
+                ui.label(egui::RichText::new(&c.name).monospace().strong());
+                if c.builtin {
+                    ui.label(egui::RichText::new("内置").small().weak());
+                }
+                ui.label(egui::RichText::new(&c.summary).weak());
+                // 按钮靠右、尺寸统一：先加的在右边，所以先加「删除」再加「编辑」。
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("删除").clicked() {
+                        del = Some(c.name.clone());
+                    }
+                    if ui.button("编辑").clicked() {
+                        edit = Some(Cap::clone(&c));
+                    }
+                });
+            });
+            ui.separator();
+        }
+
+        if let Some((n, v)) = toggle {
+            match caps::set_on(&self.store, &n, v) {
+                Ok(m) => self.status = m,
+                Err(e) => self.status = format!("改开关失败: {e}"),
+            }
+            self.caps = caps::list(&self.store);
+        }
+        if let Some(c) = edit {
+            self.cap_edit = Some(CapEdit::from(&c));
+        }
+        if let Some(n) = del {
+            self.cap_del = Some(n);
+        }
+    }
+
+    // 能力编辑窗。新增和编辑共用：名字在编辑时锁住（改名等于换键，删了重建更清楚）。
+    fn draw_cap_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut ed) = self.cap_edit.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new(if ed.is_new { "新增能力" } else { "编辑能力" })
+            .collapsible(false)
+            .resizable(true)
+            .default_width(700.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("名字（agent 用它 `tba cap <名字>` 取正文；只能用字母、数字、- 和 _）:");
+                ui.add_enabled(
+                    ed.is_new,
+                    egui::TextEdit::singleline(&mut ed.name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("例如 deploy-web"),
+                );
+                if !ed.is_new {
+                    ui.label(
+                        egui::RichText::new("编辑时不能改名；要改名就删了重建。")
+                            .small()
+                            .weak(),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.label("一句话说明（列表里给 agent 看，省得它读正文才知道是什么）:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut ed.summary)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("例如 部署：一条命令打包并上传"),
+                );
+                ui.add_space(6.0);
+                ui.label("正文（markdown：什么时候用、参数、红线。实现留在命令里）:");
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut ed.body)
+                                .desired_rows(18)
+                                .desired_width(f32::INFINITY)
+                                .code_editor(),
+                        );
+                    });
+                if !ed.err.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(&ed.err).color(egui::Color32::RED));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let ok = !ed.name.trim().is_empty();
+                    if ui
+                        .add_enabled(ok, egui::Button::new("保存"))
+                        .on_hover_text("写到 data/caps.toml，立刻生效（agent 下次读就是新正文）")
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                    if ed.builtin {
+                        ui.label(
+                            egui::RichText::new("内置条目：改坏了可以「恢复内置」")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                });
+            });
+
+        if cancel || !open {
+            self.cap_edit = None;
+            return;
+        }
+        // 打字中间态要留住，否则每帧被上一帧覆盖。
+        self.cap_edit = Some(ed.clone());
+        if !save {
+            return;
+        }
+        let name = ed.name.trim().to_string();
+        if let Err(e) = caps::check_name(&name) {
+            ed.err = e;
+            self.cap_edit = Some(ed);
+            return;
+        }
+        // 新增撞名直接拒绝：覆盖内置条目是最容易后悔的操作，要改请点那一条的「编辑」。
+        if ed.is_new && caps::get(&self.store, &name).is_some() {
+            ed.err = format!("已有同名能力「{name}」，改个名字，或直接编辑那一条。");
+            self.cap_edit = Some(ed);
+            return;
+        }
+        let cap = Cap {
+            name,
+            summary: ed.summary.trim().to_string(),
+            on: ed.on,
+            builtin: ed.builtin,
+            body: ed.body.clone(),
+        };
+        match caps::upsert(&self.store, cap) {
+            Ok(m) => {
+                self.status = m;
+                self.caps = caps::list(&self.store);
+                self.cap_edit = None;
+            }
+            Err(e) => {
+                ed.err = e;
+                self.cap_edit = Some(ed);
+            }
+        }
+    }
+
+    // 删除前的二次确认。内置条目能恢复，自定义条目删了就是真没了。
+    fn draw_cap_delete(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.cap_del.clone() else {
+            return;
+        };
+        let builtin = self.caps.iter().any(|c| c.name == name && c.builtin);
+        let mut open = true;
+        let mut yes = false;
+        let mut cancel = false;
+        egui::Window::new("删除能力")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("确定删除「{name}」？"));
+                ui.label(if builtin {
+                    "这是内置条目，删了可以在「能力」页点「恢复内置」找回。"
+                } else {
+                    "自定义条目删了就没了，要留就先复制正文备份。"
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("删除").clicked() {
+                        yes = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if yes {
+            self.status = match caps::remove(&self.store, &name) {
+                Ok(m) => m,
+                Err(e) => format!("删除失败: {e}"),
+            };
+            self.caps = caps::list(&self.store);
+            self.cap_del = None;
+        } else if cancel || !open {
+            self.cap_del = None;
+        }
+    }
+
     // skill 编辑窗。新建和编辑共用一套：is_new 只影响标题文字。
     // 保存走 push_skill（同名则更新），删除走 archive_skill。
     fn draw_skill_editor(&mut self, ctx: &egui::Context) {
@@ -1312,8 +1638,34 @@ impl App {
 
     // 通用能力：重载。编译 -> 杀旧 -> 复制校验 -> 启动。
     fn draw_reload(&mut self, ui: &mut egui::Ui) {
-        ui.heading("重载");
+        ui.horizontal(|ui| {
+            ui.heading("重载");
+            if ui
+                .button("编辑这条能力的文本")
+                .on_hover_text("正文在「通用能力 → 能力」里，agent 读的就是它；改完立刻生效")
+                .clicked()
+            {
+                match caps::get(&self.store, "reload") {
+                    Some(c) => {
+                        self.cap_edit = Some(CapEdit::from(&c));
+                    }
+                    None => {
+                        self.status =
+                            "reload 这条能力被删了：去「能力」页点「恢复内置」找回。".to_string();
+                        self.view = View::Caps;
+                    }
+                }
+            }
+        });
         ui.label("编译 → 杀旧 → 复制校验 → 启动。退出码是唯一真值，cargo 输出只进 target/reload.log。");
+        ui.label(
+            egui::RichText::new(
+                "这条流程本身是命令（tba reload），下面的按钮只是入口；\
+                 说明/红线是文本能力，agent 用 `tba cap reload` 读。",
+            )
+            .small()
+            .weak(),
+        );
         ui.add_space(10.0);
 
         egui::Grid::new("reload_form")
@@ -1868,7 +2220,7 @@ pub fn run(store: &Store) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([920.0, 640.0])
-            .with_title("TBHub - Teambition 共享 Skill"),
+            .with_title("TBHub - 项目与能力"),
         ..Default::default()
     };
     eframe::run_native(
@@ -2081,5 +2433,43 @@ mod tests {
         let old = load_prefs(&app.store);
         assert_eq!(old.font_size, 20.0);
         assert!(old.font.is_empty(), "缺字段应回落空串");
+    }
+
+    // 能力编辑窗的保存路径：改内置条目的正文要落盘、能读回，
+    // 且不能顺手把开关或内置标记改掉（那是用户自己的选择）。
+    #[test]
+    fn cap_edit_keeps_switch_and_builtin_flag() {
+        let app = tmp_app("capedit");
+        let mut c = caps::get(&app.store, "shot").expect("首次打开应灌入内置能力");
+        assert!(c.on && c.builtin);
+        c.on = false;
+        c.body = "# 我改过的截图
+只写这一行".to_string();
+        caps::upsert(&app.store, c).unwrap();
+
+        let back = caps::get(&app.store, "shot").unwrap();
+        assert_eq!(back.body, "# 我改过的截图
+只写这一行");
+        assert!(!back.on, "编辑正文不该把用户关掉的开关打开");
+        assert!(back.builtin, "内置标记要留着，否则没法恢复");
+    }
+
+    // 关掉的能力不能出现在 agent 文案里（省 token 也防误用）；
+    // 开着的那几条只出名字，不出正文。
+    #[test]
+    fn disabled_cap_is_not_in_prompt() {
+        let app = tmp_app("capprompt");
+        caps::set_on(&app.store, "shot", false).unwrap();
+        let text = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None, Lang::Zh);
+        let line = text
+            .lines()
+            .find(|l| l.contains("通用能力"))
+            .expect("文案里应该有通用能力这一行");
+        assert!(!line.contains("shot"), "关掉的能力不该出现在名单里: {line}");
+        assert!(line.contains("reload"), "开着的能力应该在名单里: {line}");
+        assert!(
+            !text.contains("## 一条命令"),
+            "能力正文不该内联进文案，否则 token 白烧"
+        );
     }
 }

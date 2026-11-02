@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod capability;
+mod caps;
 mod cmds;
 mod config;
 mod git;
@@ -411,8 +412,26 @@ pub enum Cmd {
         #[arg(long)]
         name: String,
     },
-    /// 列出内置 skill 模板（不联网，agent 先看有哪些再决定推哪个）
+    /// 内置模板已移到本地能力库：这里只做指路（tba cap list）
     SkillTpl,
+    /// 通用能力（本地、跨项目）：增删改查 + 开关。agent 用 list 看目录、用名字读正文
+    #[command(name = "cap", visible_alias = "caps")]
+    Cap {
+        /// list | show | add | edit | rm | on | off | restore | path。
+        /// 缺省 list；也可以直接写能力名（等同 show）
+        action: Option<String>,
+        /// 能力名（show / add / edit / rm / on / off / restore 用）
+        name: Option<String>,
+        /// 一句话说明（列表里显示，agent 看目录用）
+        #[arg(long)]
+        summary: Option<String>,
+        /// 正文：文件路径，或 `-` 读 stdin。add 不给留空，edit 不给保留原文
+        #[arg(long)]
+        body: Option<String>,
+        /// 新建/修改时把这条能力关掉
+        #[arg(long)]
+        off: bool,
+    },
     /// 自检：令牌 / PATH / git / GitButler / 字体 / 轮询参数一次全列出来
     Doctor,
     /// 通用能力：重载。编译 -> 杀旧 -> 复制校验 -> 启动

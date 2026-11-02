@@ -4,6 +4,7 @@ use crate::ops::*;
 use crate::store::Store;
 use crate::Cmd;
 use clap::Parser;
+use std::io::Read;
 use std::io::Write;
 
 // 自检：一条命令把「环境到底缺什么」全列出来。
@@ -243,6 +244,125 @@ fn run_wait_block(
                 c.task_name
             );
             std::process::exit(3);
+        }
+    }
+}
+
+// 通用能力的命令行入口。全是本地文件操作，不联网、不需要 token。
+//
+// 输出原则跟项目 skill 一致：list 只给「名字 + 一句话」，正文靠 show 或直接给名字
+// 单独读——免得 agent 为了找一条命令把五份长文全塞进上下文。
+fn cap_cmd(
+    store: &Store,
+    action: &str,
+    name: Option<&str>,
+    summary: Option<&str>,
+    body: Option<&str>,
+    off: bool,
+) -> Result<String, String> {
+    use crate::caps::{self, Cap};
+
+    let read_body = |src: Option<&str>| -> Result<Option<String>, String> {
+        match src {
+            None => Ok(None),
+            Some("-") => {
+                let mut s = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut s)
+                    .map_err(|e| format!("读 stdin 失败: {e}"))?;
+                Ok(Some(s))
+            }
+            Some(p) => std::fs::read_to_string(p)
+                .map(Some)
+                .map_err(|e| format!("读 {p} 失败: {e}")),
+        }
+    };
+
+    match action {
+        "list" | "ls" => {
+            let all = caps::list(store);
+            if all.is_empty() {
+                return Ok(
+                    "还没有通用能力。用 `tba cap add <名字> --summary \"...\" --body <文件>` 加一条，\n\
+                     或 `tba cap restore` 把内置的恢复回来。"
+                        .to_string(),
+                );
+            }
+            let on = all.iter().filter(|c| c.on).count();
+            let w = all
+                .iter()
+                .map(|c| c.name.chars().count())
+                .max()
+                .unwrap_or(4)
+                .max(4);
+            let mut out = format!("通用能力 {} 条（启用 {}）\n", all.len(), on);
+            for c in &all {
+                out.push_str(&format!(
+                    "  [{}] {:w$}  {}{}\n",
+                    if c.on { "开" } else { "关" },
+                    c.name,
+                    c.summary,
+                    if c.builtin { "" } else { "（自定义）" },
+                    w = w
+                ));
+            }
+            out.push_str("\n读正文: tba cap <名字>\n");
+            out.push_str(&format!("文件: {}", caps::path(store).display()));
+            Ok(out)
+        }
+        "path" => Ok(caps::path(store).display().to_string()),
+        "add" | "set" | "edit" => {
+            let n = name.ok_or("要指定能力名：tba cap add <名字> --summary \"...\"")?;
+            caps::check_name(n)?;
+            let old = caps::get(store, n);
+            let new_body = read_body(body)?;
+            let existed = old.is_some();
+            let cap = Cap {
+                name: n.trim().to_string(),
+                summary: summary
+                    .map(|s| s.to_string())
+                    .or_else(|| old.as_ref().map(|c| c.summary.clone()))
+                    .unwrap_or_default(),
+                on: !off,
+                builtin: old.as_ref().map(|c| c.builtin).unwrap_or(false),
+                body: new_body
+                    .or_else(|| old.as_ref().map(|c| c.body.clone()))
+                    .unwrap_or_default(),
+            };
+            let msg = caps::upsert(store, cap)?;
+            // 编辑时 upsert 保留原开关（用户可能特意关过），要关得显式说。
+            if existed && off {
+                caps::set_on(store, n, false)?;
+            }
+            Ok(msg)
+        }
+        "rm" | "del" | "remove" => caps::remove(
+            store,
+            name.ok_or("要指定能力名：tba cap rm <名字>")?,
+        ),
+        "on" | "off" => caps::set_on(
+            store,
+            name.ok_or("要指定能力名：tba cap on|off <名字>")?,
+            action == "on",
+        ),
+        "restore" => caps::restore(store, name),
+        "show" | "get" => {
+            let n = name.ok_or("要指定能力名：tba cap show <名字>")?;
+            let c = caps::get(store, n)
+                .ok_or_else(|| format!("没有这个能力: {n}（tba cap list 看有哪些）"))?;
+            Ok(c.body)
+        }
+        other => {
+            // `tba cap shot` 直接读正文：少打一个 show，agent 更省事。
+            if name.is_none() {
+                if let Some(c) = caps::get(store, other) {
+                    return Ok(c.body);
+                }
+            }
+            Err(format!(
+                "未知动作: {other}（可选 list | show | add | edit | rm | on | off | restore | path，\
+                 或直接给能力名）"
+            ))
         }
     }
 }
@@ -554,12 +674,33 @@ pub fn run() -> Result<(), String> {
         Cmd::SkillRm { project, name } => {
             println!("{}", crate::ops::archive_skill(&store, &project, &name)?);
         }
+        Cmd::Cap {
+            action,
+            name,
+            summary,
+            body,
+            off,
+        } => {
+            println!(
+                "{}",
+                cap_cmd(
+                    &store,
+                    action.as_deref().unwrap_or("list"),
+                    name.as_deref(),
+                    summary.as_deref(),
+                    body.as_deref(),
+                    off
+                )?
+            );
+        }
         Cmd::SkillTpl => {
-            // 只列名字 + 一句说明：agent 先看目录，需要哪个再 --name 单独推。
-            println!("内置 skill 模板（tba skill-init --project <id> [--name <名>]）：");
-            for (n, desc, _) in crate::ops::BUILTIN_SKILLS {
-                println!("  {n:<12} {desc}");
-            }
+            // 内置模板已经搬进本地能力库：那是跨项目的，agent 平时该用 tba cap。
+            // 这里只做「还认得老命令」的指路，不再列第二份目录，免得两处说法打架。
+            println!("内置模板已移到本地能力库（跨项目共享，窗口里能改）：");
+            println!("  tba cap list     看有哪些");
+            println!("  tba cap <名字>   读正文");
+            println!("可选名字: shot / git-main / release / gui-notes / reload");
+            println!("确实要把某条钉到云端某个项目时才用: tba skill-init --project <id> --name <名>");
         }
         Cmd::SkillMem { project, open } => {
             // 项目名只用来写文件标题，取不到就用 id，不阻断导出。

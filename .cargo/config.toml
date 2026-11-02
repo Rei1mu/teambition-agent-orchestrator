@@ -1,0 +1,9 @@
+# 主线程默认栈只有 1MB。clap 的 derive 会把整个子命令树编进一个巨大的
+# build_cli 函数，debug 构建下这个栈帧能顶到 1MB 上限——加一个子命令就可能
+# 让 `tba --version` 直接 stack overflow（release 因为优化过反而没事）。
+# 统一给 8MB：debug/release 都够用，GUI 的深调用链也顺带受益。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]

@@ -2893,107 +2893,15 @@ pub fn push_skill(
     Ok(format!("已创建 skill: {name} ({id})"))
 }
 
-// ---- 内置 skill 模板 ----
+// ---- 内置能力模板 ----
 //
-// 为什么要内置：skill 的价值在于「agent 不用自己找路」。让用户手写一遍再粘进 GUI，
-// 十有八九写成「自己拼 PowerShell」，下次还得找。下面几条直接推上去，名字短、正文短。
-//
-// 每条都对应一个已固化的命令（tba shot / tba git / tba publish），
-// skill 只写「什么时候用、参数是什么、红线在哪」，不写实现细节——实现细节在代码里。
-pub const SKILL_SHOT: &str = "\
-# 截图
-
-## 一条命令
-`tba shot --out .tmp/s.png`
-
-## 参数
-- `--out <路径>`：默认 `shot.png`。目录不存在会自动建。
-- `--title <标题片段>`：截指定窗口，标题包含匹配，取第一个可见窗口。
-- `--hwnd <句柄>`：直接给句柄，优先于 `--title`。
-- `--level fast|balanced|high`：压缩级别，**都是无损**。默认 fast（毫秒级，全屏约 0.3–0.8 MB）；嫌大用 high。
-
-## 要点
-- 用 BitBlt 抓屏，**不需要把窗口提到前台**，后台窗口也能截。
-- **不要自己写 PowerShell 截图脚本**，也不要找第三方工具。就这一条命令。
-- 截完用图片查看工具看 `.tmp/s.png`，不要凭想象描述界面。
-";
-
-pub const SKILL_GIT: &str = "\
-# 提交并推送
-
-## 先看状态
-`tba git status` —— 分支、脏文件、远端领先/落后、是不是 GitButler 项目。
-
-## 一步提交推送
-`tba git main -m \"feat: 改了什么\"`
-
-- GitButler 项目自动走 `but commit` + `but push`；普通仓库走 `git add -A` + `commit` + `push origin HEAD:<分支>`。
-- 默认推到 origin/HEAD 指向的分支（通常是 main）。要指定加 `--branch`。
-- GitButler 里要直接落到目标分支：加 `--land`。
-- 只想看会跑什么：`--dry`。
-- 只打 tag：`tba git tag --tag v1.2.3`
-
-## 红线
-- 不 force push。push 被拒先 `git pull --rebase`。
-- 不提交 `.env`、token、`data/`。
-- 提交信息写清「改了什么」，别用「update」。
-";
-
-pub const SKILL_RELEASE_TBA: &str = "\
-# 发版（GitHub Actions）
-
-## 0. 仓库还没有 release 流程
-`tba publish --init`
-
-生成 `.github/workflows/release.yml`：windows x64 + windows arm64（MSVC 交叉编译）
-两个 job，有 `installer/*.iss` 就出 setup.exe，没有就出 zip，tag 推上去自动发 Release。
-已有同名文件且内容不同时会拒绝，确认覆盖加 `--force`。
-
-## 1. 升版本号
-改 `Cargo.toml` 的 `version`，**然后跑一次 `cargo build` 让 Cargo.lock 跟上**，
-有 CHANGELOG 就加一条，然后提交。
-（CI 用 `--locked`，lock 里还是旧版本号会直接失败：`cannot update the lock file ... --locked`）
-
-## 2. 一条命令发版
-`tba publish --tag vX.Y.Z --watch`
-
-打 tag -> 推 tag -> 等 CI -> 列产物。没有 `--tag` 时读 Cargo.toml 的 version。
-`--watch` 需要 GitHub token（`GH_TOKEN` 环境变量，或 git 凭据里存过）；
-拿不到就只打 tag，自己开 Actions 页看。
-
-## 3. 收尾
-CI 绿了再给用户地址：`https://github.com/<owner>/<repo>/releases/tag/vX.Y.Z`
-
-## 红线
-- CI 没绿不许说「已发布」。
-- 版本号只升不降；已有 tag 默认拒绝重打。
-- 打包脚本改了，先本地打一次包再打 tag。
-";
-
-pub const SKILL_GUI: &str = "\
-# 写 GUI 的注意事项
-
-## 字体
-- **中文用黑体**：SimHei（simhei.ttf）或 Microsoft YaHei（msyh.ttc）。别用默认字体，中文会掉成方框。
-- 字体链要有回退：首选 -> 备用中文字体 -> 符号字体（seguisym.ttf）。只装一个字体必然缺字形。
-- 字体要**可配置**：设置里列本机已装字体让用户选，选不到就回落链首。
-
-## 别出豆腐块（口）
-- 符号（⚠ ✓ ▾ ⚙ emoji）先确认目标字体有字形，没有就换成文字，比如「注意：」「设置」。
-- 上线前把所有符号渲染一遍看结果，别只看代码。
-
-## 控件
-- 字号可调，默认 18px。数字用可左右拖的 DragValue，**不要滑块**，也不要只能打字的输入框。
-- 同一区域按钮尺寸统一，`button` 和 `small_button` 别混用。
-- 内容超出窗口要能滚动，底部按钮不能被裁。
-
-## 其它
-- 启动声明 DPI 感知，否则 125%/150% 缩放下整个界面糊。
-- 打包成 GUI 程序别弹控制台黑窗（Windows 上 `FreeConsole`，别改 subsystem，会吞掉 CLI 输出）。
-
-## 验证
-改完必须 `tba shot --title <窗口标题> --out .tmp/ui.png` 截图自己看，不要凭想象说「已修好」。
-";
+// 正文统一放在 caps 模块：那是**本地、跨项目**的通用能力库，GUI 里能增删改查，
+// 换项目也还在。这里保留的只是「把某条能力推成项目 skill」的老入口——项目 skill
+// 存在 Teambition 云端、按项目隔离，只在该项目确实要把某条流程钉在云端时才用。
+pub const SKILL_SHOT: &str = crate::caps::BODY_SHOT;
+pub const SKILL_GIT: &str = crate::caps::BODY_GIT;
+pub const SKILL_RELEASE_TBA: &str = crate::caps::BODY_RELEASE;
+pub const SKILL_GUI: &str = crate::caps::BODY_GUI;
 
 // (名字, 一句话说明, 正文)。说明给 `tba skill-tpl` 用，agent 先看目录再决定推哪个。
 pub const BUILTIN_SKILLS: &[(&str, &str, &str)] = &[
@@ -3656,6 +3564,17 @@ fn prompt_body(
             } else {
                 "Read one on demand (do NOT read all):"
             }
+        ));
+    }
+    // 通用能力：本地、跨项目，和项目 skill 是两套东西（skill 存在云端、按项目隔离）。
+    // 压成一行：只列名字，正文不内联——agent 用到哪个才 `cap <名字>` 读哪个。
+    let caps = crate::caps::enabled(store);
+    if !caps.is_empty() {
+        let names: Vec<&str> = caps.iter().map(|c| c.name.as_str()).collect();
+        s.push_str(&format!(
+            "{}{}（`{exe} cap <name>`）\n\n",
+            if zh { "通用能力: " } else { "Capabilities: " },
+            names.join(", ")
         ));
     }
     s.push_str(&workflow_text(
@@ -4473,10 +4392,13 @@ mod tests {
         // 两种语言都量一遍：中文准本也不能超，英文必须更省 token。
         let zh = agent_prompt_from(&store, pid, "项目一", &skills, None, Lang::Zh);
         let en = agent_prompt_from(&store, pid, "项目一", &skills, None, Lang::En);
+
         // 实测（20 个 5000 字 skill）：中文 1756 字符 ≈710 token，英文 2385 字符 ≈615 token。
         // 字符数英文反而更多，但 token 更少——中文字在 BPE 里几乎 1 字 1 token。
         // 预算按实测留一点余量：涨过就说明文案又变长了，要主动确认（用户明确要求「短」）。
-        for (tag, p, budget) in [("中文", &zh, 2100usize), ("英文", &en, 2900usize)] {
+        // v0.2.4 加了一行通用能力名单（约 116 字符，含 exe 路径），预算跟着抬一点；
+        // 再涨就说明文案又变长了，要主动确认。
+        for (tag, p, budget) in [("中文", &zh, 2200usize), ("英文", &en, 3000usize)] {
             assert!(
                 p.chars().count() < budget,
                 "{tag}版文案体积失控: {} 字符（预算 {budget}）",
