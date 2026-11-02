@@ -95,7 +95,7 @@ pub enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// 把内置 skill 模板推到项目里（release-push / shot）。同名覆盖
+    /// 把内置 skill 模板推到项目里（shot / git-main / release / gui-notes）。同名覆盖
     SkillInit {
         #[arg(long)]
         project: String,
