@@ -69,23 +69,28 @@ Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出
 
 **PATH 写入（Inno Setup 示例）**
 
-```ini
-[Registry]
-Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
-  ValueData: "{olddata};{app}"; Check: NeedsAddPath('{app}')
+别用 `[Registry]` + `ValueData: "{olddata};{app}"` 那一套。看着对，实测**重复安装会写两遍**：
+`Check:` 收到的参数里 `{app}` 没展开，`Pos` 永远匹配不上，于是每次都追加。
 
-[Code]
-function NeedsAddPath(Param: string): Boolean;
-var
-  OrigPath: string;
-begin
-  if not RegQueryStringValue(HKCU, 'Environment', 'Path', OrigPath) then
-  begin
-    Result := True; exit;
-  end;
-  Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
-end;
+正确做法是在 `[Code]` 里读出来、按 `;` 拆开、去掉重复项、整体写回：
+
+```pascal
+procedure AddToPath(Dir: string);
+// 已经有了 -> 只保留第一份（顺手清掉历史重复项）；没有 -> 追加到末尾
+// 实现见 installer/tba.iss 的 [Code] 段
 ```
+
+配套的 `RemoveFromPath` 在卸载时把**所有**匹配项摘掉（老版本只删第一个，
+所以重装过的机器 PATH 里会残留一条），其余项顺序不变。
+
+实测（装到临时目录，连装三次再卸载）：
+
+| 步骤 | PATH 里该目录出现次数 |
+|---|---|
+| 装第 1 次 | 1 |
+| 装第 2、3 次 | 1（不再累加） |
+| 人为塞两条重复后再装 | 1（自动收敛） |
+| 卸载后 | 0，其余 23 项逐字节不变 |
 
 **卸载时**从 PATH 移除同一路径，不删 `data/`（里面是 token、台账、项目绑定）。
 

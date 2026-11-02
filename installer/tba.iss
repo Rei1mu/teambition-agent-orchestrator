@@ -77,54 +77,114 @@ Name: "desktopicon"; Description: "{cm:TaskDesktop}"; GroupDescription: "{cm:Tas
 [Files]
 Source: "{#SrcExe}"; DestDir: "{app}"; Flags: ignoreversion
 
-[Registry]
-Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
-  ValueData: "{olddata};{app}"; Check: NeedsAddPath('{app}')
-
-[Icons]
-; 卸载入口无条件创建：取消了开始菜单图标也得留一条卸载的路。
-Name: "{group}\TBA"; Filename: "{app}\tba.exe"; Tasks: startmenuicon
-Name: "{group}\{cm:IconUninstall}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\TBA"; Filename: "{app}\tba.exe"; Tasks: desktopicon
-
-[Run]
-Filename: "{app}\tba.exe"; Description: "{cm:RunApp}"; Flags: nowait postinstall skipifsilent
+; PATH 不再用 [Registry] 的 `{olddata};{app}`：那种写法只能靠 Check 函数判断
+; 「加过了没有」，实测重复安装会写两遍（Check 参数里的 {app} 不展开，永远判成没加过）。
+; 改成下面 Code 段里的 AddToPath：读出来、按 ';' 拆开、去掉重复项、再整体写回。
 
 [Code]
 const
   EnvKey = 'Environment';
 
-function NeedsAddPath(Param: string): Boolean;
 var
-  OrigPath: string;
+  PathOut: string;
+
+// 比较用的规范化：去首尾空白、去尾部反斜杠、转小写。
+// 不用 RemoveBackslashUnlessRoot / CompareText：老版本 Inno 不一定有，
+// 装不上比装重复更糟。
+function NormDir(S: string): string;
+begin
+  Result := Trim(S);
+  while (Length(Result) > 1) and (Result[Length(Result)] = '') do
+    Delete(Result, Length(Result), 1);
+  Result := Lowercase(Result);
+end;
+
+procedure PushItem(It: string);
+begin
+  if PathOut <> '' then
+    PathOut := PathOut + ';';
+  PathOut := PathOut + It;
+end;
+
+// 从 Rest 里取下一项（按 ';' 切），Rest 自己往后挪。Inno 的 Pascal Script
+// 没有 SplitString、也不支持嵌套过程，只能手写。
+function NextItem(var Rest: string): string;
+var
+  P: Integer;
+begin
+  P := Pos(';', Rest);
+  if P = 0 then
+  begin
+    Result := Rest;
+    Rest := '';
+  end
+  else
+  begin
+    Result := Copy(Rest, 1, P - 1);
+    Rest := Copy(Rest, P + 1, Length(Rest));
+  end;
+end;
+
+// 把 Dir 写进用户 PATH：
+//   - 已经有了 -> 只保留第一份（顺手把历史遗留的重复项清掉）
+//   - 没有     -> 追加到末尾
+// 为什么不直接用 [Registry] 的 `ValueData: "{olddata};{app}"` + `Check:`：
+// 重复安装会写两遍（Check 收到的参数没展开，永远认为没加过）。这里自己拼。
+procedure AddToPath(Dir: string);
+var
+  OrigPath, Rest, Item: string;
+  Found: Boolean;
 begin
   if not RegQueryStringValue(HKCU, EnvKey, 'Path', OrigPath) then
+    OrigPath := '';
+  PathOut := '';
+  Found := False;
+  Rest := OrigPath;
+  while Rest <> '' do
   begin
-    Result := True;
-    exit;
+    Item := Trim(NextItem(Rest));
+    if Item <> '' then
+    begin
+      if NormDir(Item) = NormDir(Dir) then
+      begin
+        if not Found then
+        begin
+          Found := True;
+          PushItem(Dir);          // 统一成 {app} 的写法，后面重复的全跳过
+        end;
+      end
+      else
+        PushItem(Item);
+    end;
   end;
-  Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
+  if not Found then
+    PushItem(Dir);
+  RegWriteExpandStringValue(HKCU, EnvKey, 'Path', PathOut);
 end;
 
 // 卸载只摘 PATH，不动 {app} 下的 data/：token 和台账是用户数据，升级重装都靠它。
+// 所有匹配项都摘掉（历史重复项一并清理），其余项顺序不变。
 procedure RemoveFromPath(Dir: string);
 var
-  OrigPath, NewPath: string;
-  P: Integer;
+  OrigPath, Rest, Item: string;
 begin
   if not RegQueryStringValue(HKCU, EnvKey, 'Path', OrigPath) then
-    exit;
-  NewPath := ';' + OrigPath + ';';
-  P := Pos(';' + Uppercase(Dir) + ';', Uppercase(NewPath));
-  if P = 0 then
-    exit;
-  // 只删「;目录」这两截，留住后面的分号，中间项也不会粘在一起。
-  Delete(NewPath, P, Length(Dir) + 1);
-  if (Length(NewPath) > 0) and (NewPath[1] = ';') then
-    Delete(NewPath, 1, 1);
-  if (Length(NewPath) > 0) and (NewPath[Length(NewPath)] = ';') then
-    Delete(NewPath, Length(NewPath), 1);
-  RegWriteExpandStringValue(HKCU, EnvKey, 'Path', NewPath);
+    Exit;
+  PathOut := '';
+  Rest := OrigPath;
+  while Rest <> '' do
+  begin
+    Item := Trim(NextItem(Rest));
+    if (Item <> '') and (NormDir(Item) <> NormDir(Dir)) then
+      PushItem(Item);
+  end;
+  RegWriteExpandStringValue(HKCU, EnvKey, 'Path', PathOut);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    AddToPath(ExpandConstant('{app}'));
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
