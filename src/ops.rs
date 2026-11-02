@@ -3021,9 +3021,18 @@ pub fn init_builtin_skills(
 ) -> Result<String, String> {
     let mut out: Vec<String> = Vec::new();
     for (name, _, body) in BUILTIN_SKILLS {
-        if let Some(o) = only {
-            if o != *name {
-                continue;
+        match only {
+            Some(o) => {
+                if o != *name {
+                    continue;
+                }
+            }
+            // 老名字不进默认批量推送：新项目里出现两条同内容的 skill 纯属噪音，
+            // 只有点名要它（--name release-push）时才推。
+            None => {
+                if *name == "release-push" {
+                    continue;
+                }
             }
         }
         out.push(push_skill(store, project_id, name, body)?);

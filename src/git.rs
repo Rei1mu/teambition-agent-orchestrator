@@ -439,11 +439,16 @@ pub fn release(
             }
         },
     };
+    // 刚推完 tag 时，CI 的 run 还没创建出来，第一次轮询会撞上「同名 tag 的上一次运行」
+    // （比如重发同一个 tag），然后拿旧结论骗人。所以记下推送时刻，只认这之后的 run。
+    let mut pushed_at: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut log = if tag_exists(&root, &tag) && watch && !no_push {
         // 打 tag 已经做过了（比如上次 --watch 等到超时），这时不该再报「tag 已存在」，
         // 直接接着看 CI——超时提示里让用户重跑的就是这条命令。
+        // 这种情况下不加时间过滤：API 按创建时间倒序，第一条就是最新的。
         format!("tag {tag} 已存在，跳过打 tag，直接看 CI\n")
     } else {
+        pushed_at = Some(chrono::Utc::now());
         let mut l = tag_push(&tag, None, no_push, false)?;
         l.push('\n');
         l
@@ -463,7 +468,7 @@ pub fn release(
         return Ok(log.trim_end().to_string());
     };
     // 查 CI 失败不该让整条命令失败：tag 已经推上去了，agent 只需要知道「去 Actions 页看」。
-    match watch_ci(&slug, &tag, timeout_secs) {
+    match watch_ci(&slug, &tag, timeout_secs, pushed_at) {
         Ok(s) => log.push_str(&s),
         Err(e) => log.push_str(&format!(
             "查 CI 失败: {e}\n（tag 已推成功，自己去 Actions 页看）"
@@ -476,7 +481,12 @@ pub fn release(
 //
 // 超时返回 Err 里的提示而不是死等：agent 的 shell 工具上限 600 秒，
 // 卡在这里会连会话一起被砍。返回 exit 2 的语义由调用方给。
-fn watch_ci(slug: &str, tag: &str, timeout_secs: u64) -> Result<String, String> {
+fn watch_ci(
+    slug: &str,
+    tag: &str,
+    timeout_secs: u64,
+    pushed_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<String, String> {
     let token = github_token();
     if token.is_none() {
         return Ok(
@@ -501,8 +511,18 @@ fn watch_ci(slug: &str, tag: &str, timeout_secs: u64) -> Result<String, String> 
                 .as_array()
                 .and_then(|a| {
                     a.iter().find(|r| {
-                        r["head_branch"].as_str() == Some(tag)
-                            && r["event"].as_str() == Some("push")
+                        if r["head_branch"].as_str() != Some(tag)
+                            || r["event"].as_str() != Some("push")
+                        {
+                            return false;
+                        }
+                        // 只认本次推送之后创建的 run（留 90 秒时钟偏差余量）。
+                        match (&pushed_at, r["created_at"].as_str()) {
+                            (Some(t), Some(c)) => chrono::DateTime::parse_from_rfc3339(c)
+                                .map(|d| d.with_timezone(&chrono::Utc) + chrono::Duration::seconds(90) >= *t)
+                                .unwrap_or(true),
+                            _ => true,
+                        }
                     })
                 })
                 .cloned();
