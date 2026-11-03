@@ -139,6 +139,11 @@ tba gitbutler clear      :: 清掉手选路径，回到自动检测
 
 ## 离线模式（不用 Teambition）
 
+> 两个东西别混：
+> - **全局离线**（本节）：整台机器都不用 Teambition，窗口和所有命令都走本地缓存。
+> - **命令级直连 `tba go -off <任务>`**（见「一句话开工」一节）：只让**这一条命令**不走
+>   Teambition 的任务/等待流程，直接在对话框里交互。日常更常用的是这个。
+
 `data/config.toml` 里 `offline = true`，或环境变量 `TBA_OFFLINE=1`（`=0` 强制关，优先级高于配置）。
 打开后**完全不连 Teambition**，也不需要 token：
 
@@ -477,6 +482,33 @@ tba wait <claim_id>               :: 单独等（ask 超时后重跑它，或只
 1. 按 `.tba/project` 认出项目。
 2. 从列「未完成」领最早一条。
 3. 打印任务正文 + 完整流程规则。
+
+#### 直连模式：`tba go -off <这次要做的事>`
+
+不想让任务走 Teambition 那套（领任务 → 写备注 → 转「待回复」→ 等你回数字）时用它：
+
+```bat
+tba go -off 把侧栏改窄一点
+tba go -off --project <id> 修一下设置页的文案
+tba go -off                                  :: 不带任务也行，agent 会直接问你
+```
+
+这一条**完全不碰 Teambition**：不领任务、不写备注、不改状态、不发邮件、不阻塞等待。
+项目从 `.tba/project` 或 `--project` 认（认不到就用当前目录名），能力索引和编译 & 重载参数
+读本地缓存——所以它在没网、没 token 的机器上照样能跑。
+
+产出的文案和正常开工文案共用前半段（项目、skill 索引、通用能力、编译段），
+后半段换成「直连模式」规则：有疑问直接在对话里问、干完直接说结论、
+不要调用 `claim/take/start/ask/wait/beat/done/close/note`。
+
+配套的两个：
+
+```bat
+tba ask -off -q "旧缓存要一起删吗？"   :: 只把问题打到 stdout，不写任务、不发邮件、不阻塞
+tba wait -off                          :: 直接返回（直连下没有「等 Teambition 回复」这回事）
+```
+
+> `-off` 和 `--off` 等价（单横线会被自动改写成双横线）。
 
 #### 列1 是最高优先级：拖回去就能重接
 

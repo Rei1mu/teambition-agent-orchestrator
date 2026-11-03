@@ -7,6 +7,25 @@ use clap::Parser;
 use std::io::Read;
 use std::io::Write;
 
+// 参数小修正：把 `-off` 改写成 `--off`。
+//
+// 用户和 agent 都会顺手写单横线（`tba go -off "..."`），clap 会把它当成 `-o -f -f`
+// 直接报「unexpected argument」。这里做一次无损改写，比让人去背双横线靠谱。
+fn normalize_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    args.into_iter()
+        .map(|a| {
+            let s = a.to_string_lossy();
+            if s == "-off" {
+                return std::ffi::OsString::from("--off");
+            }
+            if let Some(rest) = s.strip_prefix("-off=") {
+                return std::ffi::OsString::from(format!("--off={rest}"));
+            }
+            a
+        })
+        .collect()
+}
+
 // 自检：一条命令把「环境到底缺什么」全列出来。
 //
 // 为什么值得单独做：agent 排查「为什么跑不通」时会一个个试（which git / 看 token /
@@ -407,7 +426,7 @@ fn dash(s: &str) -> &str {
 pub fn run() -> Result<(), String> {
     let store = Store::new();
     store.ensure_dirs()?;
-    let cli = crate::Cli::parse();
+    let cli = crate::Cli::parse_from(normalize_args(std::env::args_os().collect()));
 
     // 任何命令启动都顺带给「本会话占着的 running 任务」刷一次心跳：
     // 会话还活着（还在跑 tb）就不该被当成僵尸回收，长构建期间尤其需要。
@@ -939,10 +958,70 @@ pub fn run() -> Result<(), String> {
             project,
             lang,
             no_entry,
+            off,
+            task,
         } => {
             use std::io::Write;
             let lang = Lang::parse(&lang)
                 .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
+            // 不带 --off 时 go 是「去队列领任务」，不认任务描述——
+            // 静默忽略会让人以为活儿已经派下去了，所以直接说清楚。
+            if !off && !task.is_empty() {
+                return Err(format!(
+                    "`go` 不带 --off 是从队列领任务，不吃任务描述。\n\
+                     要直连（不领任务、直接在当前对话里交互）请写：tba go -off {}",
+                    task.join(" ")
+                ));
+            }
+            // 项目从本地绑定 + 项目缓存解析，能力读本地缓存，
+            // `-off` 后面那句话就是本次任务。
+            if off {
+                let desc = task.join(" ");
+                // --project 给了就用它（能带出项目能力和编译参数），没给就按本地绑定。
+                let pid = project
+                    .clone()
+                    .or_else(read_project_binding)
+                    .unwrap_or_default();
+                let cached = store.load_projects_cache();
+                let pname = if pid.is_empty() {
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|d| {
+                            d.file_name().map(|n| n.to_string_lossy().to_string())
+                        })
+                        .unwrap_or_else(|| "当前目录".to_string())
+                } else {
+                    cached
+                        .iter()
+                        .find(|(id, _)| id == &pid)
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_else(|| "未命名项目".to_string())
+                };
+                let skills = if pid.is_empty() {
+                    Vec::new()
+                } else {
+                    cached_skills(&store, &pid)
+                };
+                let draft = if desc.trim().is_empty() {
+                    None
+                } else {
+                    // 复用 draft_for_mode 的标题提取，但**不落盘**：
+                    // 直连模式没必要在 data/tasks/ 下留一个没人会读的正文文件。
+                    draft_for_mode(&store, &desc, CopyMode::ThisTask).map(|mut d| {
+                        d.body_path.clear();
+                        d
+                    })
+                };
+                print!(
+                    "{}",
+                    direct_prompt(&store, &pid, &pname, &skills, draft.as_ref(), lang)
+                );
+                eprintln!(
+                    "直连模式（--off）：没领任务、没写 Teambition。有疑问直接在对话里问用户，干完直接说结论。"
+                );
+                let _ = std::io::stdout().flush();
+                return Ok(());
+            }
             match go(&store, project.as_deref(), lang, !no_entry)? {
                 GoOutcome::NoBinding { cwd } => {
                     println!("NO_BINDING {cwd}");
@@ -1100,6 +1179,7 @@ pub fn run() -> Result<(), String> {
             question,
             done,
             no_wait,
+            off,
         } => {
             let q = if done {
                 DONE_QUESTION.to_string()
@@ -1108,6 +1188,19 @@ pub fn run() -> Result<(), String> {
                     "要给问题：`-q \"...\"`，或者加 `--done` 用标准的「做完了请确认」三选项",
                 )?
             };
+            // 直连模式：不写任务、不发信、不阻塞。问题直接打到 stdout，
+            // 由 agent 在对话框里问——用户就在这儿回，不用跑去 Teambition。
+            if off {
+                println!("{q}");
+                eprintln!(
+                    "直连模式（--off）：问题没写进 Teambition、没发邮件、不阻塞。\
+                     直接把上面的问题问用户，拿到回答继续。"
+                );
+                let _ = std::io::stdout().flush();
+                return Ok(());
+            }
+            let claim_id = claim_id
+                .ok_or("要给 claim id：`tba ask <claim_id> -q \"...\"`（直连模式可写 --off 省掉它）")?;
             let c = ask(&store, &claim_id, &q)?;
             let cfg = store.load_config();
             println!(
@@ -1195,7 +1288,16 @@ pub fn run() -> Result<(), String> {
             claim_id,
             timeout,
             interval,
+            off,
         } => {
+            // 直连模式没有「等 Teambition 回复」这回事，直接返回别让人干等。
+            if off {
+                eprintln!(
+                    "直连模式（--off）：不轮询 Teambition。要等用户回答就直接在对话里问。"
+                );
+                return Ok(());
+            }
+            let claim_id = claim_id.ok_or("要给 claim id：`tba wait <claim_id>`")?;
             run_wait_block(&store, &claim_id, timeout, interval)?;
         }
         Cmd::Beat { claim_id } => {

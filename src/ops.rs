@@ -3567,6 +3567,30 @@ fn prompt_body(
     claimed: Option<&Claim>,
     lang: Lang,
 ) -> String {
+    let cfg = store.load_config();
+    let mut s = prompt_head(store, project_id, project_name, skills, draft, lang, false);
+    let memory_on = store.load_tb_memory(project_id).enabled;
+    let exe = prompt_exe_of(&cfg);
+    s.push_str(&workflow_text(
+        &exe, project_id, &cfg, draft, claimed, lang, memory_on,
+    ));
+    s
+}
+
+/// 开工文案的**前半段**：项目头、记忆、skill 索引、通用能力、编译 & 重载。
+///
+/// 抽出来是为了让「直连模式」（`tba go --off`，不碰 Teambition）复用同一份内容——
+/// 能力索引和编译参数是本地就能决定的东西，两种模式不该长得不一样。
+/// 后半段的流程说明由调用方决定：走云端用 workflow_text，直连用 direct_workflow_text。
+fn prompt_head(
+    store: &Store,
+    project_id: &str,
+    project_name: &str,
+    skills: &[SkillItem],
+    draft: Option<&TaskDraft>,
+    lang: Lang,
+    local_only: bool,
+) -> String {
     let zh = lang == Lang::Zh;
     let cfg = store.load_config();
     // 文案里路径要出现十几次，所以允许配一个短路径（如目录联接 D:\tb\tba.exe）。
@@ -3577,30 +3601,46 @@ fn prompt_body(
     let mem = store.memory_dir(project_id);
     // 共享记忆开关：开着就把「本地目录」换成「读云端记忆」的命令。
     // 开着还显示本地目录会误导 agent 去读一份已经不用的旧文件。
-    let memory_on = store.load_tb_memory(project_id).enabled;
+    // 直连模式（local_only）例外：那条命令要联网，一律给本地目录。
+    let memory_on = store.load_tb_memory(project_id).enabled && !local_only;
     let mut s = String::new();
-    s.push_str(&format!(
-        "# {}: {project_name}\n",
-        if zh { "项目" } else { "Project" }
-    ));
-    s.push_str(&format!(
-        "{}: {project_id}\n",
-        if zh { "项目 ID" } else { "Project ID" }
-    ));
-    if memory_on {
+    // 直连模式可能没有项目绑定（目录没接 Teambition）。那时候别硬写一行空的
+    // 「项目 ID: 」，也别给一条指向不存在目录的记忆路径——看着像坏了。
+    let bound = !project_id.trim().is_empty();
+    if bound {
         s.push_str(&format!(
-            "{}: `{exe} memory --project {project_id}`\n",
-            if zh {
-                "项目记忆（云端，存状态为 mem 的任务备注）"
-            } else {
-                "Project memory (cloud, note of mem-state tasks)"
-            }
+            "# {}: {project_name}\n",
+            if zh { "项目" } else { "Project" }
         ));
+        s.push_str(&format!(
+            "{}: {project_id}\n",
+            if zh { "项目 ID" } else { "Project ID" }
+        ));
+        if memory_on {
+            s.push_str(&format!(
+                "{}: `{exe} memory --project {project_id}`\n",
+                if zh {
+                    "项目记忆（云端，存状态为 mem 的任务备注）"
+                } else {
+                    "Project memory (cloud, note of mem-state tasks)"
+                }
+            ));
+        } else {
+            s.push_str(&format!(
+                "{}: {}\n",
+                if zh { "共享记忆目录" } else { "Shared memory dir" },
+                mem.display()
+            ));
+        }
     } else {
         s.push_str(&format!(
-            "{}: {}\n",
-            if zh { "共享记忆目录" } else { "Shared memory dir" },
-            mem.display()
+            "# {}: {project_name}（{}）\n",
+            if zh { "项目" } else { "Project" },
+            if zh {
+                "本地目录，没接 Teambition"
+            } else {
+                "local dir, not linked to Teambition"
+            }
         ));
     }
     s.push_str(&format!(
@@ -3690,10 +3730,66 @@ fn prompt_body(
     if let Some(st) = crate::setting::ProjectSetting::load_cached(store, project_id) {
         s.push_str(&st.prompt_block(&exe, zh));
     }
-    s.push_str(&workflow_text(
-        &exe, project_id, &cfg, draft, claimed, lang, memory_on,
-    ));
     s
+}
+
+/// 直连模式文案（`tba go --off`）：不经过 Teambition 的任务/等待环节，
+/// 交流全在当前对话框里。能力索引和编译参数跟正常开工文案是同一份。
+pub fn direct_prompt(
+    store: &Store,
+    project_id: &str,
+    project_name: &str,
+    skills: &[SkillItem],
+    draft: Option<&TaskDraft>,
+    lang: Lang,
+) -> String {
+    let cfg = store.load_config();
+    let exe = prompt_exe_of(&cfg);
+    let mut s = prompt_head(store, project_id, project_name, skills, draft, lang, true);
+    s.push_str(&direct_workflow_text(&exe, project_id, lang));
+    s
+}
+
+/// 直连模式的流程说明。
+///
+/// 为什么单独写一份而不是给 workflow_text 加开关：那一份通篇是 claim/take/beat/ask/wait，
+/// 直连模式下这些一条都不该出现——留着只会让 agent 照着做然后卡住。
+fn direct_workflow_text(exe: &str, project_id: &str, lang: Lang) -> String {
+    if lang == Lang::Zh {
+        let mem = if project_id.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n需要记下来的东西写本地：`{exe} memory --project {project_id} --write \"...\"`。\n"
+            )
+        };
+        return format!(
+            "## 交互方式（直连模式：不走 Teambition）\n\
+             这次是 `--off`：**不领任务、不写备注、不改状态、不发邮件、不等回复**。\
+             所有交流都在当前对话里完成。\n\n\
+             1. 有拿不准的地方，直接问用户一句话，然后停下等回答。不要自己假设完就硬干。\n\
+             2. 干完直接说结论：改了什么、验证了什么、还剩什么没做。不需要 `{exe} done` / `{exe} close`。\n\
+             3. 不要调用 `{exe} claim / take / start / ask / wait / beat / done / close / note` ——\
+             这些都要联网写 Teambition，直连模式下没有意义。\n\
+             4. 分支、提交照常用 `{exe} git ...`（本地 git / GitButler）。\n\
+             {mem}"
+        );
+    }
+    let mem = if project_id.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\nSave anything worth keeping locally: `{exe} memory --project {project_id} --write \"...\"`.\n")
+    };
+    format!(
+        "## Interaction (direct mode: no Teambition)\n\
+         This run used `--off`: **do NOT claim tasks, write notes, change states, send mail, or wait for replies**. \
+         Everything happens in this conversation.\n\n\
+         1. If anything is unclear, ask the user one short question and stop for the answer. Do not guess and plow ahead.\n\
+         2. When done, report directly: what changed, what you verified, what is left. No `{exe} done` / `{exe} close`.\n\
+         3. Do not call `{exe} claim / take / start / ask / wait / beat / done / close / note` - they all write to Teambition.\n\
+         4. Branches and commits still go through `{exe} git ...` (local git / GitButler).\n\
+         {mem}"
+    )
 }
 
 // 「复制项目初始化文案」的内容：给一个**还没有** Teambition 项目的仓库用。
@@ -4217,6 +4313,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         Store { root }
+    }
+
+    // 直连模式文案（`tba go -off <任务>`）：带上这次要做的事，但**一条 Teambition
+    // 流程命令都不出现**——claim/take/ask/wait 在直连下没有意义，留着只会让 agent 照着卡住。
+    #[test]
+    fn direct_prompt_carries_task_and_drops_teambition_flow() {
+        let store = tmp_store("direct");
+        let d = TaskDraft {
+            title: "把侧栏改窄".to_string(),
+            body: "把侧栏改窄".to_string(),
+            body_path: String::new(),
+        };
+        let t = direct_prompt(&store, "p-1", "项目一", &[], Some(&d), Lang::Zh);
+        assert!(t.contains("把侧栏改窄"), "要带上这次的任务: {t}");
+        assert!(t.contains("直连模式"), "要说明是直连: {t}");
+        assert!(t.contains("不要调用"), "要明确禁止走 Teambition 流程: {t}");
+        assert!(t.contains("交互"), "要交代怎么跟用户交流: {t}");
+
+        // 没绑定项目（id 空）也不能写出空的项目 ID 行或半截记忆路径。
+        let t2 = direct_prompt(&store, "", "某个目录", &[], None, Lang::Zh);
+        assert!(t2.contains("没接 Teambition"), "{t2}");
+        assert!(!t2.contains("项目 ID:"), "空 id 不该输出项目 ID 行: {t2}");
+        assert!(!t2.contains("memory --project  "), "空 id 不该拼出半截命令: {t2}");
     }
 
     // 粗估 token（cl100k 量级）：CJK 约 1 字 1 token，其余约 4 字符 1 token。

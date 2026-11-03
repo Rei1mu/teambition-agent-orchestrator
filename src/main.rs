@@ -174,6 +174,13 @@ pub enum Cmd {
         /// 不自动往当前目录补 AGENTS.md 入口
         #[arg(long)]
         no_entry: bool,
+        /// 直连模式：不领任务、不碰 Teambition，直接在当前对话框里交互
+        #[arg(long)]
+        off: bool,
+        /// 这次要做的事。直连模式下就是「本次任务」，多个词直接写，不用引号。
+        /// 例：tba go -off 把侧栏改窄一点
+        #[arg(num_args = 0.., value_name = "TASK")]
+        task: Vec<String>,
     },
     /// 领一条「未完成」任务。默认取创建时间最早的一条。自动转「进行中」
     Claim {
@@ -212,7 +219,8 @@ pub enum Cmd {
     /// 提问：改成「待回复」+ 看板列「待回复」，问题写进任务备注，发邮件，
     /// 然后就地阻塞等你回数字（会话不会断）。加 --no-wait 只问不等。
     Ask {
-        claim_id: String,
+        /// claim id（--off 时可以省略）
+        claim_id: Option<String>,
         /// 要问用户的话
         #[arg(long, short = 'q')]
         question: Option<String>,
@@ -222,6 +230,10 @@ pub enum Cmd {
         /// 问完立刻返回，不阻塞等待（默认是就地等到用户回数字）
         #[arg(long)]
         no_wait: bool,
+        /// 直连模式：不写任务、不发邮件、不阻塞，只把问题打到 stdout，
+        /// 由 agent 在当前对话框里问用户
+        #[arg(long)]
+        off: bool,
     },
     /// 继续（只看一眼）：读回你在 Teambition 任务里的评论，状态改回「进行中」
     Reply { claim_id: String },
@@ -239,13 +251,17 @@ pub enum Cmd {
     },
     /// 同步等回复：阻塞轮询任务评论，你在 Teambition 回一句就返回正文并继续
     Wait {
-        claim_id: String,
+        /// claim id（--off 时可以省略）
+        claim_id: Option<String>,
         /// 单轮最长等待秒数（默认 540，留余量给工具 600 秒上限）
         #[arg(long)]
         timeout: Option<u64>,
         /// 轮询间隔秒数（默认 15）
         #[arg(long)]
         interval: Option<u64>,
+        /// 直连模式：不轮询 Teambition，直接返回（直连模式下本来就不需要等）
+        #[arg(long)]
+        off: bool,
     },
     /// 续命：刷新心跳。长构建/长测试前后调用，避免被判定会话断开
     Beat { claim_id: String },
