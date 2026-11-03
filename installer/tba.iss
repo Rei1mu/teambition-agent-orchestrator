@@ -19,6 +19,10 @@
 #ifndef SrcExe
   #define SrcExe "..\target\release\tba.exe"
 #endif
+; 窗口启动器（GUI 子系统，双击不闪黑框）。本地没编出来时允许缺省为空 -> 跳过打包。
+#ifndef SrcWExe
+  #define SrcWExe "..\target\release\tbaw.exe"
+#endif
 #ifndef OutDir
   #define OutDir "..\dist"
 #endif
@@ -86,14 +90,19 @@ Name: "desktopicon"; Description: "{cm:TaskDesktop}"; GroupDescription: "{cm:Tas
 
 [Files]
 Source: "{#SrcExe}"; DestDir: "{app}"; Flags: ignoreversion
+; tbaw.exe 只是双击入口：GUI 子系统，用 CREATE_NO_WINDOW 拉起 tba.exe ui。
+; tba.exe 仍然是 console 子系统（CLI 要能往 stdout 写），所以两个都要装。
+; 不给 #if 兜底：缺这个文件就该让打包失败——否则打出来的包里快捷方式指向空气。
+Source: "{#SrcWExe}"; DestDir: "{app}"; Flags: ignoreversion
 
 ; 之前只有 [Tasks] 没有 [Icons]：勾了「创建桌面快捷方式」也什么都不会生成。
-; 目标就是 tba.exe——不带参数启动 = 开窗口（见 src/main.rs 的 gui_intent）。
+; 快捷方式指向 tbaw.exe 而不是 tba.exe：GUI 子系统进程从创建起就没有控制台，
+; 双击不会闪黑框。命令行用法仍然走 PATH 里的 tba.exe。
 ; WorkingDir 设成用户主目录：别让快捷方式的工作目录落在安装目录里。
 [Icons]
-Name: "{group}\TBA"; Filename: "{app}\tba.exe"; WorkingDir: "{%USERPROFILE}"; Tasks: startmenuicon
+Name: "{group}\TBA"; Filename: "{app}\tbaw.exe"; WorkingDir: "{%USERPROFILE}"; Tasks: startmenuicon
 Name: "{group}\{cm:IconUninstall}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\TBA"; Filename: "{app}\tba.exe"; WorkingDir: "{%USERPROFILE}"; Tasks: desktopicon
+Name: "{autodesktop}\TBA"; Filename: "{app}\tbaw.exe"; WorkingDir: "{%USERPROFILE}"; Tasks: desktopicon
 
 ; PATH 不再用 [Registry] 的 `{olddata};{app}`：那种写法只能靠 Check 函数判断
 ; 「加过了没有」，实测重复安装会写两遍（Check 参数里的 {app} 不展开，永远判成没加过）。

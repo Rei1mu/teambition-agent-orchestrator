@@ -66,8 +66,8 @@ Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出
 | 项 | 效果 | 可取消 |
 |---|---|---|
 | 把 tba 加到 PATH | 写进用户 PATH，新终端能直接敲 `tba` | 是（取消时会把已有条目摘掉） |
-| 开始菜单快捷方式 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\TBA\TBA.lnk` | 是 |
-| 桌面快捷方式 | `%USERPROFILE%\Desktop\TBA.lnk` | 是 |
+| 开始菜单快捷方式 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\TBA\TBA.lnk`（指向 `tbaw.exe`，双击不闪黑框） | 是 |
+| 桌面快捷方式 | `%USERPROFILE%\Desktop\TBA.lnk`（同上，指向 `tbaw.exe`） | 是 |
 | 卸载入口 | 同上开始菜单目录 `Uninstall TBA.lnk` | 否，始终创建 |
 
 卸载入口不跟着快捷方式走：取消了开始菜单图标，也得留一条卸载的路。
@@ -835,8 +835,19 @@ font = ""          # 空 = 自动（黑体优先）；也可填 simhei / msyh / 
 → `seguisym.ttf`（符号）。只装一个字体时，它缺的字形会渲染成豆腐块（口）——
 之前只装等线，界面上到处是口，就是这个原因。
 
-**控制台窗口**：exe 是 console 子系统（CLI 要 stdout），双击时 Windows 会先给一个黑窗。
-进 GUI 前调 `FreeConsole()` 把它摘掉，所以双击只看到窗口。CLI 子命令不受影响。
+**控制台窗口**：`tba.exe` 是 console 子系统（CLI 要 stdout），Windows 在**进程创建时**
+就给它分配控制台，早于 `main()`——代码里只能等跑起来再关，Win11 默认终端是 Windows
+Terminal，那一下还得等 WT 起窗，看着就是黑框闪一下。
+
+所以双击入口单独给一个 `tbaw.exe`：**GUI 子系统**，从创建起就没有控制台。它只做一件事，
+用 `CREATE_NO_WINDOW` 把 `tba.exe ui` 拉起来然后自己退出。安装包里的桌面 / 开始菜单
+快捷方式都指向它；PATH 里放的仍然是 `tba.exe`，命令行用法完全不变。
+
+> 为什么不把 `tba.exe` 直接改成 GUI 子系统：那样 PowerShell / cmd 不会等它结束，
+> 输出也会丢（实测 PowerShell 29ms 就返回），CLI 就废了。两个 exe 各干一件事最稳。
+
+`tba.exe` 里仍保留 `FreeConsole()` + `ShowWindow(SW_HIDE)` 兜底：直接双击 `tba.exe`
+或从 PATH 里不带参数敲 `tba` 时，黑框会立刻消失（不再是进程存活期内一直挂着）。
 
 ## MCP 接入
 

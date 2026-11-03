@@ -61,6 +61,7 @@ jobs:
                "/DTargetArch=${{ matrix.arch }}" `
                "/DInnoArch=${{ matrix.inno }}" `
                "/DSrcExe=..\target\${{ matrix.target }}\release\tba.exe" `
+               "/DSrcWExe=..\target\${{ matrix.target }}\release\tbaw.exe" `
                "installer\tba.iss"
 
       - uses: actions/upload-artifact@v4
