@@ -19,21 +19,9 @@ fn enc(s: &str) -> String {
 pub const TOKEN_PAGE: &str = "https://open.teambition.com/user-mcp";
 
 pub fn open_browser(url: &str) {
-    #[cfg(windows)]
-    {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        crate::proc::hide(&mut c);
-        let _ = c.spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(url).spawn();
-    }
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    }
+    // 统一走 proc::open_url（ShellExecuteW）：以前这里自己拼 `cmd /C start`，
+    // 在 GUI 进程里可能悄无声息地失败，登录页点了「打开网页」没反应。
+    crate::proc::open_url(url);
 }
 
 pub fn verify(store: &Store) -> Result<usize, String> {

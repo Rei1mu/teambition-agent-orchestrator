@@ -236,14 +236,6 @@ const SDK_URL: &str = "https://developer.microsoft.com/windows/downloads/windows
 /// 比装完整 VS 轻，装的时候勾「使用 C++ 的桌面开发」就有 link.exe。
 const VS_BUILD_TOOLS_URL: &str = "https://visualstudio.microsoft.com/visual-cpp-build-tools/";
 
-/// 用系统默认浏览器打开链接（不弹控制台）。
-fn open_url(url: &str) {
-    let mut c = std::process::Command::new("cmd");
-    c.args(["/C", "start", "", url]);
-    crate::proc::hide(&mut c);
-    let _ = c.spawn();
-}
-
 /// 给编辑类弹窗开成一个真正的系统窗口。
 ///
 /// 以前用 `egui::Window` 画在主窗口内部：主窗一缩小，编辑框就被裁掉；切到别的页面
@@ -707,7 +699,7 @@ impl App {
                     ))
                     .clicked()
                 {
-                    open_url(crate::gitbutler::GB_DOWNLOAD_URL);
+                    crate::proc::open_url(crate::gitbutler::GB_DOWNLOAD_URL);
                 }
                 if ui
                     .button("git 下载页")
@@ -717,7 +709,7 @@ impl App {
                     ))
                     .clicked()
                 {
-                    open_url(crate::gitbutler::GIT_DOWNLOAD_URL);
+                    crate::proc::open_url(crate::gitbutler::GIT_DOWNLOAD_URL);
                 }
                 if ui
                     .button("选择 but.exe 位置")
@@ -2582,14 +2574,14 @@ impl App {
                     .on_hover_text(format!("{VS_BUILD_TOOLS_URL}\n（已装也能用：重装/换盘/换机器）"))
                     .clicked()
                 {
-                    open_url(VS_BUILD_TOOLS_URL);
+                    crate::proc::open_url(VS_BUILD_TOOLS_URL);
                 }
                 if ui
                     .button("下载 Windows SDK")
                     .on_hover_text(format!("{SDK_URL}\n（已装也能用：重装/换盘/换机器）"))
                     .clicked()
                 {
-                    open_url(SDK_URL);
+                    crate::proc::open_url(SDK_URL);
                 }
             });
             ui.label(
