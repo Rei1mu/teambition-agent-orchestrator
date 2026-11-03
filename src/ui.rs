@@ -220,6 +220,53 @@ impl CapEdit {
     }
 }
 
+/// Windows SDK 官方下载页：本机没装 SDK 时给个能点的地方，别让人自己搜。
+const SDK_URL: &str = "https://developer.microsoft.com/windows/downloads/windows-sdk/";
+
+/// 用系统默认浏览器打开链接（不弹控制台）。
+fn open_url(url: &str) {
+    let mut c = std::process::Command::new("cmd");
+    c.args(["/C", "start", "", url]);
+    crate::proc::hide(&mut c);
+    let _ = c.spawn();
+}
+
+/// 给编辑类弹窗开成一个真正的系统窗口。
+///
+/// 以前用 `egui::Window` 画在主窗口内部：主窗一缩小，编辑框就被裁掉；切到别的页面
+/// 还会被后面的面板盖住，用户点完「编辑」经常找不到窗口。换成独立窗口后它有自己的
+/// 标题栏和任务栏条目，位置对着主窗居中，关掉不影响主窗。
+///
+/// 用 immediate viewport：编辑态存在 App 里，回调里直接读写，不需要再搭一套跨窗口状态。
+fn show_editor_window<R>(
+    ctx: &egui::Context,
+    key: &str,
+    title: String,
+    size: [f32; 2],
+    min: [f32; 2],
+    add: impl FnMut(&mut egui::Ui) -> R,
+) -> R {
+    let mut vb = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_inner_size(size)
+        .with_min_inner_size(min)
+        .with_resizable(true);
+    // 对着主窗口居中：主窗被拖到副屏时，编辑框也跟着过去，不会跑到看不见的地方。
+    if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+        vb = vb.with_position(egui::pos2(
+            r.center().x - size[0] * 0.5,
+            r.center().y - size[1] * 0.5,
+        ));
+    }
+    let mut add = add;
+    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(key), vb, |ctx, _| {
+        let add = &mut add;
+        egui::CentralPanel::default()
+            .show(ctx, |ui| add(ui))
+            .inner
+    })
+}
+
 // 设置页的邮件表单。端口用 String 存，方便输入中间态（空/半个数字）。
 #[derive(Clone, Default)]
 struct MailForm {
@@ -1432,16 +1479,24 @@ impl App {
         let Some(mut ed) = self.cap_edit.clone() else {
             return;
         };
-        let mut open = true;
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new(if ed.is_new { "新增能力" } else { "编辑能力" })
-            .collapsible(false)
-            .resizable(true)
-            .default_width(700.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .open(&mut open)
-            .show(ctx, |ui| {
+        // 独立窗口：以前画在主窗口里，主窗一小就被裁掉，切页面还会被盖住。
+        let title = if ed.is_new {
+            "新增能力 · TBA".to_string()
+        } else {
+            format!("编辑能力 · {} · TBA", ed.name)
+        };
+        let (save, cancel) = show_editor_window(
+            ctx,
+            "tba-cap-editor",
+            title,
+            [880.0, 760.0],
+            [620.0, 480.0],
+            |ui| {
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    cancel = true;
+                }
                 ui.label("名字（agent 用它 `tba cap <名字>` 取正文；只能用字母、数字、- 和 _）:");
                 ui.add_enabled(
                     ed.is_new,
@@ -1513,9 +1568,12 @@ impl App {
                         );
                     }
                 });
-            });
+                (save, cancel)
+            },
+        );
 
-        if cancel || !open {
+        if cancel {
+            // 不再画这个 viewport，eframe 下一帧会把它连同窗口一起收掉。
             self.cap_edit = None;
             return;
         }
@@ -1607,20 +1665,24 @@ impl App {
         let Some(mut ed) = self.skill_edit.clone() else {
             return;
         };
-        let mut open = true;
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new(if ed.is_new {
-            "新建 skill"
+        // 同能力编辑窗：独立窗口，免得被主窗裁掉或盖住。
+        let title = if ed.is_new {
+            format!("新建 skill · {} · TBA", ed.project_name)
         } else {
-            "编辑 skill"
-        })
-        .collapsible(false)
-        .resizable(true)
-        .default_width(620.0)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .open(&mut open)
-        .show(ctx, |ui| {
+            format!("编辑 skill · {} · TBA", ed.name)
+        };
+        let (save, cancel) = show_editor_window(
+            ctx,
+            "tba-skill-editor",
+            title,
+            [760.0, 700.0],
+            [540.0, 440.0],
+            |ui| {
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    cancel = true;
+                }
             ui.label(format!("项目: {}", ed.project_name));
             ui.add_space(4.0);
             ui.label("名字（agent 用它来 `tba skill <名字>` 取正文，短一点省 token）:");
@@ -1659,9 +1721,11 @@ impl App {
                     ui.label("正在写 Teambition...");
                 }
             });
-        });
+                (save, cancel)
+            },
+        );
 
-        if cancel || !open {
+        if cancel {
             self.skill_edit = None;
             return;
         }
@@ -2215,6 +2279,23 @@ impl App {
                         )
                         .small(),
                     );
+                    if r.tc.sdk_lib.trim().is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "本机标准位置没找到 Windows SDK——没装的话编译不了。",
+                                )
+                                .small(),
+                            );
+                            if ui
+                                .link("下载 Windows SDK")
+                                .on_hover_text(SDK_URL)
+                                .clicked()
+                            {
+                                open_url(SDK_URL);
+                            }
+                        });
+                    }
                 }
                 None => {}
             }

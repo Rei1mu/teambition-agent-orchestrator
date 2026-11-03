@@ -177,10 +177,62 @@ fn detect_msvc() -> Option<(String, String)> {
 }
 
 fn detect_sdk() -> Option<String> {
-    let pf = std::env::var("ProgramFiles(x86)")
-        .or_else(|_| std::env::var("ProgramFiles"))
-        .ok()?;
-    let libroot = Path::new(&pf).join("Windows Kits").join("10").join("Lib");
+    for root in sdk_roots() {
+        if let Some(s) = scan_sdk_lib(&root) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Windows SDK 的安装根目录（`...\Windows Kits\10`），可能不止一个。
+///
+/// 先看两个 ProgramFiles，再看注册表里的 `KitsRoot10`——SDK 可以装在 D 盘，
+/// 那时候只有注册表知道。仍然不扫盘：装过多个 SDK 版本时扫盘容易挑错那份。
+fn sdk_roots() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !p.as_os_str().is_empty() && !out.iter().any(|x| x == &p) {
+            out.push(p);
+        }
+    };
+    for env in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Ok(pf) = std::env::var(env) {
+            push(Path::new(&pf).join("Windows Kits").join("10"));
+        }
+    }
+    // 32 位视图下写的是 WOW6432Node，两个都问一遍，问不到就算了。
+    for key in [
+        r"HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots",
+        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots",
+    ] {
+        if let Some(root) = reg_query(key, "KitsRoot10") {
+            push(PathBuf::from(root));
+        }
+    }
+    out
+}
+
+/// 读一个 REG_SZ：`reg query` 的输出是「    KitsRoot10    REG_SZ    C:\...」，取最后一段。
+fn reg_query(key: &str, value: &str) -> Option<String> {
+    let mut cmd = Command::new("reg");
+    cmd.args(["query", key, "/v", value]);
+    crate::proc::hide(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.lines()
+        .find(|l| l.contains(value) && l.contains("REG_SZ"))
+        .and_then(|l| l.split("REG_SZ").nth(1))
+        .map(|p| p.trim().trim_end_matches('\\').to_string())
+        .filter(|p| !p.is_empty())
+}
+
+/// 在一个 SDK 根目录下挑版本最高的、真有 kernel32.lib 的那份。
+fn scan_sdk_lib(root: &Path) -> Option<String> {
+    let libroot = root.join("Lib");
     let mut vers: Vec<String> = std::fs::read_dir(&libroot)
         .ok()?
         .filter_map(|e| e.ok())
@@ -203,6 +255,19 @@ fn detect_sdk() -> Option<String> {
         });
     }
     None
+}
+
+/// 探测不到时给用户看「都找过哪些地方」，省得他以为程序没找。
+pub fn sdk_hints() -> String {
+    let roots = sdk_roots();
+    if roots.is_empty() {
+        return "（连 ProgramFiles / 注册表都没读到，环境不太正常）".to_string();
+    }
+    roots
+        .iter()
+        .map(|p| format!("  - {}", p.join("Lib").display()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn auto_detect() -> Option<Toolchain> {
@@ -307,16 +372,32 @@ pub fn clear(store: &Store) -> Result<String, String> {
 
 /// 自动探测一遍并写盘。写盘后就是「手动指定」来源，不会再被探测结果悄悄覆盖。
 pub fn guess(store: &Store) -> Result<String, String> {
-    let auto = auto_detect().ok_or_else(|| {
-        "标准位置没找到 MSVC / Windows SDK。装一下 VS 的「使用 C++ 的桌面开发」\
+    let cur = load(store);
+    let mut auto = auto_detect().ok_or_else(|| {
+        "标准位置没找到 MSVC（link.exe）。装一下 VS 的「使用 C++ 的桌面开发」\
          （带 Windows SDK），或者用 tba toolchain set 指定位置。"
             .to_string()
     })?;
+    // 探测不到 SDK 时保留用户之前指定的那份：
+    // 否则「点一下自动探测」会把一份能用的配置探测成不可用，很反直觉。
+    if auto.sdk_lib.trim().is_empty() && !cur.sdk_lib.trim().is_empty() {
+        auto.sdk_lib = cur.sdk_lib.clone();
+    }
+    if auto.extra_lib.trim().is_empty() {
+        auto.extra_lib = cur.extra_lib.clone();
+    }
     let problems = check(&auto);
     if !problems.is_empty() {
         return Err(format!(
-            "探测到的路径不完整：\n  - {}",
-            problems.join("\n  - ")
+            "探测到的路径不完整（没有保存）：\n  - {}\n\n\
+             Windows SDK 的 lib 找过这些位置：\n{}\n\n\
+             本机没装 SDK 的话，装一个（免费）：\n\
+             https://developer.microsoft.com/windows/downloads/windows-sdk/\n\
+             或者在 VS Installer 里勾「Windows 11 SDK」。\n\
+             已经有单独的 lib 目录（里面有 kernel32.lib）就直接指过去：\n\
+             tba toolchain set --sdk-lib <目录>",
+            problems.join("\n  - "),
+            sdk_hints()
         ));
     }
     save(store, &auto)?;

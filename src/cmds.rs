@@ -504,6 +504,13 @@ pub fn run() -> Result<(), String> {
                         for p in &r.problems {
                             println!("  - {p}");
                         }
+                        if r.tc.sdk_lib.trim().is_empty() {
+                            println!("\nWindows SDK 的 lib 找过这些位置：");
+                            println!("{}", tc::sdk_hints());
+                            println!("本机没装 SDK 的话装一个（免费）：");
+                            println!("  https://developer.microsoft.com/windows/downloads/windows-sdk/");
+                            println!("或者在 VS Installer 里勾「Windows 11 SDK」。");
+                        }
                         println!("\n指定位置（换成你机器上的实际目录）：");
                         println!("  tba toolchain set --msvc-bin <dir> --msvc-lib <dir> --sdk-lib <dir>");
                         println!("    --msvc-bin: <VS>/VC/Tools/MSVC/<ver>/bin/Hostx64/x64");

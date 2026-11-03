@@ -2,8 +2,8 @@
 ; 由 .github/workflows/release.yml 调用 iscc，用 /D 传入版本号与架构。
 ;
 ; 三条硬要求来自 README「安装包要求」一节，缺一个 agent 就找不到命令：
-;   1. tba.exe 装到 {%USERPROFILE}\tba
-;   2. 该目录写进用户 PATH（HKCU）
+;   1. tba.exe 装到安装目录（默认 {%USERPROFILE}\tba，安装页可改）
+;   2. 该目录写进用户 PATH（HKCU；安装页有勾选项，默认勾上）
 ;   3. 卸载时从 PATH 移除，但不删 data/（token、台账、项目绑定都在里面）
 ; reload.ps1 等资源已 include_str! 编进 exe，不用单独装。
 
@@ -31,10 +31,15 @@ AppVerName=TBA {#AppVersion}
 AppVersion={#AppVersion}
 AppPublisher=Rei1mu
 AppPublisherURL=https://github.com/Rei1mu/teambition-agent-orchestrator
-; 路径必须短且固定：换位置会出现两个 tba.exe，where tba 返回两条。
-; Inno 没有 {userprofile} 这个常量，用户主目录要写成环境变量 {%USERPROFILE}。
+; 路径默认短且固定：{%USERPROFILE}\tba 是历史默认位置，where tba 只会有一条。
+; 但不再强制——用户可以把 exe 装到别的盘。升级时 Inno 会沿用上次选的目录
+; （UsePreviousAppDir），不会又跳回默认值。
+; 数据目录默认跟 exe 同级的 data\；换目录后 tba 会回落到 %USERPROFILE%\tba\data，
+; 所以不会像重装一样丢 token（见 src/config.rs 的 data_dir）。
 DefaultDirName={%USERPROFILE}\tba
 DefaultGroupName=TBA
+DisableDirPage=no
+UsePreviousAppDir=yes
 DisableProgramGroupPage=yes
 ; 装到用户目录，不需要管理员权限，双击就能装。
 PrivilegesRequired=lowest
@@ -60,6 +65,8 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 [CustomMessages]
 zh.TaskGroup=创建快捷方式
 en.TaskGroup=Shortcuts
+zh.TaskPath=把 tba 加到 PATH（新开的终端能直接敲 tba）
+en.TaskPath=Add tba to PATH (so `tba` works in new terminals)
 zh.TaskStartMenu=创建开始菜单快捷方式
 en.TaskStartMenu=Create a Start Menu shortcut
 zh.TaskDesktop=创建桌面快捷方式
@@ -70,6 +77,9 @@ zh.RunApp=立即启动 TBA
 en.RunApp=Launch TBA
 
 [Tasks]
+; PATH 单独做成一项：默认勾上（不勾的话命令行敲 tba 会找不到），但用户可以取消。
+; 取消时卸载逻辑会把它从 PATH 摘掉，不会留下一条指向不存在目录的路径。
+Name: "addtopath"; Description: "{cm:TaskPath}"; GroupDescription: "{cm:TaskGroup}"
 ; 两个快捷方式都默认勾选，用户可以取消。GroupDescription 相同 -> 同一页同一组。
 Name: "startmenuicon"; Description: "{cm:TaskStartMenu}"; GroupDescription: "{cm:TaskGroup}"
 Name: "desktopicon"; Description: "{cm:TaskDesktop}"; GroupDescription: "{cm:TaskGroup}"
@@ -184,7 +194,13 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
-    AddToPath(ExpandConstant('{app}'));
+  begin
+    // 用户取消了「加到 PATH」就明确摘掉：升级时改主意也能生效。
+    if WizardIsTaskSelected('addtopath') then
+      AddToPath(ExpandConstant('{app}'))
+    else
+      RemoveFromPath(ExpandConstant('{app}'));
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

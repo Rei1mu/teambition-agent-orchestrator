@@ -127,10 +127,23 @@ pub const DEFAULT_SMTP_PORT: u16 = 465;
 pub const DEFAULT_IMAP_PORT: u16 = 993;
 
 // 本地数据放在 exe 运行目录下的 data/。所有 agent 共享同一个目录。
+//
+// 安装包允许把 exe 装到任意位置（比如 D:\apps\tba），但历史数据多半在默认位置
+// %USERPROFILE%\tba\data。同级没有 data\ 时回落到那里，免得换个目录就像重装一样
+// 要重新登录、项目绑定也全没了。dev 构建（target\debug\data 已存在）不受影响。
 pub fn data_dir() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            return dir.join("data");
+            let here = dir.join("data");
+            if !here.exists() {
+                if let Some(home) = std::env::var_os("USERPROFILE") {
+                    let old = PathBuf::from(home).join("tba").join("data");
+                    if old.is_dir() {
+                        return old;
+                    }
+                }
+            }
+            return here;
         }
     }
     PathBuf::from("data")

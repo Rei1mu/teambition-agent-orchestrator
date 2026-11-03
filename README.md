@@ -47,15 +47,19 @@ Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出
 
 安装时做三件事，缺一个 agent 就找不到命令：
 
-1. 把 `tba.exe` 放到安装目录。
-2. 把安装目录写进**用户 PATH**。
+1. 把 `tba.exe` 放到安装目录（**可自定义**，安装页第二屏能改）。
+2. 把安装目录写进**用户 PATH**（安装页「Shortcuts」一组的可勾选项，默认勾上；取消就不写）。
 3. `data/` 不预置，首次运行自动生成（exe 同目录）。
 
-**安装目录约定：`C:\Users\<用户名>\tba`**（Inno Setup 里写 `{%USERPROFILE}\tba`；没有 `{userprofile}` 这个常量）。
+**默认安装目录：`C:\Users\<用户名>\tba`**（Inno Setup 里写 `{%USERPROFILE}\tba`；没有 `{userprofile}` 这个常量）。
+默认值只是「最省事」的选择：路径短、不需要管理员权限、`tba` 这个名字和目录名一致。
 
-跨设备统一用这个位置，好处是：路径短、不需要管理员权限、`tba` 这个名字和目录名一致。
-别装到 `%LOCALAPPDATA%\Programs\tba` 或别的地方——两个位置都进 PATH 会出现两个 `tba.exe`，
-`where tba` 返回两条，agent 和人都分不清跑的是哪一个。
+想装到别的盘就改，注意三点：
+
+- **升级会沿用上次选的目录**（`UsePreviousAppDir`），不会又跳回默认值。
+- 两个位置都装、都进 PATH，就会出现两个 `tba.exe`，`where tba` 返回两条。换位置前先卸旧的。
+- `data/` 默认在 exe 同级的 `data\`；换目录后同级没有 `data\` 时会**回落到**
+  `%USERPROFILE%\tba\data`，所以换位置不会丢 token、项目绑定和台账。
 
 **快捷方式**：安装页有「Shortcuts」一组，两项都默认勾选，可以取消：
 
@@ -702,10 +706,14 @@ mingw 运行时，窗口和路径行为都不一样，所以不做兜底——�
 
 1. 环境变量 `TBA_MSVC_BIN` / `TBA_MSVC_LIB` / `TBA_SDK_LIB` / `TBA_EXTRA_LIB`（CI、临时覆盖）
 2. `data/toolchain.toml`（手选一次，之后一直用）
-3. 自动探测（`vswhere` 找 VS + `Windows Kits\10\Lib\<ver>`）
+3. 自动探测（`vswhere` 找 VS + `Windows Kits\10\Lib\<ver>`，另外查注册表 `KitsRoot10`，
+   所以 SDK 装在 D 盘也能找到）
 
 自动探测只覆盖标准位置，**不扫盘**：装了 VS 预览版或好几个 SDK 版本时，扫盘很容易
 挑错那一份，让用户点一次「选择」更准。
+
+`guess` 探不到 SDK 时**不会把已有的配置清掉**——它会沿用 `toolchain.toml` 里那份
+`sdk_lib`，并告诉你「找过哪些位置」。只有真的一份都没有时才报错，报错里带 SDK 下载地址。
 
 ```bat
 tba toolchain                     :: 状态：可用/不可用、来源、还差什么
@@ -721,7 +729,15 @@ tba toolchain clear               :: 清掉手选，回到自动探测
 分别要能找到 `link.exe` / `libcmt.lib` / `kernel32.lib`，找不到就不写，错误直接说
 缺哪个文件——比「选错了一层目录」这种猜谜强。
 
-窗口里在 **设置 → 构建工具链**：状态 + 来源 + 三个「选择…目录」按钮 + 自动探测 / 清除。
+**本机没装 Windows SDK 怎么办**：`kernel32.lib` 不一定非要来自完整安装。只要有一个
+目录里放着 `kernel32.lib`（比如从别的机器拷来的 `winsdk_libs` 平铺目录），
+`tba toolchain set --sdk-lib <那个目录>` 就能用。想装完整 SDK：
+
+- VS Installer → 修改 → 单个组件 → 勾「Windows 11 SDK」
+- 或者单独装：https://developer.microsoft.com/windows/downloads/windows-sdk/
+
+窗口里在 **设置 → 构建工具链**：状态 + 来源 + 三个「选择…目录」按钮 + 自动探测 / 清除；
+探不到 SDK 时下面多一行「下载 Windows SDK」链接，点了用默认浏览器打开。
 
 ## 共享记忆
 
