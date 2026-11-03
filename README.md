@@ -135,7 +135,7 @@ tba gitbutler clear      :: 清掉手选路径，回到自动检测
 - **Windows 官方只发 MSI**（没有独立 CLI 二进制，官方 `curl -fsSL https://gitbutler.com/install.sh | sh` 也只支持 mac/linux）。自动安装走：下载 MSI zip → `Expand-Archive` 解压 → `msiexec /a /qn TARGETDIR=…` 管理抽取 → 拷贝 `but.exe` → `but --version` 验活。**不需要 UAC、不动注册表**，实测 10 秒左右装完。
 - **git 是系统级依赖**，TBA 不自动装（Git for Windows 装 Program Files 要提权），检测到缺失时引导去 <https://git-scm.com/download/win>。
 - 缺 GitButler/git 时，任何 `tba` 命令都会先打印引导再退出；排查问题可用 `TBA_SKIP_GITBUTLER=1` 强制跳过。
-- 窗口里 CentralPanel 置顶有一张 GitButler 状态卡（版本 + 来源 + 一键安装 + 指定位置），悬停版本号可看完整路径。窗口是全局的，「当前目录配没配」不在窗口里判断——真正用到 `but` 的是 `tba git`，它按你执行命令的那个项目目录自己判断（普通仓库走 git，GitButler 项目走 `but commit`）。
+- 窗口里 **设置页** 有一张 GitButler 状态卡（版本 + 来源 + 一键安装 + 指定位置），悬停版本号可看完整路径。它原来置顶在项目列表上方，一占就是小半屏，现在搬进设置；只有**缺件时**项目页顶部才留一行橙字提醒 + 「去设置」。窗口是全局的，「当前目录配没配」不在窗口里判断——真正用到 `but` 的是 `tba git`，它按你执行命令的那个项目目录自己判断（普通仓库走 git，GitButler 项目走 `but commit`）。
 
 ## 快速开始
 
@@ -685,11 +685,30 @@ tba reload kill  /  tba reload status        :: 杀 / 看是否在跑
 tba reload build --compile "make"            :: 临时覆盖编译指令（不写回设置）
 ```
 
-窗口里在项目卡片的 **编译 & 重载** 栏（默认收起）：勾选启用、编译指令、项目目录、
-exe 基名、启动模式、运行副本、启动参数，按钮是「保存到 Teambition」「从云端重读」
-「查看文案」和「编译 & 重载 / 只重启 / 杀掉 / 状态」，结果和 `target/reload.log` 末尾就在下面。
+窗口里在项目卡片的 **编译 & 重载** 栏（默认收起）：**直接编辑那段 TOML 文本**（就是存进
+Teambition 任务备注的那一份），下面一行实时告诉你解析结果；按钮是「保存到 Teambition」
+「探测默认值」「从云端重读」「查看文案」和「编译 & 重载 / 只重启 / 杀掉 / 状态」，
+结果和 `target/reload.log` 末尾就在下面。
 
-「查看文案」按**当前表单内容**生成，所以改完还没保存也能先看效果；保存到 Teambition 后
+```toml
+on = true                                  # 关掉 = agent 文案里不出现这段
+compile = "cargo build --release"          # 空着 = 还没定，可用「探测默认值」
+root = 'D:\dev\mcp'                        # 编译在这个目录跑
+name = "tba"                               # exe 基名，不带 .exe
+mode = "rename"                            # rename 改名直跑 / copy 副本运行
+live = ""                                  # copy 模式的副本路径，空 = 自动推算
+args = "ui"                                # 启动参数
+```
+
+为什么是文本而不是一排输入框：这几个参数本来就是**一条命令的几个片段**，拆成六个格子后
+改一个得挨个找，还看不全整体；而它最终就是 Teambition 任务备注里的那段文本——直接编辑它，
+「看到的」和「存下去的」是同一份，复制给别人、贴到 issue 里也能直接用。
+
+容错：路径写进双引号里 `root = "D:\dev\mcp"` 在 TOML 里是非法转义（`\d`），解析会失败，
+此时**退化成逐行扫 `key = value`**，字段照样读得出来，界面上给一条橙色提示建议改用单引号。
+所以「不是合法 TOML」只是提示，不会让设置失效。
+
+「查看文案」按**当前文本内容**生成，所以改完还没保存也能先看效果；保存到 Teambition 后
 agent 才会真收到。
 
 约定：

@@ -119,6 +119,10 @@ pub struct App {
     cap_off: HashMap<String, Vec<String>>,
     // 项目「编译 & 重载」的编辑态（本地缓存 + 云端设置）
     setting: HashMap<String, crate::setting::ProjectSetting>,
+    // 「编译 & 重载」的**文本**编辑缓冲（每个项目一段 TOML 原文）。
+    // 表单拆成六个格子太碎，改一个参数得挨个找；直接编辑那段文本更顺手，
+    // 而且它就是存到 Teambition 任务备注里的东西——所见即所存。
+    compile_text: HashMap<String, String>,
     // 已经从云端拉过一次（避免每次展开都联网）
     setting_fetched: HashMap<String, bool>,
     // 正在读/写哪个项目的设置
@@ -502,6 +506,7 @@ impl App {
             },
             cap_off: HashMap::new(),
             setting: HashMap::new(),
+            compile_text: HashMap::new(),
             setting_fetched: HashMap::new(),
             setting_busy: None,
             reload_busy: None,
@@ -590,6 +595,21 @@ impl App {
             let r = crate::gitbutler::install(&store).map(|_| ());
             let _ = tx.send(Ev::GbInstalled(r));
         });
+    }
+
+    /// 缺 GitButler / git 时的一句话提醒；都正常时返回 None（完全不占位）。
+    /// 项目列表上方只留这一行，卡片本体在设置页。
+    fn git_missing_hint(&self) -> Option<String> {
+        let gb = self.gb.as_ref()?;
+        if !gb.found {
+            return Some(
+                "没检测到 GitButler CLI（but.exe），TBHub 不会干活——去设置里装或选路径".to_string(),
+            );
+        }
+        if self.git_ver.is_none() {
+            return Some("没检测到 git，GitButler 依赖它".to_string());
+        }
+        None
     }
 
     /// GitButler 状态卡：CLI 装没装、什么版本、从哪来、当前目录配没配；
@@ -862,6 +882,9 @@ impl eframe::App for App {
                     self.setting_busy = None;
                     match r {
                         Ok(Some(st)) => {
+                            // 云端拉回来就重置文本缓冲：这是用户主动「从云端重读」，
+                            // 或者第一次展开时的自动拉取（那时还没人编辑过）。
+                            self.compile_text.insert(pid.clone(), st.to_note());
                             self.setting.insert(pid, st);
                         }
                         Ok(None) => {
@@ -881,6 +904,9 @@ impl eframe::App for App {
                             if let Some(st) =
                                 crate::setting::ProjectSetting::load_cached(&self.store, &pid)
                             {
+                                // 文本也换成规范化后的版本：用户手写的引号/转义被修正，
+                                // 下次打开看到的就是「实际存下去的东西」。
+                                self.compile_text.insert(pid.clone(), st.to_note());
                                 self.setting.insert(pid, st);
                             }
                         }
@@ -1091,10 +1117,20 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // GitButler 状态卡：优先级高于 Teambition，哪个视图都置顶显示，
-            // 缺 CLI 时给一键安装（装到运行目录，无需管理员）。
-            self.draw_gitbutler_card(ui);
-            ui.add_space(6.0);
+            // GitButler / git 状态卡搬去了设置页：它一占就是小半屏，把项目列表整个顶下去。
+            // 只在**缺件**时留一行提醒——缺 CLI 时 TBHub 根本不干活，不能让人蒙在鼓里。
+            if let Some(msg) = self.git_missing_hint() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("⚠ {msg}"))
+                            .color(egui::Color32::from_rgb(0xE0, 0x7B, 0x39)),
+                    );
+                    if ui.button("去设置").clicked() {
+                        self.view = View::Settings;
+                    }
+                });
+                ui.add_space(4.0);
+            }
             if self.view == View::Caps {
                 // 能力列表可能很长（尤其字号大时），必须套滚动区，否则底部行被裁掉。
                 egui::ScrollArea::vertical()
@@ -1984,13 +2020,22 @@ impl App {
         }
         let mut ed = self.setting.get(pid).cloned().unwrap_or_default();
         let busy = self.reload_busy.as_deref() == Some(pid);
-        let title = if ed.on {
+        // 文本缓冲：第一次进来用当前设置渲染成 TOML，之后就是用户手里的那份。
+        if !self.compile_text.contains_key(pid) {
+            self.compile_text.insert(pid.to_string(), ed.to_note());
+        }
+        // 标题按文本里解析出来的 on 走，改了 `on = false` 立刻反映到折叠标题上。
+        let parsed_now = crate::setting::ProjectSetting::parse_note(
+            self.compile_text.get(pid).map(|s| s.as_str()).unwrap_or(""),
+        );
+        let title = if parsed_now.on {
             "编译 & 重载".to_string()
         } else {
             "编译 & 重载（已停用）".to_string()
         };
         let mut save = false;
         let mut refetch = false;
+        let mut detect = false;
         let mut action: Option<&'static str> = None;
 
         egui::CollapsingHeader::new(title)
@@ -2011,90 +2056,74 @@ impl App {
                 }
                 ui.label(
                     egui::RichText::new(
-                        "参数存 Teambition：状态 setting 的任务「项目设置」，网页上也能看能改。\
-                         勾选 = 这个项目要编译 & 重载；关掉后 agent 文案里不出现。",
+                        "参数存 Teambition：状态 setting 的任务「项目设置」。下面就是那段文本，\
+                         网页上看到的也是同一份——改完点「保存到 Teambition」。",
                     )
                     .small()
                     .weak(),
                 );
-                ui.checkbox(&mut ed.on, "启用（编译 & 重载）");
-                ui.horizontal(|ui| {
-                    ui.label("编译指令");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut ed.compile)
-                            .desired_width(420.0)
-                            .hint_text("例如 cargo build --release / zig build / npm run build"),
-                    );
-                });
-                if ed.compile.trim().is_empty() {
-                    ui.label(
-                        egui::RichText::new(
-                            "空着 = 还没定。让 agent 跑 `tba setting guess` 探测项目类型，\
-                             再 `tba setting set --compile \"...\"` 写回 Teambition；\
-                             也可以直接在这里填。空着仍可「只重载」（杀旧 + 启动）。",
-                        )
-                        .small()
-                        .weak(),
+                ui.label(
+                    egui::RichText::new(
+                        "字段：on(true/false) · compile · root · name(exe 基名，不带 .exe) · \
+                         mode(rename 改名直跑 / copy 副本运行) · live(copy 模式的副本路径) · args(启动参数)",
+                    )
+                    .small()
+                    .weak(),
+                );
+                // 文本就是真相：这段 TOML 原样存进 Teambition 任务备注。
+                // 之前是六个输入框，改一个参数得在格子里挨个找，还看不全整体。
+                let mut text = self.compile_text.get(pid).cloned().unwrap_or_default();
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .code_editor()
+                        .desired_rows(9)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(
+                            "# 一行一个字段，例如：\n\
+                             # on = true\n\
+                             # compile = \"cargo build --release\"\n\
+                             # root = 'D:\\dev\\mcp'\n\
+                             # name = \"tba\"\n\
+                             # mode = \"rename\"\n\
+                             # args = \"ui\"",
+                        ),
+                );
+                if resp.changed() {
+                    self.compile_text.insert(pid.to_string(), text.clone());
+                }
+                // 解析结果就地反馈：语法对不对、有没有明显会跑挂的。
+                // 解析不了也照样能用（逐行扫 key = value），所以只是提示不是错误。
+                let parsed = crate::setting::ProjectSetting::parse_note(&text);
+                let mut warns: Vec<String> = Vec::new();
+                let mut hints: Vec<String> = Vec::new();
+                if !crate::setting::ProjectSetting::is_toml(&text) {
+                    warns.push(
+                        "不是合法 TOML（多半是 Windows 路径里的 \\ 或引号写错），已按行读取：\
+                         字段照样能认，但建议路径用单引号 'D:\\dev\\mcp'"
+                            .to_string(),
                     );
                 }
-
-                egui::Grid::new(("compile_grid", pid))
-                    .num_columns(2)
-                    .spacing([10.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("项目目录");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut ed.root)
-                                .desired_width(420.0)
-                                .hint_text("编译在这个目录里跑"),
-                        );
-                        ui.end_row();
-
-                        ui.label("exe 基名");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut ed.name)
-                                .desired_width(200.0)
-                                .hint_text("不带 .exe"),
-                        );
-                        ui.end_row();
-
-                        ui.label("启动模式");
-                        egui::ComboBox::from_id_salt(("compile_mode", pid))
-                            .selected_text(if ed.mode == "copy" {
-                                "copy · 副本运行"
-                            } else {
-                                "rename · 改名直跑"
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut ed.mode,
-                                    "rename".to_string(),
-                                    "rename · 改名直跑",
-                                );
-                                ui.selectable_value(
-                                    &mut ed.mode,
-                                    "copy".to_string(),
-                                    "copy · 副本运行",
-                                );
-                            });
-                        ui.end_row();
-
-                        if ed.mode == "copy" {
-                            ui.label("运行副本");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut ed.live).desired_width(420.0),
-                            );
-                            ui.end_row();
-                        }
-
-                        ui.label("启动参数");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut ed.args)
-                                .desired_width(200.0)
-                                .hint_text("例如 ui"),
-                        );
-                        ui.end_row();
-                    });
+                warns.extend(parsed.problems());
+                if parsed.compile.trim().is_empty() {
+                    hints.push(
+                        "compile 空着 = 还没定：可以点「探测默认值」，或让 agent 跑 \
+                         `tba setting guess`。空着仍可「只重启」。"
+                            .to_string(),
+                    );
+                }
+                if warns.is_empty() && hints.is_empty() {
+                    ui.label(egui::RichText::new("✓ 解析正常").small().weak());
+                }
+                for w in warns {
+                    ui.label(
+                        egui::RichText::new(format!("⚠ {w}"))
+                            .small()
+                            .color(egui::Color32::from_rgb(0xE0, 0x7B, 0x39)),
+                    );
+                }
+                for h in hints {
+                    ui.label(egui::RichText::new(format!("· {h}")).small().weak());
+                }
 
                 ui.horizontal_wrapped(|ui| {
                     if ui
@@ -2108,6 +2137,16 @@ impl App {
                         save = true;
                     }
                     if ui
+                        .button("探测默认值")
+                        .on_hover_text(
+                            "按项目现状补 root / name / compile，**只填空着的**，填过的一律不动。\
+                             补完直接显示在文本里，还要点保存才写回云端",
+                        )
+                        .clicked()
+                    {
+                        detect = true;
+                    }
+                    if ui
                         .add_enabled(
                             self.setting_busy.as_deref() != Some(pid),
                             egui::Button::new("从云端重读"),
@@ -2117,16 +2156,17 @@ impl App {
                         refetch = true;
                     }
                     // 文案就是开工时给 agent 的那一段（和 `tba setting text` 同源）。
-                    // 按当前表单算：改完没保存也能先看效果，保存后 agent 才真收到。
+                    // 按当前文本算：改完没保存也能先看效果，保存后 agent 才真收到。
                     if ui
                         .button("查看文案")
                         .on_hover_text(
-                            "看开工文案里「编译 & 重载」那一段（按当前表单内容生成；                             保存到 Teambition 后 agent 才会收到）",
+                            "看开工文案里「编译 & 重载」那一段（按当前文本内容生成；\
+                             保存到 Teambition 后 agent 才会收到）",
                         )
                         .clicked()
                     {
                         let exe = crate::ops::prompt_exe(&self.store);
-                        let block = ed.prompt_block(&exe, true);
+                        let block = parsed.prompt_block(&exe, true);
                         let text = if block.trim().is_empty() {
                             "「编译 & 重载」已停用：这段不会出现在开工文案里。".to_string()
                         } else {
@@ -2180,6 +2220,17 @@ impl App {
                 }
             });
 
+        // 文本 -> 结构体：保存、跑「编译 & 重载」都用解析出来的值，
+        // 这样「文本里写的就是会执行的东西」，不会出现表单和文本两套真相。
+        let text_now = self.compile_text.get(pid).cloned().unwrap_or_default();
+        ed = crate::setting::ProjectSetting::parse_note(&text_now);
+        if detect {
+            // 探测默认值：只补空着的字段，然后把结果写回文本让人过目。
+            let mut st = ed.clone();
+            st.fill_defaults();
+            self.compile_text.insert(pid.to_string(), st.to_note());
+            ed = st;
+        }
         // 编辑态写回：CollapsingHeader 收起时闭包不执行，这里只在展开时覆盖，
         // 不会把云端刚拉回来的值冲掉（拉回来时闭包还没跑）。
         self.setting.insert(pid.to_string(), ed.clone());
@@ -2202,6 +2253,9 @@ impl App {
             let mut st = ed.clone();
             // 空字段按项目现状补齐再存，否则云端会留下一个「有任务没参数」的设置。
             st.fill_defaults();
+            // 文本同步成规范化后的 TOML：手写的引号/转义在这里被修正，
+            // 下次打开看到的就是实际存下去的东西。
+            self.compile_text.insert(pid.to_string(), st.to_note());
             self.setting.insert(pid.to_string(), st.clone());
             thread::spawn(move || {
                 let r = crate::setting::save(&store, &pid2, &st);
@@ -2490,6 +2544,10 @@ impl App {
         ui.heading("设置");
         // 工具链放最上面：编译不了是最容易卡住人的一件事，比字号重要。
         self.draw_toolchain(ui);
+        ui.add_space(12.0);
+        // GitButler / git 也从主界面搬到这里：优先级仍然最高（缺它 TBHub 不干活），
+        // 但它平时是「装好就再也不看」的东西，不该常年占着项目列表上方。
+        self.draw_gitbutler_card(ui);
         ui.add_space(12.0);
         ui.label(
             "界面偏好会单独存到 data/ui.toml，不会碰 Teambition 配置（token 等）。",

@@ -154,6 +154,34 @@ impl ProjectSetting {
         !self.root.trim().is_empty() && !self.name.trim().is_empty()
     }
 
+    /// 文本能不能按 TOML 读。只用于 GUI 给提示：读不了也会走逐行扫描，
+    /// 所以这里返回 false 不代表设置不可用。
+    pub fn is_toml(text: &str) -> bool {
+        toml::from_str::<ProjectSetting>(text.trim_start_matches('\u{feff}')).is_ok()
+    }
+
+    /// 明显会出问题的地方，给人看的短句。空 vec = 没发现毛病。
+    /// 只报「按现在的值跑一定不对」的：宁可少报，也别把提示写成噪音。
+    pub fn problems(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if !self.mode.trim().is_empty() && self.mode.trim() != "rename" && self.mode.trim() != "copy"
+        {
+            v.push(format!(
+                "mode 只能是 rename 或 copy，现在是 \"{}\"（会被当成 rename）",
+                self.mode.trim()
+            ));
+        }
+        if self.root.trim().is_empty() {
+            v.push("root 空着：编译不知道在哪个目录跑".to_string());
+        } else if !Path::new(self.root.trim()).is_dir() {
+            v.push(format!("root 目录不存在：{}", self.root.trim()));
+        }
+        if self.name.trim().is_empty() {
+            v.push("name 空着：找不到要启动的 exe".to_string());
+        }
+        v
+    }
+
     /// 开工文案里「编译 & 重载」那一段。
     ///
     /// GUI 的「查看文案」和 `tba setting text` 都调这里，保证**看到的就是 agent 收到的**——
@@ -362,8 +390,7 @@ root = 'D:\dev\mcp'
     }
 
     #[test]
-    fn guess_compile_by_build_file() {
-        let d = std::env::temp_dir().join(format!("tba-set-{}", std::process::id()));
+    fn guess_compile_by_build_file() {        let d = std::env::temp_dir().join(format!("tba-set-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         assert_eq!(guess_compile(&d.display().to_string()), "");
@@ -380,5 +407,39 @@ root = 'D:\dev\mcp'
             "cargo build --release"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // GUI 现在直接编辑 TOML 文本，这两个函数决定给什么提示。
+    #[test]
+    fn problems_flag_bad_mode_and_missing_root() {
+        let bad = ProjectSetting {
+            mode: "cpy".to_string(),
+            ..Default::default()
+        };
+        let p = bad.problems();
+        assert!(p.iter().any(|x| x.contains("mode")), "{p:?}");
+        assert!(p.iter().any(|x| x.contains("root")), "{p:?}");
+        assert!(p.iter().any(|x| x.contains("name")), "{p:?}");
+
+        let ok = ProjectSetting {
+            compile: "cargo build".to_string(),
+            root: std::env::temp_dir().display().to_string(),
+            name: "tba".to_string(),
+            mode: "rename".to_string(),
+            ..Default::default()
+        };
+        assert!(ok.problems().is_empty(), "{:?}", ok.problems());
+    }
+
+    #[test]
+    fn is_toml_detects_bad_quoting() {
+        assert!(ProjectSetting::is_toml("compile = \"cargo build\"\n"));
+        // Windows 路径写进双引号里，\d 是非法转义：TOML 读不了，
+        // 但逐行扫描能原样捞回来——所以「读不了」只是提示，不是错误。
+        assert!(!ProjectSetting::is_toml("root = \"D:\\dev\\mcp\"\n"));
+        assert_eq!(
+            ProjectSetting::parse_note("root = \"D:\\dev\\mcp\"\n").root,
+            r"D:\dev\mcp"
+        );
     }
 }
