@@ -48,7 +48,7 @@ Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出
 安装时做三件事，缺一个 agent 就找不到命令：
 
 1. 把 `tba.exe` 放到安装目录（**可自定义**，安装页第二屏能改）。
-2. 把安装目录写进**用户 PATH**（安装页「Shortcuts」一组的可勾选项，默认勾上；取消就不写）。
+2. 把安装目录写进**用户 PATH**（安装页「附加选项」里的可勾选项，默认勾上；取消就不写）。
 3. `data/` 不预置，首次运行自动生成（exe 同目录）。
 
 **默认安装目录：`C:\Users\<用户名>\tba`**（Inno Setup 里写 `{%USERPROFILE}\tba`；没有 `{userprofile}` 这个常量）。
@@ -61,10 +61,11 @@ Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出
 - `data/` 默认在 exe 同级的 `data\`；换目录后同级没有 `data\` 时会**回落到**
   `%USERPROFILE%\tba\data`，所以换位置不会丢 token、项目绑定和台账。
 
-**快捷方式**：安装页有「Shortcuts」一组，两项都默认勾选，可以取消：
+**附加选项**：安装页有「附加选项」一组，三项默认都勾选，可以取消：
 
-| 项 | 位置 | 可取消 |
+| 项 | 效果 | 可取消 |
 |---|---|---|
+| 把 tba 加到 PATH | 写进用户 PATH，新终端能直接敲 `tba` | 是（取消时会把已有条目摘掉） |
 | 开始菜单快捷方式 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\TBA\TBA.lnk` | 是 |
 | 桌面快捷方式 | `%USERPROFILE%\Desktop\TBA.lnk` | 是 |
 | 卸载入口 | 同上开始菜单目录 `Uninstall TBA.lnk` | 否，始终创建 |

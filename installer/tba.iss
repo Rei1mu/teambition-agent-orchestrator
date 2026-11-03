@@ -63,8 +63,8 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 
 ; 自定文案走 cm，两种语言各自正确。硬编码在 [Tasks] 里就只能显示一种。
 [CustomMessages]
-zh.TaskGroup=创建快捷方式
-en.TaskGroup=Shortcuts
+zh.TaskGroup=附加选项
+en.TaskGroup=Additional tasks
 zh.TaskPath=把 tba 加到 PATH（新开的终端能直接敲 tba）
 en.TaskPath=Add tba to PATH (so `tba` works in new terminals)
 zh.TaskStartMenu=创建开始菜单快捷方式
