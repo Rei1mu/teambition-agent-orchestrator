@@ -153,6 +153,67 @@ impl ProjectSetting {
     pub fn ready(&self) -> bool {
         !self.root.trim().is_empty() && !self.name.trim().is_empty()
     }
+
+    /// 开工文案里「编译 & 重载」那一段。
+    ///
+    /// GUI 的「查看文案」和 `tba setting text` 都调这里，保证**看到的就是 agent 收到的**——
+    /// 另写一份说明迟早会和实际文案对不上。
+    pub fn prompt_block(&self, exe: &str, zh: bool) -> String {
+        if !self.on {
+            return String::new();
+        }
+        if self.compile.trim().is_empty() {
+            return if zh {
+                format!(
+                    "编译 & 重载（本项目）：编译指令未填，先 `{exe} setting guess` 探测项目类型，\
+                     再 `{exe} setting set --compile \"...\"` 写回 Teambition，然后 `{exe} reload build`\n\n"
+                )
+            } else {
+                format!(
+                    "Build & reload: compile not set. `{exe} setting guess` to detect the project type, \
+                     then `{exe} setting set --compile \"...\"` (saved to Teambition), then `{exe} reload build`\n\n"
+                )
+            };
+        }
+        // 参数齐全时把关键项摆出来：agent 一眼能确认编译的是哪个项目、跑的是哪个 exe，
+        // 不用再 `tba setting` 查一遍。
+        let mut parts: Vec<String> = vec![format!(
+            "{}: {}",
+            if zh { "编译" } else { "compile" },
+            self.compile.trim()
+        )];
+        if !self.root.trim().is_empty() {
+            parts.push(format!(
+                "{}: {}",
+                if zh { "目录" } else { "dir" },
+                self.root.trim()
+            ));
+        }
+        if !self.name.trim().is_empty() {
+            parts.push(format!("exe: {}", self.name.trim()));
+        }
+        let launch = if self.mode.trim() == "copy" {
+            if zh { "副本运行" } else { "run a copy" }
+        } else if zh {
+            "直接跑产物"
+        } else {
+            "run in place"
+        };
+        parts.push(format!("{}: {launch}", if zh { "启动" } else { "launch" }));
+        if zh {
+            format!(
+                "编译 & 重载（本项目）：`{exe} reload build`\n  {}\n  \
+                 一条命令走完 编译 → 杀旧 → 启动，成功回 `OK <pid>`；失败看 `{exe} reload status`。\n\n",
+                parts.join(" · ")
+            )
+        } else {
+            format!(
+                "Build & reload (this project): `{exe} reload build`\n  {}\n  \
+                 One command: build -> kill old -> launch. `OK <pid>` on success; `{exe} reload status` on failure.\n\n",
+                parts.join(" · ")
+            )
+        }
+    }
 }
 
 /// 按项目里的构建文件猜编译指令。猜不到返回空串（让 agent 自己看）。
@@ -230,9 +291,44 @@ pub fn save(store: &Store, project_id: &str, s: &ProjectSetting) -> Result<Strin
 mod tests {
     use super::*;
 
+    // 开工文案里那段「编译 & 重载」：GUI 的「查看文案」和 `tba setting text` 读的就是它，
+    // 所以它必须自己说得清「编译什么、在哪编、跑哪个 exe」，而不是让人再去 `tba setting` 查。
     #[test]
-    fn note_roundtrip() {
+    fn prompt_block_carries_params() {
         let s = ProjectSetting {
+            on: true,
+            compile: "cargo build --release".into(),
+            root: r"D:\dev\mcp".into(),
+            name: "tba".into(),
+            mode: "rename".into(),
+            ..Default::default()
+        };
+        let zh = s.prompt_block("tba", true);
+        assert!(zh.contains("编译 & 重载"), "{zh}");
+        assert!(zh.contains("cargo build --release"), "要带编译指令: {zh}");
+        assert!(zh.contains(r"D:\dev\mcp"), "要带项目目录: {zh}");
+        assert!(zh.contains("exe: tba"), "要带 exe 名: {zh}");
+        assert!(zh.contains("reload build"), "要给出跑法: {zh}");
+
+        // 关掉的项目：这段整个不出现，别留一句「已停用」白占字数。
+        let off = ProjectSetting {
+            on: false,
+            ..s.clone()
+        };
+        assert!(off.prompt_block("tba", true).is_empty());
+
+        // 编译指令空着：给探测入口，而不是默认按 cargo 硬编。
+        let empty = ProjectSetting {
+            compile: String::new(),
+            ..s
+        };
+        let e = empty.prompt_block("tba", true);
+        assert!(e.contains("setting guess"), "空指令要给探测入口: {e}");
+        assert!(!e.contains("cargo build"), "不该替用户猜指令: {e}");
+    }
+
+    #[test]
+    fn note_roundtrip() {        let s = ProjectSetting {
             on: false,
             compile: "zig build -Doptimize=ReleaseFast".to_string(),
             root: r"D:\dev\zigapp".to_string(),

@@ -647,7 +647,18 @@ tba setting                                  :: 看本项目的设置（缺省�
 tba setting guess                            :: 按项目文件猜编译指令，只打印不保存
 tba setting set --compile "zig build -Doptimize=ReleaseFast"
 tba setting set --root D:\dev\zigapp --name zigapp --mode copy --args ""
+tba setting text                             :: 打印开工文案里「编译 & 重载」那一段
+tba setting text --lang en                   :: 英文版
 tba setting off                              :: 停用：agent 文案里不再出现编译 & 重载
+```
+
+`setting text` 和窗口里的「查看文案」读的是**同一份生成函数**，不是另写的说明——
+所以看到的就是 agent 开工时真收到的那三行：
+
+```
+编译 & 重载（本项目）：`tba reload build`
+  编译: cargo build --release · 目录: D:\dev\mcp · exe: tba · 启动: 直接跑产物
+  一条命令走完 编译 → 杀旧 → 启动，成功回 `OK <pid>`；失败看 `tba reload status`。
 ```
 
 `setting` 任务的备注长这样（`tba setting set` 和窗口都写它，手改也认）：
@@ -676,7 +687,10 @@ tba reload build --compile "make"            :: 临时覆盖编译指令（不�
 
 窗口里在项目卡片的 **编译 & 重载** 栏（默认收起）：勾选启用、编译指令、项目目录、
 exe 基名、启动模式、运行副本、启动参数，按钮是「保存到 Teambition」「从云端重读」
-和「编译 & 重载 / 只重启 / 杀掉 / 状态」，结果和 `target/reload.log` 末尾就在下面。
+「查看文案」和「编译 & 重载 / 只重启 / 杀掉 / 状态」，结果和 `target/reload.log` 末尾就在下面。
+
+「查看文案」按**当前表单内容**生成，所以改完还没保存也能先看效果；保存到 Teambition 后
+agent 才会真收到。
 
 约定：
 
@@ -737,8 +751,17 @@ tba toolchain clear               :: 清掉手选，回到自动探测
 - VS Installer → 修改 → 单个组件 → 勾「Windows 11 SDK」
 - 或者单独装：https://developer.microsoft.com/windows/downloads/windows-sdk/
 
-窗口里在 **设置 → 构建工具链**：状态 + 来源 + 三个「选择…目录」按钮 + 自动探测 / 清除；
-探不到 SDK 时下面多一行「下载 Windows SDK」链接，点了用默认浏览器打开。
+窗口里在 **设置 → 构建工具链**：状态 + 来源 + 三个「选择…目录」按钮 + 自动探测 / 清除。
+缺 MSVC 或 SDK 时，下面会多一行「手动安装」，**只给真正缺的那一项**：
+
+| 缺什么 | 按钮 | 打开的页面 |
+|---|---|---|
+| `link.exe`（MSVC） | 下载 VS 生成工具（含 MSVC） | https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
+| `kernel32.lib`（SDK） | 下载 Windows SDK | https://developer.microsoft.com/windows/downloads/windows-sdk/ |
+
+点按钮用系统默认浏览器打开，不用自己搜。装 VS 生成工具时勾「使用 C++ 的桌面开发」，
+它自带 MSVC 和 Windows SDK；装完回来点「自动探测」就填好了。浏览器没弹出来，
+把鼠标停在按钮上能看到完整地址，手动打开也行。
 
 ## 共享记忆
 

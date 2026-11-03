@@ -162,6 +162,8 @@ pub struct App {
     // 构建工具链状态。None = 还没算过（resolve 会跑 vswhere，不能每帧算）。
     // 改完路径就置 None，下一帧重算。
     tc: Option<crate::toolchain::Resolved>,
+    // 只读文本查看窗（标题, 正文）。给「查看文案」这类「只想看一眼」的内容用。
+    text_view: Option<(String, String)>,
 }
 
 // skill 编辑窗的编辑态。正文是整段 markdown，直接存 String。
@@ -222,6 +224,10 @@ impl CapEdit {
 
 /// Windows SDK 官方下载页：本机没装 SDK 时给个能点的地方，别让人自己搜。
 const SDK_URL: &str = "https://developer.microsoft.com/windows/downloads/windows-sdk/";
+
+/// VS 生成工具（Build Tools）：只装编译器 + Windows SDK，不带 IDE。
+/// 比装完整 VS 轻，装的时候勾「使用 C++ 的桌面开发」就有 link.exe。
+const VS_BUILD_TOOLS_URL: &str = "https://visualstudio.microsoft.com/visual-cpp-build-tools/";
 
 /// 用系统默认浏览器打开链接（不弹控制台）。
 fn open_url(url: &str) {
@@ -457,6 +463,19 @@ impl App {
             .ok()
             .and_then(|n| caps::get(&store, &n))
             .map(|c| CapEdit::from(&c));
+        // 同一个钩子家族：TBA_UI_TEXT=<项目 id> 直接打开「编译 & 重载」的文案查看窗。
+        let text_view0 = std::env::var("TBA_UI_TEXT").ok().map(|pid| {
+            let st = crate::setting::ProjectSetting::load_cached(&store, &pid)
+                .unwrap_or_default();
+            let exe = crate::ops::prompt_exe(&store);
+            let block = st.prompt_block(&exe, true);
+            let text = if block.trim().is_empty() {
+                "「编译 & 重载」已停用：这段不会出现在开工文案里。".to_string()
+            } else {
+                block.trim_end().to_string()
+            };
+            ("编译 & 重载 · 开工文案".to_string(), text)
+        });
         let mut app = App {
             store,
             tx,
@@ -509,6 +528,7 @@ impl App {
             debug_open: std::env::var("TBA_UI_OPEN").as_deref() == Ok("1"),
             // 懒加载：设置页第一次打开时才算（要跑 vswhere，启动时不抢时间）。
             tc: None,
+            text_view: text_view0,
         };
         if !needs_token {
             app.reload_projects();
@@ -1371,10 +1391,71 @@ impl eframe::App for App {
         self.draw_skill_editor(ctx);
         self.draw_cap_editor(ctx);
         self.draw_cap_delete(ctx);
+        self.draw_text_view(ctx);
     }
 }
 
 impl App {
+    /// 只读文本查看窗（独立系统窗口）。目前给「编译 & 重载 → 查看文案」用。
+    fn draw_text_view(&mut self, ctx: &egui::Context) {
+        let Some((title, text)) = self.text_view.clone() else {
+            return;
+        };
+        let mut close = false;
+        let mut copy = false;
+        let (close2, copy2) = show_editor_window(
+            ctx,
+            "tba-text-view",
+            title,
+            [820.0, 620.0],
+            [520.0, 360.0],
+            |ui| {
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+                // 按钮放在上面：ScrollArea 用 auto_shrink=false 会吃满剩余高度，
+                // 放它下面就会被挤出窗口（实测截图里根本看不见）。
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "这就是开工文案里 agent 实际收到的那一段，不是另写的说明。",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.button("关闭").clicked() {
+                                close = true;
+                            }
+                            if ui.button("复制").clicked() {
+                                copy = true;
+                            }
+                        },
+                    );
+                });
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&text).monospace().size(13.0),
+                            )
+                            .wrap(),
+                        );
+                    });
+                (close, copy)
+            },
+        );
+        if copy2 {
+            ctx.copy_text(text.clone());
+        }
+        if close || close2 {
+            self.text_view = None;
+        }
+    }
     // 通用能力页：本地、跨项目的文本能力库。
     //
     // 和「项目列表」里的 skill 是两套东西：项目 skill 存 Teambition 云端、按项目隔离，
@@ -2035,6 +2116,24 @@ impl App {
                     {
                         refetch = true;
                     }
+                    // 文案就是开工时给 agent 的那一段（和 `tba setting text` 同源）。
+                    // 按当前表单算：改完没保存也能先看效果，保存后 agent 才真收到。
+                    if ui
+                        .button("查看文案")
+                        .on_hover_text(
+                            "看开工文案里「编译 & 重载」那一段（按当前表单内容生成；                             保存到 Teambition 后 agent 才会收到）",
+                        )
+                        .clicked()
+                    {
+                        let exe = crate::ops::prompt_exe(&self.store);
+                        let block = ed.prompt_block(&exe, true);
+                        let text = if block.trim().is_empty() {
+                            "「编译 & 重载」已停用：这段不会出现在开工文案里。".to_string()
+                        } else {
+                            block.trim_end().to_string()
+                        };
+                        self.text_view = Some(("编译 & 重载 · 开工文案".to_string(), text));
+                    }
                     if self.setting_busy.as_deref() == Some(pid) {
                         ui.spinner();
                     }
@@ -2279,22 +2378,39 @@ impl App {
                         )
                         .small(),
                     );
-                    if r.tc.sdk_lib.trim().is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(
-                                    "本机标准位置没找到 Windows SDK——没装的话编译不了。",
-                                )
-                                .small(),
-                            );
-                            if ui
-                                .link("下载 Windows SDK")
-                                .on_hover_text(SDK_URL)
-                                .clicked()
+                    // 没装就用手动安装：直接开浏览器，别让人自己去搜下载页。
+                    // 只给真正缺的那一项，免得两行按钮看着像「都得装」。
+                    let need_msvc = r.tc.msvc_bin.trim().is_empty()
+                        || !std::path::Path::new(r.tc.msvc_bin.trim()).join("link.exe").is_file();
+                    let need_sdk = r.tc.sdk_lib.trim().is_empty();
+                    if need_msvc || need_sdk {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("手动安装：");
+                            if need_msvc
+                                && ui
+                                    .button("下载 VS 生成工具（含 MSVC）")
+                                    .on_hover_text(VS_BUILD_TOOLS_URL)
+                                    .clicked()
+                            {
+                                open_url(VS_BUILD_TOOLS_URL);
+                            }
+                            if need_sdk
+                                && ui
+                                    .button("下载 Windows SDK")
+                                    .on_hover_text(SDK_URL)
+                                    .clicked()
                             {
                                 open_url(SDK_URL);
                             }
                         });
+                        ui.label(
+                            egui::RichText::new(
+                                "装 VS 生成工具时勾「使用 C++ 的桌面开发」，它自带 MSVC 和 Windows SDK；\
+                                 装完回来点「自动探测」就能填好。浏览器没弹出来，就手动打开上面悬停显示的地址。",
+                            )
+                            .small()
+                            .weak(),
+                        );
                     }
                 }
                 None => {}

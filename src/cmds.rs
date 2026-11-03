@@ -1743,6 +1743,7 @@ pub fn run() -> Result<(), String> {
             args,
             on,
             off,
+            lang,
         } => {
             let pid = project
                 .or_else(crate::ops::read_project_binding)
@@ -1776,6 +1777,23 @@ pub fn run() -> Result<(), String> {
                             println!("存一份:   tba setting set");
                         }
                     }
+                }
+                "text" | "prompt" => {
+                    // 和开工文案同源：agent 收到什么，这里就打印什么。
+                    let s = crate::setting::ProjectSetting::load_cached(&store, &pid)
+                        .unwrap_or_else(|| crate::setting::ProjectSetting {
+                            root: std::env::current_dir()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_default(),
+                            ..Default::default()
+                        });
+                    if !s.on {
+                        println!("「编译 & 重载」在这个项目里是关的，开工文案里不会出现这一段。");
+                        return Ok(());
+                    }
+                    let zh = lang.as_deref() != Some("en");
+                    let exe = crate::ops::prompt_exe(&store);
+                    print!("{}", s.prompt_block(&exe, zh));
                 }
                 "guess" => {
                     let cached = crate::setting::ProjectSetting::load_cached(&store, &pid);

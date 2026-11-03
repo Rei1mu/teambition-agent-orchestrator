@@ -3499,13 +3499,9 @@ fn prompt_body(
     let cfg = store.load_config();
     // 文案里路径要出现十几次，所以允许配一个短路径（如目录联接 D:\tb\tba.exe）。
     // 没配就用真实 exe 路径，行为跟以前一致。
-    let exe = if cfg.tool_path.trim().is_empty() {
-        std::env::current_exe()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "tba".to_string())
-    } else {
-        cfg.tool_path.trim().to_string()
-    };
+    // 逻辑收在 prompt_exe_of 里：「查看文案」和 `tba setting text` 用同一份，
+    // 否则预览出来的命令和 agent 真收到的对不上。
+    let exe = prompt_exe_of(&cfg);
     let mem = store.memory_dir(project_id);
     // 共享记忆开关：开着就把「本地目录」换成「读云端记忆」的命令。
     // 开着还显示本地目录会误导 agent 去读一份已经不用的旧文件。
@@ -3618,28 +3614,9 @@ fn prompt_body(
     // 编译 & 重载：参数存 Teambition 的 setting 任务，每个项目一份。
     // 编译指令空着就明说「去探测再写回来」——否则 agent 会拿默认 cargo 硬编，
     // 遇到 zig / go 项目就白跑一轮。
+    // 文案本体在 setting::prompt_block，GUI 的「查看文案」和 `tba setting text` 读同一份。
     if let Some(st) = crate::setting::ProjectSetting::load_cached(store, project_id) {
-        if st.on {
-            if st.compile.trim().is_empty() {
-                s.push_str(&format!(
-                    "{}: {} `{exe} setting guess` → `{exe} setting set --compile \"...\"`（{}）\n\n",
-                    if zh { "编译 & 重载" } else { "Build & reload" },
-                    if zh { "编译指令未填，先探测项目类型：" } else { "compile not set, detect first:" },
-                    if zh {
-                        "存到 Teambition 的 setting 任务，再 `reload build`"
-                    } else {
-                        "saved to the setting task, then `reload build`"
-                    }
-                ));
-            } else {
-                s.push_str(&format!(
-                    "{}: `{exe} reload build`（{}: {}）\n\n",
-                    if zh { "编译 & 重载" } else { "Build & reload" },
-                    if zh { "编译指令" } else { "compile" },
-                    st.compile
-                ));
-            }
-        }
+        s.push_str(&st.prompt_block(&exe, zh));
     }
     s.push_str(&workflow_text(
         &exe, project_id, &cfg, draft, claimed, lang, memory_on,
@@ -3821,10 +3798,25 @@ fn entry_cmd(store: &Store) -> String {
 // 真实可执行路径。config 里的 tool_path 往往只是 `tba`，而 agent 的 shell
 // 不一定继承了 PATH——没有路径它就会全盘搜 exe，实测白烧一分多钟。
 // 所以凡是给 agent 看的文案，都写死绝对路径，不指望 PATH。
-fn exe_path_or(cmd: &str) -> String {
+pub(crate) fn exe_path_or(cmd: &str) -> String {
     std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| cmd.to_string())
+}
+
+/// 开工文案里 exe 的写法：配了 `tool_path` 就用它，否则用真实绝对路径。
+///
+/// 「查看文案」这类预览必须走这里——另算一份就会和 agent 实际收到的对不上。
+pub(crate) fn prompt_exe(store: &Store) -> String {
+    prompt_exe_of(&store.load_config())
+}
+
+fn prompt_exe_of(cfg: &crate::config::Config) -> String {
+    if cfg.tool_path.trim().is_empty() {
+        exe_path_or("tba")
+    } else {
+        cfg.tool_path.trim().to_string()
+    }
 }
 
 // 在当前目录补一个 AGENTS.md 入口。两个块各自检测标记，缺哪个补哪个——

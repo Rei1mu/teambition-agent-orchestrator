@@ -501,7 +501,7 @@ pub enum Cmd {
     },
     /// 项目设置：编译指令 / 项目目录 / exe 名 / 启动参数（存 Teambition 的 setting 任务）
     Setting {
-        /// show | set | guess
+        /// show | set | guess | text
         #[arg(default_value = "show")]
         action: String,
         /// 项目 id。缺省读当前目录的 .tba/project 绑定
@@ -531,6 +531,9 @@ pub enum Cmd {
         /// 停用「编译 & 重载」：agent 文案里不再出现
         #[arg(long)]
         off: bool,
+        /// text 用：zh（默认）| en
+        #[arg(long)]
+        lang: Option<String>,
     },
 }
 
