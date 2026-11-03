@@ -1012,7 +1012,7 @@ impl eframe::App for App {
             .exact_width(nav_width)
             .show(ctx, |ui| {
                 ui.add_space(10.0);
-                ui.heading("TBHub");
+                ui.heading("tba");
                 ui.add_space(10.0);
 
                 ui.label(egui::RichText::new("项目").small().weak());
@@ -1059,7 +1059,7 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("TBHub · 项目与能力");
+                ui.heading("tba · 项目与能力");
                 if !self.needs_token {
                     if ui.button("刷新").clicked() {
                         self.reload_projects();
@@ -2271,7 +2271,7 @@ impl App {
             ui.add_space(48.0);
             ui.heading("还没有 Teambition 访问令牌");
             ui.add_space(10.0);
-            ui.label("TBHub 通过 Teambition MCP 读写项目、任务和 skill。");
+            ui.label("tba 通过 Teambition MCP 读写项目、任务和 skill。");
             ui.label("需要先在 Teambition 上创建 User Token，再粘贴到下面。");
             ui.add_space(24.0);
 
@@ -2721,7 +2721,7 @@ impl App {
                     let r = crate::mail::send(
                         &cfg,
                         "[TB] 测试邮件",
-                        "这是一封 TBHub 测试邮件，收到即表示 SMTP 配置可用。",
+                        "这是一封 tba 测试邮件，收到即表示 SMTP 配置可用。",
                     );
                     let _ = tx.send(Ev::MailSent(r));
                 });
@@ -2820,17 +2820,31 @@ impl App {
 
 // 双击 exe 时 Windows 会先给一个控制台黑窗，再弹 GUI，很难看。
 // exe 是 console 子系统（CLI 要 stdout），没法靠 windows_subsystem 属性关掉——
-// 那会把所有子命令的输出也吞了。只能在进 GUI 之前主动 FreeConsole。
+// 那会把所有子命令的输出也吞了。只能在进 GUI 之前主动把窗口藏掉 + FreeConsole。
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn FreeConsole() -> i32;
+    fn GetConsoleWindow() -> isize;
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
 }
 
 #[cfg(windows)]
 pub fn hide_console() {
-    // 没有控制台时返回 0，无害。
+    // 顺序有讲究：先 ShowWindow(SW_HIDE) 再 FreeConsole。
+    // FreeConsole 只是把本进程从控制台摘下来，窗口要等「最后一个附着的进程」退出才销毁；
+    // 先藏一下能保证眼睛立刻看不到，不依赖 FreeConsole 的时序。
+    const SW_HIDE: i32 = 0;
     unsafe {
+        let h = GetConsoleWindow();
+        if h != 0 {
+            ShowWindow(h, SW_HIDE);
+        }
         FreeConsole();
     }
 }
@@ -2853,11 +2867,11 @@ pub fn run(store: &Store) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(size)
-            .with_title("TBHub - 项目与能力"),
+            .with_title("tba · 项目与能力"),
         ..Default::default()
     };
     eframe::run_native(
-        "TBHub",
+        "tba",
         options,
         Box::new(move |cc| {
             // 先读偏好再装字体：用户选过黑体就别硬上雅黑。

@@ -87,6 +87,14 @@ Name: "desktopicon"; Description: "{cm:TaskDesktop}"; GroupDescription: "{cm:Tas
 [Files]
 Source: "{#SrcExe}"; DestDir: "{app}"; Flags: ignoreversion
 
+; 之前只有 [Tasks] 没有 [Icons]：勾了「创建桌面快捷方式」也什么都不会生成。
+; 目标就是 tba.exe——不带参数启动 = 开窗口（见 src/main.rs 的 gui_intent）。
+; WorkingDir 设成用户主目录：别让快捷方式的工作目录落在安装目录里。
+[Icons]
+Name: "{group}\TBA"; Filename: "{app}\tba.exe"; WorkingDir: "{%USERPROFILE}"; Tasks: startmenuicon
+Name: "{group}\{cm:IconUninstall}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\TBA"; Filename: "{app}\tba.exe"; WorkingDir: "{%USERPROFILE}"; Tasks: desktopicon
+
 ; PATH 不再用 [Registry] 的 `{olddata};{app}`：那种写法只能靠 Check 函数判断
 ; 「加过了没有」，实测重复安装会写两遍（Check 参数里的 {app} 不展开，永远判成没加过）。
 ; 改成下面 Code 段里的 AddToPath：读出来、按 ';' 拆开、去掉重复项、再整体写回。

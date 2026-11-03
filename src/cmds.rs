@@ -1209,7 +1209,7 @@ pub fn run() -> Result<(), String> {
                     );
                 }
                 "test" => {
-                    mail::send(&cfg, "[TB] 测试邮件", "这是一封 TBHub 测试邮件。收到即表示 SMTP 配置可用。")?;
+                    mail::send(&cfg, "[TB] 测试邮件", "这是一封 tba 测试邮件。收到即表示 SMTP 配置可用。")?;
                     println!("已发送测试邮件到 {}", cfg.mail_to);
                 }
                 "check" => {
