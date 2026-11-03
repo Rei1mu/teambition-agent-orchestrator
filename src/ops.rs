@@ -3571,16 +3571,49 @@ fn prompt_body(
         ));
     }
     // 通用能力：本地、跨项目，和项目 skill 是两套东西（skill 存在云端、按项目隔离）。
-    // 压成一行：只列名字，正文不内联——agent 用到哪个才 `cap <名字>` 读哪个。
+    //
+    // 一行一条「名字 + 何时用」：只列名字时 agent 猜不出用途（gui-notes 是干什么的？），
+    // 等于没写这条能力；但正文也不能内联——5 条正文合计 2650 字符，全贴进去每次开工
+    // 要多付 3 倍 token，而这一次多半一条都用不上。所以是索引 + 按需读。
+    //
+    // always 的条目（禁止弹命令行）是「动手前就得知道、等踩了坑再去读已经晚了」的红线，
+    // 标【常驻】让它先被看见。
     // 项目级开关：这个项目取消勾选的能力不进文案（agent 搜不到就不会用）。
     let caps = crate::caps::enabled_for(store, project_id);
     if !caps.is_empty() {
-        let names: Vec<&str> = caps.iter().map(|c| c.name.as_str()).collect();
-        s.push_str(&format!(
-            "{}{}（`{exe} cap <name>`）\n\n",
-            if zh { "通用能力: " } else { "Capabilities: " },
-            names.join(", ")
-        ));
+        let w = caps
+            .iter()
+            .map(|c| c.name.chars().count())
+            .max()
+            .unwrap_or(4);
+        // 括号按语言分开写：英文里塞全角括号会很扎眼。
+        if zh {
+            s.push_str(&format!("通用能力，用到才读正文（`{exe} cap <名字>`）\n"));
+        } else {
+            s.push_str(&format!(
+                "Capabilities, read body on demand (`{exe} cap <name>`)\n"
+            ));
+        }
+        for c in &caps {
+            let pad = " ".repeat(w.saturating_sub(c.name.chars().count()));
+            let mark = if c.always {
+                if zh {
+                    "【常驻】"
+                } else {
+                    "[ALWAYS] "
+                }
+            } else {
+                ""
+            };
+            // 英文文案优先用英文说明；用户自建的能力没填就回落到中文那条。
+            let why = if zh || c.summary_en.trim().is_empty() {
+                c.summary.as_str()
+            } else {
+                c.summary_en.as_str()
+            };
+            s.push_str(&format!("- {}{}  {}{}\n", c.name, pad, mark, why));
+        }
+        s.push('\n');
     }
     // 编译 & 重载：参数存 Teambition 的 setting 任务，每个项目一份。
     // 编译指令空着就明说「去探测再写回来」——否则 agent 会拿默认 cargo 硬编，
@@ -4430,8 +4463,11 @@ mod tests {
         // 字符数英文反而更多，但 token 更少——中文字在 BPE 里几乎 1 字 1 token。
         // 预算按实测留一点余量：涨过就说明文案又变长了，要主动确认（用户明确要求「短」）。
         // v0.2.4 加了一行通用能力名单（约 116 字符，含 exe 路径），预算跟着抬一点；
+        // v0.2.6 能力从「只列名字」改成「一行一条：名字 + 何时用」（中文约 +156、
+        // 英文约 +310，英文说明比中文长），——
+        // 只列名字 agent 猜不出用途，等于没写；正文仍然按需读，没有内联。
         // 再涨就说明文案又变长了，要主动确认。
-        for (tag, p, budget) in [("中文", &zh, 2200usize), ("英文", &en, 3000usize)] {
+        for (tag, p, budget) in [("中文", &zh, 2600usize), ("英文", &en, 3400usize)] {
             assert!(
                 p.chars().count() < budget,
                 "{tag}版文案体积失控: {} 字符（预算 {budget}）",
@@ -4444,6 +4480,28 @@ mod tests {
             est_tokens(&en),
             est_tokens(&zh)
         );
+    }
+
+    // 能力索引：一行一条「名字 + 何时用」。
+    // 只列名字时 agent 猜不出 gui-notes 是干什么的，等于这条能力不存在；
+    // 常驻条目（动手前就得知道的红线）要标出来，其余不许内联正文。
+    #[test]
+    fn caps_index_carries_why_and_always_mark() {
+        let store = tmp_store("capsindex");
+        let p = agent_prompt_from(&store, "p1", "项目一", &[], None, Lang::Zh);
+        assert!(p.contains("- shot"), "能力要一行一条: {p}");
+        assert!(
+            p.contains("看界面/验收 UI"),
+            "索引要带「什么时候用」，不能只给名字: {p}"
+        );
+        let always_line = p
+            .lines()
+            .find(|l| l.contains("no-console"))
+            .expect("no-console 应该在文案里");
+        assert!(always_line.contains("【常驻】"), "常驻条目要标出来: {always_line}");
+        let shot_line = p.lines().find(|l| l.contains("- shot")).unwrap();
+        assert!(!shot_line.contains("【常驻】"), "普通能力不该被标常驻: {shot_line}");
+        assert!(!p.contains("## 一条命令"), "正文仍按需读，不许内联");
     }
 
     // AGENTS.md 入口：两个块各自补，用户自己的内容一个字不动。

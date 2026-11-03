@@ -24,11 +24,19 @@ pub struct Cap {
     pub name: String,
     #[serde(default)]
     pub summary: String,
+    /// 英文说明：英文开工文案用。空着就回落到 summary（用户自建的能力多半只写中文）。
+    #[serde(default)]
+    pub summary_en: String,
     #[serde(default = "default_on")]
     pub on: bool,
     /// 内置条目：正文可改、可删，但删了能用 `tba cap restore` 找回来。
     #[serde(default)]
     pub builtin: bool,
+    /// 常驻：开工文案里直接标出来，并把它当红线先讲。
+    /// 只给「动手前就必须知道、等踩了坑再去读已经晚了」的约束型能力
+    /// （典型是「禁止弹命令行」）。其余能力都是索引 + 按需读正文。
+    #[serde(default)]
+    pub always: bool,
     #[serde(default)]
     pub body: String,
 }
@@ -62,8 +70,10 @@ impl Default for CapsFile {
     }
 }
 
-/// 当前内置清单版本。加/删内置条目时 +1。
-const SEED: u32 = 2;
+/// 当前内置清单版本。加/删内置条目、或改内置条目的索引说明时 +1。
+///
+/// v3：索引说明改成「何时用」句式，并给 no-console 标上常驻。
+const SEED: u32 = 3;
 
 // ---- 内置正文 ----
 //
@@ -186,25 +196,47 @@ pub const BODY_NO_CONSOLE: &str = "\
 - 不要用 `cmd /c start \"\" ...` 打开程序，会闪一个黑框。
 ";
 
-// (名字, 说明, 正文)
-pub const BUILTIN: &[(&str, &str, &str)] = &[
+// (名字, 索引说明, 常驻, 正文)
+//
+// 索引说明写「**什么时候用**」而不是「是什么」：开工文案只列这一行，
+// agent 靠它判断要不要去读正文。写「截图：一条命令出 png」它看不出该在
+// 什么场合用；写「看界面/验收 UI」才是一个触发条件。
+pub const BUILTIN: &[(&str, &str, &str, bool, &str)] = &[
     // 重载不在这里：它跟具体项目绑定（编译指令、exe 名每个项目都不同），
     // 已经搬到「项目列表 → 编译 & 重载」，参数存 Teambition 的 setting 任务。
     (
         "no-console",
-        "禁止弹命令行：所有命令都隐藏窗口调用",
+        "绝不弹黑框：所有命令都隐藏窗口调用",
+        "never pop a console: hide every child window",
+        true,
         BODY_NO_CONSOLE,
     ),
-    ("shot", "截图：一条命令出 png，后台窗口也能截", BODY_SHOT),
-    ("git-main", "提交并推送（GitButler 项目自动走 but）", BODY_GIT),
+    (
+        "shot",
+        "看界面/验收 UI：一条命令出 png，后台窗口也能截",
+        "to see the UI: one command -> png, background windows OK",
+        false,
+        BODY_SHOT,
+    ),
+    (
+        "git-main",
+        "要提交推送：GitButler 项目自动走 but",
+        "commit & push: `but` automatically for GitButler projects",
+        false,
+        BODY_GIT,
+    ),
     (
         "release",
-        "发版：生成 workflow / 打 tag / 等 CI / 列产物",
+        "要发版：生成 workflow / 打 tag / 等 CI",
+        "cut a release: workflow / tag / wait CI",
+        false,
         BODY_RELEASE,
     ),
     (
         "gui-notes",
-        "写 GUI 的注意事项：黑体、字体可选、别出豆腐块",
+        "改 GUI 前先读：字体、黑体、别出豆腐块",
+        "before touching GUI: fonts, bold, no tofu boxes",
+        false,
         BODY_GUI,
     ),
 ];
@@ -216,11 +248,13 @@ pub fn path(store: &Store) -> PathBuf {
 fn builtin_caps() -> Vec<Cap> {
     BUILTIN
         .iter()
-        .map(|(name, summary, body)| Cap {
+        .map(|(name, summary, summary_en, always, body)| Cap {
             name: (*name).to_string(),
             summary: (*summary).to_string(),
+            summary_en: (*summary_en).to_string(),
             on: true,
             builtin: true,
+            always: *always,
             body: (*body).to_string(),
         })
         .collect()
@@ -242,17 +276,31 @@ pub fn load(store: &Store) -> CapsFile {
             if f.caps.len() != before {
                 dirty = true;
             }
-            // 内置清单升级：只补「新版才有、列表里没有」的条目。
+            // 内置清单升级：补缺失的条目，并把**索引层**（说明 + 常驻标记）
+            // 拉齐到当前版本。
+            //
+            // 为什么索引层可以覆盖：它是「目录」，决定 agent 会不会去读正文，
+            // 跟着版本走才对。用户真正会改的是正文和开关，这两样一律不动。
+            // 自定义条目（builtin=false）完全不经手。
             if f.seeded < SEED {
-                for (name, summary, body) in BUILTIN {
-                    if !f.caps.iter().any(|c| c.name == *name) {
-                        f.caps.push(Cap {
+                for (name, summary, summary_en, always, body) in BUILTIN {
+                    match f.caps.iter_mut().find(|c| c.name == *name) {
+                        Some(c) => {
+                            if c.builtin {
+                                c.summary = (*summary).to_string();
+                                c.summary_en = (*summary_en).to_string();
+                                c.always = *always;
+                            }
+                        }
+                        None => f.caps.push(Cap {
                             name: (*name).to_string(),
                             summary: (*summary).to_string(),
+                            summary_en: (*summary_en).to_string(),
                             on: true,
                             builtin: true,
+                            always: *always,
                             body: (*body).to_string(),
-                        });
+                        }),
                     }
                 }
                 f.seeded = SEED;
@@ -382,7 +430,7 @@ pub fn remove(store: &Store, name: &str) -> Result<String, String> {
         return Err(format!("没有这个能力: {name}"));
     }
     save(store, &f)?;
-    let recover = BUILTIN.iter().any(|(n, _, _)| *n == name);
+    let recover = BUILTIN.iter().any(|(n, ..)| *n == name);
     Ok(if recover {
         format!("已删除能力: {name}（内置条目，`tba cap restore {name}` 可恢复）")
     } else {
@@ -394,7 +442,7 @@ pub fn remove(store: &Store, name: &str) -> Result<String, String> {
 pub fn restore(store: &Store, name: Option<&str>) -> Result<String, String> {
     let mut f = load(store);
     let mut done = Vec::new();
-    for (n, summary, body) in BUILTIN {
+    for (n, summary, summary_en, always, body) in BUILTIN {
         if let Some(want) = name {
             if want != *n {
                 continue;
@@ -402,11 +450,11 @@ pub fn restore(store: &Store, name: Option<&str>) -> Result<String, String> {
         }
         match f.caps.iter_mut().find(|c| c.name == *n) {
             Some(c) => {
-                // 已存在：只把正文拉回默认，开关和说明留着用户改过的样子。
+                // 已存在：正文、说明、常驻标记一起拉回默认；开关留着用户改过的样子。
                 c.body = (*body).to_string();
-                if c.summary.is_empty() {
-                    c.summary = (*summary).to_string();
-                }
+                c.summary = (*summary).to_string();
+                c.summary_en = (*summary_en).to_string();
+                c.always = *always;
                 c.builtin = true;
                 done.push(format!("已重置 {n}"));
             }
@@ -414,8 +462,10 @@ pub fn restore(store: &Store, name: Option<&str>) -> Result<String, String> {
                 f.caps.push(Cap {
                     name: (*n).to_string(),
                     summary: (*summary).to_string(),
+                    summary_en: (*summary_en).to_string(),
                     on: true,
                     builtin: true,
+                    always: *always,
                     body: (*body).to_string(),
                 });
                 done.push(format!("已恢复 {n}"));
@@ -428,7 +478,7 @@ pub fn restore(store: &Store, name: Option<&str>) -> Result<String, String> {
             name.unwrap_or(""),
             BUILTIN
                 .iter()
-                .map(|(n, _, _)| *n)
+                .map(|(n, ..)| *n)
                 .collect::<Vec<_>>()
                 .join(" / ")
         ));
@@ -479,6 +529,57 @@ mod tests {
         assert!(list(&store).is_empty());
     }
 
+    // 老 caps.toml 没有 always 字段：读进来默认 false，不能因为缺字段就整条丢掉。
+    #[test]
+    fn missing_always_defaults_to_false() {
+        let store = tmp("legacy-always");
+        std::fs::write(
+            path(&store),
+            "seeded = 3\n\n[[caps]]\nname = \"old\"\nsummary = \"老条目\"\non = true\n\
+             builtin = false\nbody = \"x\"\n",
+        )
+        .unwrap();
+        let c = get(&store, "old").expect("缺 always 字段也要能读出来");
+        assert!(!c.always);
+    }
+
+    // 索引层（说明 + 常驻标记）跟版本走；正文和开关是用户的，升级不许碰。
+    #[test]
+    fn seed_upgrade_refreshes_index_only() {
+        let store = tmp("seed-upgrade");
+        let mut f = load(&store);
+        f.seeded = 1;
+        for c in f.caps.iter_mut() {
+            if c.name == "shot" {
+                c.summary = "我自己写的".into();
+                c.body = "我改过的正文".into();
+                c.on = false;
+            }
+            if c.name == "no-console" {
+                c.always = false;
+            }
+        }
+        save(&store, &f).unwrap();
+
+        let after = load(&store);
+        let shot = after.caps.iter().find(|c| c.name == "shot").unwrap();
+        assert_eq!(
+            shot.summary, "看界面/验收 UI：一条命令出 png，后台窗口也能截",
+            "说明属于索引层，跟着版本走"
+        );
+        assert_eq!(shot.body, "我改过的正文", "正文是用户的内容，升级不许覆盖");
+        assert!(!shot.on, "开关是用户的，升级不许覆盖");
+        assert!(
+            after
+                .caps
+                .iter()
+                .find(|c| c.name == "no-console")
+                .unwrap()
+                .always,
+            "常驻标记属于索引层，跟着版本走"
+        );
+    }
+
     // 增删改查一轮：改名不合法要拒，删了能恢复。
     #[test]
     fn crud_roundtrip() {
@@ -490,8 +591,10 @@ mod tests {
             Cap {
                 name: "my-cap".into(),
                 summary: "自用".into(),
+                summary_en: String::new(),
                 on: true,
                 builtin: false,
+                always: false,
                 body: "# 正文".into(),
             },
         )
@@ -524,8 +627,10 @@ mod tests {
             Cap {
                 name: "shot".into(),
                 summary: "改过的说明".into(),
+                summary_en: String::new(),
                 on: true,
                 builtin: false,
+                always: false,
                 body: "新正文".into(),
             },
         )

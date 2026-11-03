@@ -233,8 +233,9 @@ tba skill-init --project <id> --name shot       :: 只推一个
 窗口里能直接改。`tba skill-init` 仍然保留，只在「确实要把某条流程钉在云端这个项目」
 时才用（比如团队里别人也要看）。
 
-**省 token 的用法**：开工文案里只列 skill / 能力的名字（一行一个），agent 判断要用
-哪个才去 `tba skill <名字>` / `tba cap <名字>` 读全文。所以正文可以写长，但名字要短。
+**省 token 的用法**：开工文案里 skill 只列名字；能力列「名字 + 什么时候用」一行一条，
+agent 判断要用哪个才去 `tba skill <名字>` / `tba cap <名字>` 读全文。所以正文可以写长，
+但名字要短、能力的一句话说明要写「何时用」（比如「看界面/验收 UI」而不是「截图」）。
 
 ## 截图
 
@@ -535,22 +536,45 @@ tba hello                 :: 不介意共用就自动生成（s-3f2a1c）
 ```bat
 tba cap list                                   :: 目录：名字 + 一句话 + 开关
 tba cap shot                                   :: 读正文（等同 tba cap show shot）
-tba cap add deploy-web --summary "部署：打包并上传" --body DEPLOY.md
+tba cap add deploy-web --summary "要部署：打包并上传" --body DEPLOY.md
 tba cap add deploy-web --summary "..." --body -  :: 正文从 stdin 读（可管道/重定向）
 tba cap edit shot --body new.md                :: 改正文（不给 --body 保留原文）
 tba cap on shot  /  tba cap off shot           :: 开关（关掉不进 agent 文案）
+tba cap add deploy-web --summary "..." --summary-en "to deploy: build and upload"
+tba cap add deploy-web --always --summary "..." :: 常驻：开工文案里标【常驻】，先被看见
 tba cap rm shot                                :: 删除
 tba cap restore                                :: 补齐缺失的内置能力
 tba cap path                                   :: 打印 caps.toml 路径
 ```
 
+**开工文案里长什么样**（一行一条，标题说清「用到才读正文」）：
+
+```
+通用能力，用到才读正文（`tba cap <名字>`）
+- shot        看界面/验收 UI：一条命令出 png，后台窗口也能截
+- git-main    要提交推送：GitButler 项目自动走 but
+- release     要发版：生成 workflow / 打 tag / 等 CI
+- gui-notes   改 GUI 前先读：字体、黑体、别出豆腐块
+- no-console  【常驻】绝不弹黑框：所有命令都隐藏窗口调用
+```
+
+只列名字是不够的：`gui-notes` 光看名字 agent 猜不出干什么，等于这条能力不存在。
+但正文也不能全贴进去（5 条正文合计 2600 字符，全内联每次开工多付 3 倍 token），
+所以是「索引带触发条件 + 正文按需读」。
+
+**常驻（`always`）** 是给「动手前就得知道、等踩了坑再去读已经晚了」的约束型能力用的
+（典型是 `no-console`）：标【常驻】让 agent 先看见。其余能力别勾，勾了只是白花 token。
+
 窗口里在 **通用能力 → 能力（可编辑）**：列表带开关，每条能「编辑」「删除」，
 顶部「新增」「恢复内置」。改完立刻落盘，agent 下次 `tba cap <名字>` 读到的就是新正文。
 
-内置 5 条：`no-console`（禁止弹命令行）/ `shot`（截图）/ `git-main`（提交推送）/
+内置 5 条：`no-console`（禁止弹命令行，常驻）/ `shot`（截图）/ `git-main`（提交推送）/
 `release`（发版）/ `gui-notes`（写 GUI 的注意事项）。内置条目正文可改、删了能恢复
-（`tba cap restore`）。内置清单升级时（比如这次新增 `no-console`）会自动补进老用户的
-`caps.toml`，但**不会**把你删掉的条目重新灌回来。
+（`tba cap restore`）。内置清单升级时会自动补进老用户的 `caps.toml`，但**不会**把你删掉的
+条目重新灌回来。
+
+升级只刷新**索引层**（一句话说明 + 英文说明 + 常驻标记）——那是「目录」，跟着版本走才对；
+**正文和开关是你的，一律不动**。自定义条目（非内置）完全不经手。
 
 **每个项目还能单独关**：项目卡片里的「通用 skill」栏，取消勾选 = 这个项目不用，
 开工文案里不列、agent 也就搜不到。存在 `data/projects/<id>/caps-off.toml`，

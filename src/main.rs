@@ -427,15 +427,24 @@ pub enum Cmd {
         action: Option<String>,
         /// 能力名（show / add / edit / rm / on / off / restore 用）
         name: Option<String>,
-        /// 一句话说明（列表里显示，agent 看目录用）
+        /// 一句话说明（写「什么时候用」；开工文案里一行一条给 agent 看）
         #[arg(long)]
         summary: Option<String>,
+        /// 英文说明（英文开工文案用；空着回落到 --summary）
+        #[arg(long = "summary-en")]
+        summary_en: Option<String>,
         /// 正文：文件路径，或 `-` 读 stdin。add 不给留空，edit 不给保留原文
         #[arg(long)]
         body: Option<String>,
         /// 新建/修改时把这条能力关掉
         #[arg(long)]
         off: bool,
+        /// 常驻：开工文案里标【常驻】，给「动手前就得知道」的红线用（如禁止弹命令行）
+        #[arg(long)]
+        always: bool,
+        /// 取消常驻
+        #[arg(long = "no-always")]
+        no_always: bool,
     },
     /// 自检：令牌 / PATH / git / GitButler / 字体 / 轮询参数一次全列出来
     Doctor,

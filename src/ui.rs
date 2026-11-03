@@ -178,9 +178,11 @@ struct SkillEdit {
 struct CapEdit {
     name: String,
     summary: String,
+    summary_en: String,
     body: String,
     on: bool,
     builtin: bool,
+    always: bool,
     is_new: bool,
     err: String,
 }
@@ -190,9 +192,11 @@ impl CapEdit {
         CapEdit {
             name: String::new(),
             summary: String::new(),
+            summary_en: String::new(),
             body: String::new(),
             on: true,
             builtin: false,
+            always: false,
             is_new: true,
             err: String::new(),
         }
@@ -202,9 +206,11 @@ impl CapEdit {
         CapEdit {
             name: c.name.clone(),
             summary: c.summary.clone(),
+            summary_en: c.summary_en.clone(),
             body: c.body.clone(),
             on: c.on,
             builtin: c.builtin,
+            always: c.always,
             is_new: false,
             err: String::new(),
         }
@@ -1379,6 +1385,14 @@ impl App {
                 if c.builtin {
                     ui.label(egui::RichText::new("内置").small().weak());
                 }
+                if c.always {
+                    ui.label(
+                        egui::RichText::new("常驻")
+                            .small()
+                            .color(egui::Color32::from_rgb(200, 140, 40)),
+                    )
+                    .on_hover_text("开工文案里会标出来，给「动手前就得知道」的红线用");
+                }
                 ui.label(egui::RichText::new(&c.summary).weak());
                 // 按钮靠右、尺寸统一：先加的在右边，所以先加「删除」再加「编辑」。
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1438,12 +1452,25 @@ impl App {
                     );
                 }
                 ui.add_space(6.0);
-                ui.label("一句话说明（列表里给 agent 看，省得它读正文才知道是什么）:");
+                ui.label("一句话说明（写「什么时候用」，agent 靠这一行决定要不要读正文）:");
                 ui.add(
                     egui::TextEdit::singleline(&mut ed.summary)
                         .desired_width(f32::INFINITY)
-                        .hint_text("例如 部署：一条命令打包并上传"),
+                        .hint_text("例如 要部署：一条命令打包并上传"),
                 );
+                ui.add_space(6.0);
+                ui.label("英文说明（可选：英文开工文案用，空着就用上面那句）:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut ed.summary_en)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("e.g. to deploy: one command to build and upload"),
+                );
+                ui.add_space(6.0);
+                ui.checkbox(&mut ed.always, "常驻：开工文案里标出来，先被看见")
+                    .on_hover_text(
+                        "只给「动手前就得知道、等踩了坑再读已经晚了」的红线用（比如禁止弹命令行）。\
+                         其余能力都是索引 + 按需读正文；勾了会让每次开工的文案变长。",
+                    );
                 ui.add_space(6.0);
                 ui.label("正文（markdown：什么时候用、参数、红线。实现留在命令里）:");
                 egui::ScrollArea::vertical()
@@ -1507,8 +1534,10 @@ impl App {
         let cap = Cap {
             name,
             summary: ed.summary.trim().to_string(),
+            summary_en: ed.summary_en.trim().to_string(),
             on: ed.on,
             builtin: ed.builtin,
+            always: ed.always,
             body: ed.body.clone(),
         };
         match caps::upsert(&self.store, cap) {
@@ -2731,12 +2760,15 @@ mod tests {
         let app = tmp_app("capprompt");
         caps::set_on(&app.store, "shot", false).unwrap();
         let text = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None, Lang::Zh);
-        let line = text
-            .lines()
-            .find(|l| l.contains("通用能力"))
-            .expect("文案里应该有通用能力这一行");
-        assert!(!line.contains("shot"), "关掉的能力不该出现在名单里: {line}");
-        assert!(line.contains("git-main"), "开着的能力应该在名单里: {line}");
+        // 能力现在是「标题 + 一行一条」，所以按段落取，不按单行取。
+        let seg = text
+            .split("
+
+")
+            .find(|b| b.contains("通用能力"))
+            .expect("文案里应该有通用能力这一段");
+        assert!(!seg.contains("shot"), "关掉的能力不该出现在名单里: {seg}");
+        assert!(seg.contains("git-main"), "开着的能力应该在名单里: {seg}");
         assert!(
             !text.contains("## 一条命令"),
             "能力正文不该内联进文案，否则 token 白烧"
@@ -2770,19 +2802,23 @@ mod tests {
         let app = tmp_app("capprompt2");
         app.store.set_cap_off("p1", "shot", true).unwrap();
         let text = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None, Lang::Zh);
-        let line = text
-            .lines()
-            .find(|l| l.contains("通用能力"))
-            .expect("文案里应该有通用能力这一行");
-        assert!(!line.contains("shot"), "本项目关掉的能力不该出现: {line}");
-        assert!(line.contains("git-main"), "其他能力照旧: {line}");
+        let seg = text
+            .split("
+
+")
+            .find(|b| b.contains("通用能力"))
+            .expect("文案里应该有通用能力这一段");
+        assert!(!seg.contains("shot"), "本项目关掉的能力不该出现: {seg}");
+        assert!(seg.contains("git-main"), "其他能力照旧: {seg}");
 
         // 另一个项目不受影响（项目级，不是全局）
         let other = crate::ops::agent_prompt_from(&app.store, "p2", "proj2", &[], None, Lang::Zh);
-        let line2 = other
-            .lines()
-            .find(|l| l.contains("通用能力"))
-            .expect("文案里应该有通用能力这一行");
-        assert!(line2.contains("shot"), "别的项目应该还在: {line2}");
+        let seg2 = other
+            .split("
+
+")
+            .find(|b| b.contains("通用能力"))
+            .expect("文案里应该有通用能力这一段");
+        assert!(seg2.contains("shot"), "别的项目应该还在: {seg2}");
     }
 }

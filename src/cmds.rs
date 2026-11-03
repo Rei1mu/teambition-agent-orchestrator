@@ -257,8 +257,10 @@ fn cap_cmd(
     action: &str,
     name: Option<&str>,
     summary: Option<&str>,
+    summary_en: Option<&str>,
     body: Option<&str>,
     off: bool,
+    always: Option<bool>,
 ) -> Result<String, String> {
     use crate::caps::{self, Cap};
 
@@ -298,16 +300,18 @@ fn cap_cmd(
             let mut out = format!("通用能力 {} 条（启用 {}）\n", all.len(), on);
             for c in &all {
                 out.push_str(&format!(
-                    "  [{}] {:w$}  {}{}\n",
+                    "  [{}] {:w$}  {}{}{}\n",
                     if c.on { "开" } else { "关" },
                     c.name,
+                    if c.always { "【常驻】" } else { "" },
                     c.summary,
                     if c.builtin { "" } else { "（自定义）" },
                     w = w
                 ));
             }
-            out.push_str("\n读正文: tba cap <名字>\n");
-            out.push_str(&format!("文件: {}", caps::path(store).display()));
+            out.push_str("\n读正文: tba cap <名字>");
+            out.push_str("\n常驻 = 开工文案里会标出来（给动手前就得知道的红线用）");
+            out.push_str(&format!("\n文件: {}", caps::path(store).display()));
             Ok(out)
         }
         "path" => Ok(caps::path(store).display().to_string()),
@@ -323,8 +327,16 @@ fn cap_cmd(
                     .map(|s| s.to_string())
                     .or_else(|| old.as_ref().map(|c| c.summary.clone()))
                     .unwrap_or_default(),
+                summary_en: summary_en
+                    .map(|s| s.to_string())
+                    .or_else(|| old.as_ref().map(|c| c.summary_en.clone()))
+                    .unwrap_or_default(),
                 on: !off,
                 builtin: old.as_ref().map(|c| c.builtin).unwrap_or(false),
+                // 不给 --always/--no-always 就保留原值（新建默认 false）。
+                always: always
+                    .or_else(|| old.as_ref().map(|c| c.always))
+                    .unwrap_or(false),
                 body: new_body
                     .or_else(|| old.as_ref().map(|c| c.body.clone()))
                     .unwrap_or_default(),
@@ -693,8 +705,11 @@ pub fn run() -> Result<(), String> {
             action,
             name,
             summary,
+            summary_en,
             body,
             off,
+            always,
+            no_always,
         } => {
             println!(
                 "{}",
@@ -703,8 +718,16 @@ pub fn run() -> Result<(), String> {
                     action.as_deref().unwrap_or("list"),
                     name.as_deref(),
                     summary.as_deref(),
+                    summary_en.as_deref(),
                     body.as_deref(),
-                    off
+                    off,
+                    if always {
+                        Some(true)
+                    } else if no_always {
+                        Some(false)
+                    } else {
+                        None
+                    }
                 )?
             );
         }

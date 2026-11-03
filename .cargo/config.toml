@@ -7,3 +7,9 @@ rustflags = ["-C", "link-arg=/STACK:8388608"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+# GNU 工具链不认 /STACK 语法，同样的 8MB 要用 ld 的参数写法。
+# 本机没装 Windows SDK 时 msvc 链不了，只能靠 gnu 跑测试和本地验证，
+# 所以这条也得有，否则 `tba --version` 在 gnu debug 下一样会爆栈。
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
