@@ -39,16 +39,22 @@ pub struct Outcome {
     pub err: String,
 }
 
-fn build_cmd(
-    action: &str,
-    root: &str,
-    name: &str,
-    live: &str,
-    launch_args: &str,
-    mode: &str,
-    elevate: bool,
-    release_src: bool,
-) -> Result<Command, String> {
+// 一次重载请求。参数多，用结构体传：以前 8 个位置参数，加个编译指令
+// 就得改所有调用点，还容易传错顺序。
+pub struct ReloadReq {
+    pub action: String,
+    pub root: String,
+    pub name: String,
+    pub live: String,
+    pub args: String,
+    pub mode: String,
+    /// 编译指令。空 = 走脚本里的默认（cargo）。
+    pub compile: String,
+    pub elevate: bool,
+    pub release_src: bool,
+}
+
+fn build_cmd(req: &ReloadReq) -> Result<Command, String> {
     let script = ensure_reload_script()?;
     let mut cmd = Command::new("powershell.exe");
     cmd.arg("-NoProfile")
@@ -56,52 +62,41 @@ fn build_cmd(
         .arg("Bypass")
         .arg("-File")
         .arg(script);
-    cmd.arg("-Action").arg(action);
-    cmd.arg("-Root").arg(root);
+    cmd.arg("-Action").arg(&req.action);
+    cmd.arg("-Root").arg(&req.root);
     cmd.arg("-StatusFile").arg(status_file());
-    cmd.arg("-Mode").arg(mode);
+    cmd.arg("-Mode").arg(&req.mode);
     // 调用方进程永不杀（rename 模式下调用方就是产物本身）
     cmd.arg("-SelfPid").arg(std::process::id().to_string());
-    if !name.trim().is_empty() {
-        cmd.arg("-Name").arg(name.trim());
+    if !req.name.trim().is_empty() {
+        cmd.arg("-Name").arg(req.name.trim());
     }
-    if !live.trim().is_empty() {
-        cmd.arg("-Live").arg(live.trim());
+    if !req.live.trim().is_empty() {
+        cmd.arg("-Live").arg(req.live.trim());
     }
-    if !launch_args.trim().is_empty() {
-        cmd.arg("-LaunchArgs").arg(launch_args.trim());
+    if !req.args.trim().is_empty() {
+        cmd.arg("-LaunchArgs").arg(req.args.trim());
     }
-    if release_src {
+    // 编译指令来自项目设置（Teambition 的 setting 任务）：rust 是 cargo，
+    // zig / go / npm 各不相同，写死在脚本里只能覆盖一种。
+    if !req.compile.trim().is_empty() {
+        cmd.arg("-Compile").arg(req.compile.trim());
+    }
+    if req.release_src {
         cmd.arg("-ReleaseSrc");
     }
-    if elevate {
+    if req.elevate {
         cmd.arg("-Elevate");
     }
+    // 别弹黑窗：编译要几十秒，一个控制台窗口杵在那儿最碍事。
+    crate::proc::hide(&mut cmd);
     Ok(cmd)
 }
 
 // 同步执行：脚本里完成 编译 -> 杀旧 -> (复制校验) -> 启动，退出码即结果。
 // mode: "rename" 改名直跑 / "copy" 副本运行。
-pub fn run_sync(
-    action: &str,
-    root: &str,
-    name: &str,
-    live: &str,
-    launch_args: &str,
-    mode: &str,
-    elevate: bool,
-    release_src: bool,
-) -> Result<Outcome, String> {
-    let mut cmd = build_cmd(
-        action,
-        root,
-        name,
-        live,
-        launch_args,
-        mode,
-        elevate,
-        release_src,
-    )?;
+pub fn run_sync(req: &ReloadReq) -> Result<Outcome, String> {
+    let mut cmd = build_cmd(req)?;
     let out = cmd
         .output()
         .map_err(|e| format!("启动 reload.ps1 失败: {e}"))?;
@@ -143,6 +138,7 @@ pub fn is_live(live: &str) -> bool {
     same_file(&cur, Path::new(live))
 }
 
+#[allow(dead_code)] // 窗口的重载页搬进项目卡片后暂时没有调用点，留着给 CLI 排查
 pub fn last_status() -> String {
     std::fs::read_to_string(status_file())
         .unwrap_or_default()

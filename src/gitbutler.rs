@@ -232,7 +232,10 @@ fn desktop_app_dirs() -> Vec<PathBuf> {
 }
 
 fn run_version(path: &Path) -> Option<String> {
-    let out = Command::new(path).arg("--version").output().ok()?;
+    let mut c = Command::new(path);
+    c.arg("--version");
+    crate::proc::hide(&mut c);
+    let out = c.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -240,7 +243,10 @@ fn run_version(path: &Path) -> Option<String> {
 }
 
 fn run_project_setup(path: &Path) -> Option<bool> {
-    let out = Command::new(path).args(["status", "--json"]).output().ok()?;
+    let mut c = Command::new(path);
+    c.args(["status", "--json"]);
+    crate::proc::hide(&mut c);
+    let out = c.output().ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     project_setup_from(out.status.success(), &stdout, &stderr)
@@ -335,7 +341,10 @@ fn probe(cands: &[(PathBuf, GbSource)]) -> Option<GbStatus> {
 
 /// git 在不在（GitButler CLI 依赖 git）。返回版本号，如 2.47.1。
 pub fn git_available() -> Option<String> {
-    let out = Command::new("git").arg("--version").output().ok()?;
+    let mut c = Command::new("git");
+    c.arg("--version");
+    crate::proc::hide(&mut c);
+    let out = c.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -396,8 +405,10 @@ fn fetch_binary(url: &str, dest: &Path) -> Result<(), String> {
 }
 
 fn run_ps(script: &str) -> Result<(), String> {
-    let status = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    let mut c = Command::new("powershell");
+    c.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    crate::proc::hide(&mut c);
+    let status = c
         .status()
         .map_err(|e| format!("运行 PowerShell 失败: {e}"))?;
     if !status.success() {
@@ -462,7 +473,9 @@ pub fn install(store: &Store) -> Result<PathBuf, String> {
         // 3. msiexec /a = 管理安装：只解出文件，不注册、不需要管理员
         let msi = find_by_ext(&work, "msi").ok_or("zip 里没找到 .msi")?;
         let target = work.join("x");
-        let status = Command::new("msiexec")
+        let mut cmd = Command::new("msiexec");
+        crate::proc::hide(&mut cmd);
+        let status = cmd
             .args([
                 "/a",
                 &msi.to_string_lossy(),

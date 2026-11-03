@@ -2489,7 +2489,10 @@ pub fn parse_memory_title(title: &str) -> Option<String> {
 //
 // 必须走 `teambition.task.query` + fields（taskId 支持逗号分隔）：
 // `project.task-query`（列表）不保证返回 note，拿它当正文会退化成标题。
-fn read_task_notes(ctx: &mut Ctx, ids: &[String]) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn read_task_notes(
+    ctx: &mut Ctx,
+    ids: &[String],
+) -> Result<Vec<(String, String)>, String> {
     let mut out: Vec<(String, String)> = Vec::new();
     if ids.is_empty() {
         return Ok(out);
@@ -3095,6 +3098,7 @@ pub fn open_folder(path: &std::path::Path) -> Result<(), String> {
     let mut cmd = {
         let mut c = std::process::Command::new("explorer");
         c.arg(path);
+        crate::proc::hide(&mut c);
         c
     };
     #[cfg(target_os = "macos")]
@@ -3568,7 +3572,8 @@ fn prompt_body(
     }
     // 通用能力：本地、跨项目，和项目 skill 是两套东西（skill 存在云端、按项目隔离）。
     // 压成一行：只列名字，正文不内联——agent 用到哪个才 `cap <名字>` 读哪个。
-    let caps = crate::caps::enabled(store);
+    // 项目级开关：这个项目取消勾选的能力不进文案（agent 搜不到就不会用）。
+    let caps = crate::caps::enabled_for(store, project_id);
     if !caps.is_empty() {
         let names: Vec<&str> = caps.iter().map(|c| c.name.as_str()).collect();
         s.push_str(&format!(
@@ -3576,6 +3581,32 @@ fn prompt_body(
             if zh { "通用能力: " } else { "Capabilities: " },
             names.join(", ")
         ));
+    }
+    // 编译 & 重载：参数存 Teambition 的 setting 任务，每个项目一份。
+    // 编译指令空着就明说「去探测再写回来」——否则 agent 会拿默认 cargo 硬编，
+    // 遇到 zig / go 项目就白跑一轮。
+    if let Some(st) = crate::setting::ProjectSetting::load_cached(store, project_id) {
+        if st.on {
+            if st.compile.trim().is_empty() {
+                s.push_str(&format!(
+                    "{}: {} `{exe} setting guess` → `{exe} setting set --compile \"...\"`（{}）\n\n",
+                    if zh { "编译 & 重载" } else { "Build & reload" },
+                    if zh { "编译指令未填，先探测项目类型：" } else { "compile not set, detect first:" },
+                    if zh {
+                        "存到 Teambition 的 setting 任务，再 `reload build`"
+                    } else {
+                        "saved to the setting task, then `reload build`"
+                    }
+                ));
+            } else {
+                s.push_str(&format!(
+                    "{}: `{exe} reload build`（{}: {}）\n\n",
+                    if zh { "编译 & 重载" } else { "Build & reload" },
+                    if zh { "编译指令" } else { "compile" },
+                    st.compile
+                ));
+            }
+        }
     }
     s.push_str(&workflow_text(
         &exe, project_id, &cfg, draft, claimed, lang, memory_on,
@@ -3813,7 +3844,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **禁止 run_in_background，绝不结束会话**——断了没人接你回复。\
          只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
          **通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git main -m` 提交推送 / \
-         `publish` 发版 / `shot` 截图 / `reload` 重载。先 `{exe} --help`。\n"
+         `publish` 发版 / `shot` 截图。先 `{exe} --help`。\n\
+         **编译 & 重载**：`{exe} setting` 看本项目的编译指令和 exe 名（存 Teambition 的 \
+         setting 任务），再 `{exe} reload build`。\n"
     );
 
     // 四条编码纪律。来自 Karpathy 对 LLM 编码陷阱的总结，专治三种毛病：

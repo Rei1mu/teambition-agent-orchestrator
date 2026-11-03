@@ -37,11 +37,33 @@ fn default_on() -> bool {
     true
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CapsFile {
     #[serde(default)]
     pub caps: Vec<Cap>,
+    /// 已经灌过第几版内置条目。老文件没这个字段 = 第 1 版。
+    /// 只在**内置清单本身变了**（新增了一条内置能力）时才升级：
+    /// 这样新增的 no-console 能自动出现在老用户的列表里，而用户自己删掉的
+    /// 条目不会因为普通读取又长回来。
+    #[serde(default = "seed_v1")]
+    pub seeded: u32,
 }
+
+fn seed_v1() -> u32 {
+    1
+}
+
+impl Default for CapsFile {
+    fn default() -> Self {
+        CapsFile {
+            caps: Vec::new(),
+            seeded: SEED,
+        }
+    }
+}
+
+/// 当前内置清单版本。加/删内置条目时 +1。
+const SEED: u32 = 2;
 
 // ---- 内置正文 ----
 //
@@ -143,35 +165,36 @@ pub const BODY_GUI: &str = "\
 改完必须 `tba shot --title <窗口标题> --out .tmp/ui.png` 截图自己看，不要凭想象说「已修好」。
 ";
 
-pub const BODY_RELOAD: &str = "\
-# 重载（无痛重启）
+pub const BODY_NO_CONSOLE: &str = "\
+# 禁止弹命令行
 
-## 一条命令
-`tba reload build`
+## 规则
+凡是起子进程，**都不许弹控制台窗口**。窗口一闪而过最影响使用，用户看到黑框
+就以为程序出问题了。
 
-编译 -> 杀旧 -> 复制校验 -> 启动，四步都在命令里，退出码是唯一真值：
-0 成功 / 2 超时 / 3 别处已收尾 / 4 项目不存在 / 5 BLOCKED。
-
-## 动作
-- `tba reload build`：编译 + 替换 + 启动（最常用）
-- `tba reload restart`：不编译，直接杀旧 + 启动
-- `tba reload kill`：只杀
-- `tba reload status`：看目标进程在不在
-
-## 参数
-`--root <项目根>` / `--name <exe 基名>` / `--live <运行副本路径>` /
-`--mode rename|copy` / `--elevate` / `--args <启动参数>`。缺省按 exe 位置和 Cargo.toml 推断。
+## 怎么做
+- tba 自己起的进程（git / but / cargo / 终端脚本）已经统一加 `CREATE_NO_WINDOW`，
+  不用管。
+- agent 自己起进程时：
+  - 终端脚本：`Start-Process -WindowStyle Hidden` 或 `-WindowStyle Minimized`；
+  - cmd：`start /b`，别用 `start`（会开新窗口）；
+  - 能不用 shell 就不用，直接调 exe。
+- 后台跑长任务用 `run_in_background`，不要开个窗口让用户看着。
 
 ## 红线
-- 不要自己 kill + copy + start，也不要擅自把 exe 改名成 `_new_text01.exe` 之类。
-- 编译失败时旧窗口不动、继续可用；不要手动删 target 或清缓存重来。
-- 重载 tba 自己时命令会自动转后台（等本进程退出再编译），不要在前台等。
-- 报 BLOCKED 就是别人正在重载，等它收尾，别抢。
+- 不要为了「看输出」把窗口留在前台；输出重定向到日志文件，需要时读文件。
+- 不要用 `cmd /c start \"\" ...` 打开程序，会闪一个黑框。
 ";
 
 // (名字, 说明, 正文)
 pub const BUILTIN: &[(&str, &str, &str)] = &[
-    ("reload", "重载：编译 -> 杀旧 -> 复制校验 -> 启动", BODY_RELOAD),
+    // 重载不在这里：它跟具体项目绑定（编译指令、exe 名每个项目都不同），
+    // 已经搬到「项目列表 → 编译 & 重载」，参数存 Teambition 的 setting 任务。
+    (
+        "no-console",
+        "禁止弹命令行：所有命令都隐藏窗口调用",
+        BODY_NO_CONSOLE,
+    ),
     ("shot", "截图：一条命令出 png，后台窗口也能截", BODY_SHOT),
     ("git-main", "提交并推送（GitButler 项目自动走 but）", BODY_GIT),
     (
@@ -208,10 +231,42 @@ fn builtin_caps() -> Vec<Cap> {
 pub fn load(store: &Store) -> CapsFile {
     let p = path(store);
     match std::fs::read_to_string(&p) {
-        Ok(s) => toml::from_str(&s).unwrap_or_default(),
+        Ok(s) => {
+            let mut f: CapsFile = toml::from_str(&s).unwrap_or_default();
+            let mut dirty = false;
+            // v0.2.5 迁移：reload 从「通用能力」搬到「项目 → 编译 & 重载」。
+            // 老文件里那条内置条目留着只会让 agent 读到一个已经不该用的说明，
+            // 所以读的时候顺手摘掉（用户自己建的、非内置的同名条目不动）。
+            let before = f.caps.len();
+            f.caps.retain(|c| !(c.builtin && c.name == "reload"));
+            if f.caps.len() != before {
+                dirty = true;
+            }
+            // 内置清单升级：只补「新版才有、列表里没有」的条目。
+            if f.seeded < SEED {
+                for (name, summary, body) in BUILTIN {
+                    if !f.caps.iter().any(|c| c.name == *name) {
+                        f.caps.push(Cap {
+                            name: (*name).to_string(),
+                            summary: (*summary).to_string(),
+                            on: true,
+                            builtin: true,
+                            body: (*body).to_string(),
+                        });
+                    }
+                }
+                f.seeded = SEED;
+                dirty = true;
+            }
+            if dirty {
+                let _ = save(store, &f);
+            }
+            f
+        }
         Err(_) => {
             let f = CapsFile {
                 caps: builtin_caps(),
+                seeded: SEED,
             };
             let _ = save(store, &f);
             f
@@ -246,6 +301,16 @@ pub fn enabled(store: &Store) -> Vec<Cap> {
         .caps
         .into_iter()
         .filter(|c| c.on)
+        .collect()
+}
+
+// 某个项目实际能用的：全局开着，且没被这个项目单独关掉。
+// 开工文案按这个列，agent 就不会去翻一个跟当前项目无关的能力。
+pub fn enabled_for(store: &Store, project_id: &str) -> Vec<Cap> {
+    let off = store.load_cap_off(project_id);
+    enabled(store)
+        .into_iter()
+        .filter(|c| !off.iter().any(|n| n == &c.name))
         .collect()
 }
 
@@ -390,7 +455,11 @@ mod tests {
         let caps = list(&store);
         assert_eq!(caps.len(), BUILTIN.len());
         assert!(path(&store).exists());
-        assert!(caps.iter().any(|c| c.name == "reload"));
+        assert!(caps.iter().any(|c| c.name == "no-console"));
+        assert!(
+            !caps.iter().any(|c| c.name == "reload"),
+            "reload 已搬到项目设置，不该再出现在能力库里"
+        );
         assert!(caps.iter().all(|c| c.on && c.builtin));
     }
 
@@ -398,10 +467,12 @@ mod tests {
     #[test]
     fn empty_file_is_not_reseeded() {
         let store = tmp("empty");
+        // 当前版本写出来的空文件 = 用户主动删光，不能重灌。
         save(
             &store,
             &CapsFile {
                 caps: Vec::new(),
+                seeded: SEED,
             },
         )
         .unwrap();

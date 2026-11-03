@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 #  reload.ps1 - generic reload capability (built into TBHub)
 #
 #  Contract: exit code is the only truth. 0 = ok, 1 = fail.
@@ -41,6 +41,7 @@ param(
     [string]$LaunchArgs = "",
     [string]$Triple = "stable-x86_64-pc-windows-msvc",
     [string]$Mode = "copy",
+    [string]$Compile = "",
     [int]$SelfPid = 0,
     [string]$StatusFile = "",
     [switch]$ReleaseSrc,
@@ -219,13 +220,19 @@ function Copy-Verify {
 
 # ---- launch ----
 function Launch {
+    if (-not (Test-Path -LiteralPath $LIVE)) { Out-Err "launch" "no exe: $LIVE" }
     $argList = @()
     if ($LaunchArgs) { $argList = $LaunchArgs.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries) }
-    if ($Elevate) {
-        $p = Start-Process -FilePath $LIVE -ArgumentList $argList -WorkingDirectory $ROOT -Verb RunAs -PassThru -ErrorAction SilentlyContinue
-    } else {
-        $p = Start-Process -FilePath $LIVE -ArgumentList $argList -WorkingDirectory $ROOT -PassThru -ErrorAction SilentlyContinue
-    }
+    # -WindowStyle Hidden 同时解决两件事：
+    #   1) 控制台程序不弹黑框（控制台窗口建了但隐藏）；
+    #   2) 走 ShellExecute，子进程不继承调用方的 stdout 管道 —— 否则
+    #      `tba reload build` 会一直等管道 EOF，直到被启动的程序退出（踩过）。
+    # GUI 程序的主窗口不受影响（实测 egui 窗口照常显示）。
+    # 注意：-ArgumentList 传空数组会报「参数为 Null、为空」，所以空的时候整个不传。
+    $sp = @{ FilePath = $LIVE; WorkingDirectory = $ROOT; PassThru = $true; ErrorAction = "SilentlyContinue"; WindowStyle = "Hidden" }
+    if ($argList.Count -gt 0) { $sp.ArgumentList = $argList }
+    if ($Elevate) { $sp.Verb = "RunAs" }
+    $p = Start-Process @sp
     if (-not $p) { Out-Err "launch" "Start-Process returned nothing" }
     $p.Id
 }
@@ -237,15 +244,32 @@ function Pid-Running {
 
 switch ($Action) {
     "build" {
+        # 编译必须在项目根跑：以前靠调用方的 cwd 是项目根，现在参数来自
+        # 项目设置（可能是从窗口/别的目录起的），cwd 靠不住。
+        if (-not $ROOT -or -not (Test-Path -LiteralPath $ROOT)) {
+            Out-Err "root" "no such dir: $ROOT"
+        }
+        Set-Location -LiteralPath $ROOT
         if ($ReleaseSrc) {
             try { Release-Src } catch { Out-Err "release" "$($_.Exception.Message)" }
         }
         $env:PATH = "$MSVC_BIN;$env:PATH"
         $env:LIB = if ($EXTRA_LIB) { "$MSVC_LIB;$SDK_LIB;$EXTRA_LIB" } else { "$MSVC_LIB;$SDK_LIB" }
-        & $CARGO +$Triple build --release *>&1 | Out-File -FilePath $LOG -Append -Encoding utf8
-        if ($LASTEXITCODE -ne 0) {
-            Restore-Src
-            Out-Err "build" "cargo exit $LASTEXITCODE (see $LOG)"
+        if ($Compile) {
+            # 编译指令来自项目设置（Teambition 的 setting 任务）：zig / go / npm 各不相同。
+            # 用 cmd /c 跑整串，才能带参数和管道；输出照样进日志，不回灌调用方。
+            Add-Content -Path $LOG -Value "[compile] $Compile" -Encoding utf8
+            & cmd /c $Compile *>&1 | Out-File -FilePath $LOG -Append -Encoding utf8
+            if ($LASTEXITCODE -ne 0) {
+                Restore-Src
+                Out-Err "compile" "exit $LASTEXITCODE (see $LOG)"
+            }
+        } else {
+            & $CARGO +$Triple build --release *>&1 | Out-File -FilePath $LOG -Append -Encoding utf8
+            if ($LASTEXITCODE -ne 0) {
+                Restore-Src
+                Out-Err "build" "cargo exit $LASTEXITCODE (see $LOG)"
+            }
         }
         Kill-Old
         if ($NEED_COPY) {

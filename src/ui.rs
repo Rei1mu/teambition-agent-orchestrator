@@ -24,7 +24,12 @@ enum Ev {
     Skills(String, Vec<SkillItem>),
     LoggedIn(usize),
     Err(String),
-    ReloadDone(String),
+    /// 编译 & 重载的结果（项目 id, 输出）
+    ReloadDone(String, String),
+    /// 项目设置从云端读回来了（项目 id, 结果）
+    SettingLoaded(String, Result<Option<crate::setting::ProjectSetting>, String>),
+    /// 项目设置保存结果（项目 id, 结果）
+    SettingSaved(String, Result<String, String>),
     /// GitButler/git 后台检测结果
     GbChecked {
         gb: crate::gitbutler::GbStatus,
@@ -47,7 +52,6 @@ enum View {
     Projects,
     /// 通用能力：本地、跨项目的文本能力库，可增删改查
     Caps,
-    Reload,
     Settings,
 }
 
@@ -109,17 +113,20 @@ pub struct App {
     loading_projects: bool,
     loading_skill: Option<String>,
     status: String,
-    // 侧栏视图 + 通用能力（重载）
+    // 侧栏视图
     view: View,
-    reload_root: String,
-    reload_name: String,
-    reload_live: String,
-    reload_mode: String,
-    reload_args: String,
-    reload_out: String,
-    reload_log: String,
-    reload_busy: bool,
-    reload_elevate: bool,
+    // 项目级：通用能力「不用」名单（本地 projects/<id>/caps-off.toml）
+    cap_off: HashMap<String, Vec<String>>,
+    // 项目「编译 & 重载」的编辑态（本地缓存 + 云端设置）
+    setting: HashMap<String, crate::setting::ProjectSetting>,
+    // 已经从云端拉过一次（避免每次展开都联网）
+    setting_fetched: HashMap<String, bool>,
+    // 正在读/写哪个项目的设置
+    setting_busy: Option<String>,
+    // 重载动作按项目记：编译要几十秒，切到别的项目也不该串台
+    reload_busy: Option<String>,
+    reload_out: HashMap<String, String>,
+    reload_log: HashMap<String, String>,
     // 界面偏好（字号）
     font_size: f32,
     // 中文字体 key（空 = 自动）。改了要重装字体，所以记一份已生效的值做差异判断。
@@ -149,6 +156,9 @@ pub struct App {
     cap_edit: Option<CapEdit>,
     // 删除前的二次确认（存名字）
     cap_del: Option<String>,
+    // 截图自验用：TBA_UI_OPEN=1 时所有项目卡片和折叠区默认展开
+    // （GUI 没法用命令行点按钮，不展开就截不到里面的内容）。
+    debug_open: bool,
 }
 
 // skill 编辑窗的编辑态。正文是整段 markdown，直接存 String。
@@ -380,16 +390,6 @@ impl App {
         // 先用缓存秒开，再后台刷新。
         let cached = store.load_projects_cache();
         let needs_token = store.load_config().token().is_none();
-        // 重载面板默认指向当前 exe 所在项目
-        let reload_root = crate::capability::guess_root();
-        let reload_name = crate::capability::guess_name(&reload_root);
-        let reload_live = crate::capability::default_live(&reload_root, &reload_name);
-        let reload_args = if reload_name == "tba" {
-            "ui".to_string()
-        } else {
-            String::new()
-        };
-        let last = crate::capability::last_status();
         let prefs = load_prefs(&store);
         let font_size = prefs.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         // 邮件表单要预填，先读一份配置（store 之后会被 move 进 App）。
@@ -423,22 +423,15 @@ impl App {
                 // 截图验证用：GUI 没法用命令行点按钮，起个指定页才好自查界面。
                 Ok("settings") => View::Settings,
                 Ok("caps") => View::Caps,
-                Ok("reload") => View::Reload,
                 _ => View::Projects,
             },
-            reload_root,
-            reload_name,
-            reload_live,
-            reload_mode: "rename".to_string(),
-            reload_args,
-            reload_out: if last.is_empty() {
-                "尚未执行。".to_string()
-            } else {
-                last
-            },
-            reload_log: String::new(),
-            reload_busy: false,
-            reload_elevate: false,
+            cap_off: HashMap::new(),
+            setting: HashMap::new(),
+            setting_fetched: HashMap::new(),
+            setting_busy: None,
+            reload_busy: None,
+            reload_out: HashMap::new(),
+            reload_log: HashMap::new(),
             font_size,
             font_choice: prefs.font.clone(),
             applied_font_choice: prefs.font.clone(),
@@ -457,6 +450,7 @@ impl App {
             caps: caps_rows,
             cap_edit: cap_edit0,
             cap_del: None,
+            debug_open: std::env::var("TBA_UI_OPEN").as_deref() == Ok("1"),
         };
         if !needs_token {
             app.reload_projects();
@@ -778,10 +772,42 @@ impl eframe::App for App {
                         self.status = format!("错误: {e}");
                     }
                 }
-                Ev::ReloadDone(text) => {
-                    self.reload_busy = false;
-                    self.reload_out = text;
-                    self.reload_log = crate::capability::log_tail(&self.reload_root, 15);
+                Ev::ReloadDone(pid, text) => {
+                    self.reload_busy = None;
+                    if let Some(st) = self.setting.get(&pid) {
+                        self.reload_log
+                            .insert(pid.clone(), crate::capability::log_tail(&st.root, 15));
+                    }
+                    self.reload_out.insert(pid, text);
+                }
+                Ev::SettingLoaded(pid, r) => {
+                    self.setting_busy = None;
+                    match r {
+                        Ok(Some(st)) => {
+                            self.setting.insert(pid, st);
+                        }
+                        Ok(None) => {
+                            self.status = "还没有「编译 & 重载」设置：填好点「保存到 Teambition」，\
+                                          或让 agent 跑 `tba setting set --compile ...`"
+                                .to_string();
+                        }
+                        Err(e) => self.status = format!("读取项目设置失败: {e}"),
+                    }
+                }
+                Ev::SettingSaved(pid, r) => {
+                    self.setting_busy = None;
+                    match r {
+                        Ok(msg) => {
+                            self.status = msg;
+                            // 保存成功顺手把内存里的值对齐（fill_defaults 可能补了字段）
+                            if let Some(st) =
+                                crate::setting::ProjectSetting::load_cached(&self.store, &pid)
+                            {
+                                self.setting.insert(pid, st);
+                            }
+                        }
+                        Err(e) => self.status = format!("保存项目设置失败: {e}"),
+                    }
                 }
                 Ev::GbChecked { gb, git } => {
                     self.gb = Some(gb);
@@ -842,7 +868,8 @@ impl eframe::App for App {
         if self.loading_projects
             || self.loading_skill.is_some()
             || self.setup_busy
-            || self.reload_busy
+            || self.reload_busy.is_some()
+            || self.setting_busy.is_some()
             || self.skillmem_busy.is_some()
         {
             ctx.request_repaint();
@@ -927,13 +954,6 @@ impl eframe::App for App {
                 {
                     self.view = View::Caps;
                 }
-                if ui
-                    .selectable_label(self.view == View::Reload, "重载")
-                    .on_hover_text("编译 -> 杀旧 -> 复制校验 -> 启动")
-                    .clicked()
-                {
-                    self.view = View::Reload;
-                }
 
                 ui.add_space(12.0);
                 ui.label(egui::RichText::new("设置").small().weak());
@@ -1016,14 +1036,6 @@ impl eframe::App for App {
                     });
                 return;
             }
-            if self.view == View::Reload {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        self.draw_reload(ui);
-                    });
-                return;
-            }
             if self.needs_token {
                 // 登录页比一屏高（字号 18+ 时尤其），不套滚动区底部的「创建步骤」
                 // 会被直接裁掉，看着就像「页面只有一半」。
@@ -1043,7 +1055,15 @@ impl eframe::App for App {
                     ui.label("没有项目。点右上角刷新重试。");
                     return;
                 }
-                let projects = self.projects.clone();
+                // 截图自验用：TBA_UI_ONLY=TBHub 只渲染名字包含它的项目，
+                // 一个项目展开就有三块内容，不筛根本截不全。
+                let only = std::env::var("TBA_UI_ONLY").unwrap_or_default();
+                let projects: Vec<(String, String)> = self
+                    .projects
+                    .iter()
+                    .filter(|(_, n)| only.is_empty() || n.contains(&only))
+                    .cloned()
+                    .collect();
                 let mut to_load: Option<String> = None;
                 // Option 四元组: 项目id, 项目名, 复制模式, 文案语言。
                 // CopyMode::Queue => 复制「领列1任务」文案（忽略本次任务草稿）；
@@ -1053,7 +1073,7 @@ impl eframe::App for App {
                 for (pid, pname) in projects {
                     let pid = pid.clone();
                     let pname = pname.clone();
-                    let open = self.open.get(&pid).cloned().unwrap_or(false);
+                    let open = self.open.get(&pid).cloned().unwrap_or(self.debug_open);
                     let arrow = if open { "▾" } else { "▸" };
                     let header = ui.selectable_label(false, format!("{arrow} {pname}"));
                     if header.clicked() {
@@ -1138,54 +1158,12 @@ impl eframe::App for App {
                                 self.store.memory_dir(&pid).display()
                             ));
                             ui.add_space(4.0);
-                            ui.label(if loading {
-                                "正在加载 skill...".to_string()
-                            } else if rows.is_empty() {
-                                "没有 skill。".to_string()
-                            } else {
-                                format!("skill ({} 个):", rows.len())
-                            });
-                            for row in &rows {
-                                let mut on = row.on;
-                                ui.horizontal(|ui| {
-                                    if ui.checkbox(&mut on, &row.name).changed() {
-                                        let _ = self.store.set_switch(&pid, &row.name, on);
-                                        if let Some(list) = self.skills.get_mut(&pid) {
-                                            if let Some(r) =
-                                                list.iter_mut().find(|r| r.name == row.name)
-                                            {
-                                                r.on = on;
-                                            }
-                                        }
-                                        self.status = format!(
-                                            "skill「{}」已{}",
-                                            row.name,
-                                            if on { "开启" } else { "关闭" }
-                                        );
-                                    }
-                                    // 编辑 / 删除都走后台线程：要联网写 Teambition。
-                                    if ui.button("编辑").clicked() {
-                                        edit_req = Some((
-                                            row.name.clone(),
-                                            row.content.clone(),
-                                            false,
-                                        ));
-                                    }
-                                    if ui.button("删除").clicked() {
-                                        del_req = Some(row.name.clone());
-                                    }
-                                });
-                            }
-                            if ui
-                                .button("+ 新建 skill")
-                                .on_hover_text(
-                                    "写一段 markdown 存到 Teambition 的 skill 状态任务里。\
-                                     agent 用 `tba skills` 看到名字，用到才读正文（省 token）",
-                                )
-                                .clicked()
-                            {
-                                edit_req = Some((String::new(), String::new(), true));
-                            }
+                            // 两栏分开、默认收起：tb skill 在云端（按项目），
+                            // 通用 skill 在本机（跨项目），混在一个列表里分不清
+                            // 「关掉的是这个项目的还是整台机器的」。
+                            self.draw_tb_skills(ui, &pid, &rows, loading, &mut edit_req, &mut del_req);
+                            self.draw_caps_for_project(ui, &pid);
+                            self.draw_compile_section(ui, &pid);
                             ui.add_space(6.0);
                             // 导出：把云端 skill / mem 拉成本地两个 md，人可以直接看
                             // 「agent 读到的到底是什么样」。下载 = 重新拉一遍覆盖本地。
@@ -1694,169 +1672,395 @@ impl App {
     }
 
     // 通用能力：重载。编译 -> 杀旧 -> 复制校验 -> 启动。
-    fn draw_reload(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("重载");
-            if ui
-                .button("编辑这条能力的文本")
-                .on_hover_text("正文在「通用能力 → 能力」里，agent 读的就是它；改完立刻生效")
-                .clicked()
-            {
-                match caps::get(&self.store, "reload") {
-                    Some(c) => {
-                        self.cap_edit = Some(CapEdit::from(&c));
-                    }
-                    None => {
-                        self.status =
-                            "reload 这条能力被删了：去「能力」页点「恢复内置」找回。".to_string();
-                        self.view = View::Caps;
-                    }
-                }
-            }
-        });
-        ui.label("编译 → 杀旧 → 复制校验 → 启动。退出码是唯一真值，cargo 输出只进 target/reload.log。");
-        ui.label(
-            egui::RichText::new(
-                "这条流程本身是命令（tba reload），下面的按钮只是入口；\
-                 说明/红线是文本能力，agent 用 `tba cap reload` 读。",
-            )
-            .small()
-            .weak(),
-        );
-        ui.add_space(10.0);
-
-        egui::Grid::new("reload_form")
-            .num_columns(2)
-            .spacing([10.0, 8.0])
+    // ---- 项目卡片里的三块：tb skill / 通用 skill / 编译 & 重载 ----
+    //
+    // 为什么都要默认收起：一个项目展开就有三个列表 + 一堆按钮，找「复制文案」
+    // 得往下滚半天。默认收起后，卡片高度只跟项目数有关，扫一眼就能定位。
+    fn draw_tb_skills(
+        &mut self,
+        ui: &mut egui::Ui,
+        pid: &str,
+        rows: &[SkillItem],
+        loading: bool,
+        edit_req: &mut Option<(String, String, bool)>,
+        del_req: &mut Option<String>,
+    ) {
+        let on_n = rows.iter().filter(|r| r.on).count();
+        let title = if loading {
+            "tb skill（加载中…）".to_string()
+        } else {
+            format!("tb skill（{} 个，{} 开）", rows.len(), on_n)
+        };
+        egui::CollapsingHeader::new(title)
+            .id_salt(("tb-skill", pid))
+            .default_open(self.debug_open)
             .show(ui, |ui| {
-                ui.label("项目目录");
-                ui.add(egui::TextEdit::singleline(&mut self.reload_root).desired_width(430.0));
-                ui.end_row();
-
-                ui.label("exe 基名");
-                ui.add(egui::TextEdit::singleline(&mut self.reload_name).desired_width(200.0));
-                ui.end_row();
-
-                ui.label("模式");
-                egui::ComboBox::from_id_salt("reload_mode")
-                    .selected_text(if self.reload_mode == "rename" {
-                        "rename · 改名直跑"
-                    } else {
-                        "copy · 副本运行"
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.reload_mode,
-                            "rename".to_string(),
-                            "rename · 改名直跑",
-                        );
-                        ui.selectable_value(
-                            &mut self.reload_mode,
-                            "copy".to_string(),
-                            "copy · 副本运行",
-                        );
-                    });
-                ui.end_row();
-
-                if self.reload_mode != "rename" {
-                    ui.label("运行副本");
-                    ui.add(egui::TextEdit::singleline(&mut self.reload_live).desired_width(430.0));
-                    ui.end_row();
+                ui.label(
+                    egui::RichText::new(
+                        "存 Teambition 云端、按项目隔离。勾选 = 这个项目启用；编辑/删除都改云端那条任务。",
+                    )
+                    .small()
+                    .weak(),
+                );
+                if loading {
+                    ui.label("正在加载…");
+                } else if rows.is_empty() {
+                    ui.label("没有 tb skill。");
                 }
-
-                ui.label("启动参数");
-                ui.add(egui::TextEdit::singleline(&mut self.reload_args).desired_width(200.0));
-                ui.end_row();
+                for row in rows {
+                    let mut on = row.on;
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut on, &row.name).changed() {
+                            let _ = self.store.set_switch(pid, &row.name, on);
+                            if let Some(list) = self.skills.get_mut(pid) {
+                                if let Some(r) = list.iter_mut().find(|r| r.name == row.name) {
+                                    r.on = on;
+                                }
+                            }
+                            self.status =
+                                format!("skill「{}」已{}", row.name, if on { "开启" } else { "关闭" });
+                        }
+                        // 编辑 / 删除都走后台线程：要联网写 Teambition。
+                        if ui.button("编辑").clicked() {
+                            *edit_req = Some((row.name.clone(), row.content.clone(), false));
+                        }
+                        if ui.button("删除").clicked() {
+                            *del_req = Some(row.name.clone());
+                        }
+                    });
+                }
+                if ui
+                    .button("+ 新建 skill")
+                    .on_hover_text(
+                        "写一段 markdown 存到 Teambition 的 skill 状态任务里。\
+                         agent 用 `tba skills` 看到名字，用到才读正文（省 token）",
+                    )
+                    .clicked()
+                {
+                    *edit_req = Some((String::new(), String::new(), true));
+                }
             });
-
-        ui.horizontal(|ui| {
-            if self.reload_mode != "rename" && ui.button("重新推算副本路径").clicked() {
-                self.reload_live =
-                    crate::capability::default_live(&self.reload_root, &self.reload_name);
-            }
-            ui.checkbox(&mut self.reload_elevate, "UAC 提权");
-        });
-        ui.add_space(10.0);
-
-        let busy = self.reload_busy;
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!busy, egui::Button::new("重载 build")).clicked() {
-                self.start_reload("build");
-            }
-            if ui.add_enabled(!busy, egui::Button::new("重启 restart")).clicked() {
-                self.start_reload("restart");
-            }
-            if ui.add_enabled(!busy, egui::Button::new("杀掉 kill")).clicked() {
-                self.start_reload("kill");
-            }
-            if ui.add_enabled(!busy, egui::Button::new("状态 status")).clicked() {
-                self.start_reload("status");
-            }
-            if busy {
-                ui.spinner();
-            }
-        });
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new("结果").strong());
-        ui.label(egui::RichText::new(&self.reload_out).monospace());
-
-        ui.add_space(8.0);
-        ui.collapsing("reload.log 末尾 15 行", |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(200.0)
-                .show(ui, |ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(&self.reload_log).monospace().small(),
-                    ));
-                });
-        });
     }
 
-    fn start_reload(&mut self, action: &str) {
-        self.reload_busy = true;
-        self.reload_out = format!("正在执行 {action}...");
-        let action = action.to_string();
-        let root = self.reload_root.clone();
-        let name = self.reload_name.clone();
-        let live = self.reload_live.clone();
-        let mode = self.reload_mode.clone();
-        let args = self.reload_args.clone();
-        let elevate = self.reload_elevate;
+    // 通用 skill：本地、跨项目的能力，这里只给开关。
+    // 勾选 = 这个项目用；取消 = 这个项目不用，agent 文案里也不会出现（也就搜不到）。
+    // 不提供编辑/删除：那是「能力」页的事，这里改的是「这个项目用不用」。
+    fn draw_caps_for_project(&mut self, ui: &mut egui::Ui, pid: &str) {
+        let caps = self.caps.clone();
+        if !self.cap_off.contains_key(pid) {
+            self.cap_off
+                .insert(pid.to_string(), self.store.load_cap_off(pid));
+        }
+        let off = self.cap_off.get(pid).cloned().unwrap_or_default();
+        let on_n = caps
+            .iter()
+            .filter(|c| c.on && !off.iter().any(|n| n == &c.name))
+            .count();
+        egui::CollapsingHeader::new(format!("通用 skill（{} 条，{} 开）", caps.len(), on_n))
+            .id_salt(("caps", pid))
+            .default_open(self.debug_open)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "本机、跨项目的能力。勾选 = 这个项目用；取消 = 这个项目不用，\
+                         agent 文案里不会出现。要改正文去「通用能力 → 能力」。",
+                    )
+                    .small()
+                    .weak(),
+                );
+                for c in &caps {
+                    let mut on = c.on && !off.iter().any(|n| n == &c.name);
+                    let label = format!("{} — {}", c.name, c.summary);
+                    if !c.on {
+                        // 全局关掉的，项目里勾也没意义：显示成禁用 + 说明。
+                        ui.add_enabled(false, egui::Checkbox::new(&mut on, label));
+                        ui.label(egui::RichText::new("（全局已关）").small().weak());
+                        continue;
+                    }
+                    if ui.checkbox(&mut on, label).changed() {
+                        match self.store.set_cap_off(pid, &c.name, !on) {
+                            Ok(()) => {
+                                self.cap_off
+                                    .insert(pid.to_string(), self.store.load_cap_off(pid));
+                                self.status = format!(
+                                    "「{}」在本项目已{}",
+                                    c.name,
+                                    if on { "启用" } else { "停用（agent 搜不到）" }
+                                );
+                            }
+                            Err(e) => self.status = format!("保存失败: {e}"),
+                        }
+                    }
+                }
+            });
+    }
+
+    // 编译 & 重载：参数存 Teambition 状态为 setting 的任务（标题「项目设置」），
+    // 本地留一份缓存好秒开。第一次展开时后台拉一次云端，之后用内存里的编辑态。
+    fn draw_compile_section(&mut self, ui: &mut egui::Ui, pid: &str) {
+        if !self.setting.contains_key(pid) {
+            let cached = crate::setting::ProjectSetting::load_cached(&self.store, pid)
+                .unwrap_or_default();
+            self.setting.insert(pid.to_string(), cached);
+        }
+        let mut ed = self.setting.get(pid).cloned().unwrap_or_default();
+        let busy = self.reload_busy.as_deref() == Some(pid);
+        let title = if ed.on {
+            "编译 & 重载".to_string()
+        } else {
+            "编译 & 重载（已停用）".to_string()
+        };
+        let mut save = false;
+        let mut refetch = false;
+        let mut action: Option<&'static str> = None;
+
+        egui::CollapsingHeader::new(title)
+            .id_salt(("compile", pid))
+            .default_open(self.debug_open)
+            .show(ui, |ui| {
+                // 展开过就拉一次云端：本地缓存可能是上次的，编译指令改了要能看到。
+                if self.setting_fetched.get(pid) != Some(&true) && self.setting_busy.is_none() {
+                    self.setting_fetched.insert(pid.to_string(), true);
+                    self.setting_busy = Some(pid.to_string());
+                    let store = self.store.clone();
+                    let tx = self.tx.clone();
+                    let pid2 = pid.to_string();
+                    thread::spawn(move || {
+                        let r = crate::setting::fetch(&store, &pid2);
+                        let _ = tx.send(Ev::SettingLoaded(pid2, r));
+                    });
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "参数存 Teambition：状态 setting 的任务「项目设置」，网页上也能看能改。\
+                         勾选 = 这个项目要编译 & 重载；关掉后 agent 文案里不出现。",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.checkbox(&mut ed.on, "启用（编译 & 重载）");
+                ui.horizontal(|ui| {
+                    ui.label("编译指令");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ed.compile)
+                            .desired_width(420.0)
+                            .hint_text("例如 cargo build --release / zig build / npm run build"),
+                    );
+                });
+                if ed.compile.trim().is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "空着 = 还没定。让 agent 跑 `tba setting guess` 探测项目类型，\
+                             再 `tba setting set --compile \"...\"` 写回 Teambition；\
+                             也可以直接在这里填。空着仍可「只重载」（杀旧 + 启动）。",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+
+                egui::Grid::new(("compile_grid", pid))
+                    .num_columns(2)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("项目目录");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut ed.root)
+                                .desired_width(420.0)
+                                .hint_text("编译在这个目录里跑"),
+                        );
+                        ui.end_row();
+
+                        ui.label("exe 基名");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut ed.name)
+                                .desired_width(200.0)
+                                .hint_text("不带 .exe"),
+                        );
+                        ui.end_row();
+
+                        ui.label("启动模式");
+                        egui::ComboBox::from_id_salt(("compile_mode", pid))
+                            .selected_text(if ed.mode == "copy" {
+                                "copy · 副本运行"
+                            } else {
+                                "rename · 改名直跑"
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut ed.mode,
+                                    "rename".to_string(),
+                                    "rename · 改名直跑",
+                                );
+                                ui.selectable_value(
+                                    &mut ed.mode,
+                                    "copy".to_string(),
+                                    "copy · 副本运行",
+                                );
+                            });
+                        ui.end_row();
+
+                        if ed.mode == "copy" {
+                            ui.label("运行副本");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut ed.live).desired_width(420.0),
+                            );
+                            ui.end_row();
+                        }
+
+                        ui.label("启动参数");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut ed.args)
+                                .desired_width(200.0)
+                                .hint_text("例如 ui"),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.setting_busy.as_deref() != Some(pid),
+                            egui::Button::new("保存到 Teambition"),
+                        )
+                        .on_hover_text("写进状态 setting 的任务备注，换设备也还在")
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.setting_busy.as_deref() != Some(pid),
+                            egui::Button::new("从云端重读"),
+                        )
+                        .clicked()
+                    {
+                        refetch = true;
+                    }
+                    if self.setting_busy.as_deref() == Some(pid) {
+                        ui.spinner();
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("编译 & 重载"))
+                        .on_hover_text("编译 -> 杀旧 -> 复制校验 -> 启动")
+                        .clicked()
+                    {
+                        action = Some("build");
+                    }
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("只重启"))
+                        .on_hover_text("不编译，直接杀旧 + 启动")
+                        .clicked()
+                    {
+                        action = Some("restart");
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("杀掉")).clicked() {
+                        action = Some("kill");
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("状态")).clicked() {
+                        action = Some("status");
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                });
+                if let Some(out) = self.reload_out.get(pid) {
+                    ui.label(egui::RichText::new(out).monospace());
+                }
+                if let Some(log) = self.reload_log.get(pid) {
+                    if !log.is_empty() {
+                        ui.collapsing("reload.log 末尾", |ui| {
+                            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(log).monospace().small(),
+                                ));
+                            });
+                        });
+                    }
+                }
+            });
+
+        // 编辑态写回：CollapsingHeader 收起时闭包不执行，这里只在展开时覆盖，
+        // 不会把云端刚拉回来的值冲掉（拉回来时闭包还没跑）。
+        self.setting.insert(pid.to_string(), ed.clone());
+        if refetch {
+            self.setting_fetched.insert(pid.to_string(), false);
+            self.setting_busy = Some(pid.to_string());
+            let store = self.store.clone();
+            let tx = self.tx.clone();
+            let pid2 = pid.to_string();
+            thread::spawn(move || {
+                let r = crate::setting::fetch(&store, &pid2);
+                let _ = tx.send(Ev::SettingLoaded(pid2, r));
+            });
+        }
+        if save {
+            self.setting_busy = Some(pid.to_string());
+            let store = self.store.clone();
+            let tx = self.tx.clone();
+            let pid2 = pid.to_string();
+            let mut st = ed.clone();
+            // 空字段按项目现状补齐再存，否则云端会留下一个「有任务没参数」的设置。
+            st.fill_defaults();
+            self.setting.insert(pid.to_string(), st.clone());
+            thread::spawn(move || {
+                let r = crate::setting::save(&store, &pid2, &st);
+                let _ = tx.send(Ev::SettingSaved(pid2, r));
+            });
+        }
+        if let Some(a) = action {
+            self.start_reload(pid, a);
+        }
+    }
+
+    // 跑一次编译 & 重载。参数就是上面那张表里的值——存没存过都能跑，
+    // 存过只是让它换设备还在。
+    fn start_reload(&mut self, pid: &str, action: &str) {
+        let st = self.setting.get(pid).cloned().unwrap_or_default();
+        self.reload_busy = Some(pid.to_string());
+        self.reload_out
+            .insert(pid.to_string(), format!("正在执行 {action}..."));
+        let req = crate::capability::ReloadReq {
+            action: action.to_string(),
+            root: st.root.clone(),
+            name: st.name.clone(),
+            live: st.live.clone(),
+            args: st.args.clone(),
+            mode: st.mode.clone(),
+            compile: st.compile.clone(),
+            elevate: false,
+            release_src: false,
+        };
+        let pid2 = pid.to_string();
         let tx = self.tx.clone();
         thread::spawn(move || {
+            let mut req = req;
             // 自己重载自己：先把 cargo 产物重命名挪开，链接器才写得进去
-            let release_src = action == "build" && crate::capability::is_src(&root, &name);
-            match crate::capability::run_sync(
-                &action,
-                &root,
-                &name,
-                &live,
-                &args,
-                &mode,
-                elevate,
-                release_src,
-            ) {
+            req.release_src =
+                req.action == "build" && crate::capability::is_src(&req.root, &req.name);
+            let self_src = req.release_src;
+            match crate::capability::run_sync(&req) {
                 Ok(r) => {
-                    let text = if r.code == 0 {
+                    let ok = r.code == 0;
+                    let text = if ok {
                         r.out
                     } else if !r.err.is_empty() {
                         r.err
                     } else {
                         format!("exit {}", r.code)
                     };
-                    let ok = r.code == 0;
-                    let _ = tx.send(Ev::ReloadDone(text));
-                    // 重载/重启成功后新实例已经起来，旧窗口让位
-                    if ok && (action == "build" || action == "restart") {
+                    let _ = tx.send(Ev::ReloadDone(pid2, text));
+                    // 重载 tba 自己：新实例已经起来，旧窗口让位
+                    if ok && self_src {
                         thread::sleep(std::time::Duration::from_millis(1200));
                         std::process::exit(0);
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Ev::ReloadDone(format!("ERR run:{e}")));
+                    let _ = tx.send(Ev::ReloadDone(pid2, format!("ERR run:{e}")));
                 }
             }
         });
@@ -2274,9 +2478,18 @@ pub fn hide_console() {}
 pub fn run(store: &Store) -> Result<(), String> {
     hide_console();
     let store = store.clone();
+    // 截图自验用：窗口大小可指定（TBA_UI_SIZE=1000x1500），否则默认 920x640。
+    // 卡片展开后有 tb skill / 通用 skill / 编译 & 重载 三块，默认高度截不全。
+    let size = std::env::var("TBA_UI_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some([w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?])
+        })
+        .unwrap_or([920.0, 640.0]);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 640.0])
+            .with_inner_size(size)
             .with_title("TBHub - 项目与能力"),
         ..Default::default()
     };
@@ -2523,10 +2736,53 @@ mod tests {
             .find(|l| l.contains("通用能力"))
             .expect("文案里应该有通用能力这一行");
         assert!(!line.contains("shot"), "关掉的能力不该出现在名单里: {line}");
-        assert!(line.contains("reload"), "开着的能力应该在名单里: {line}");
+        assert!(line.contains("git-main"), "开着的能力应该在名单里: {line}");
         assert!(
             !text.contains("## 一条命令"),
             "能力正文不该内联进文案，否则 token 白烧"
         );
+    }
+
+    // 编译 & 重载：设置里有编译指令就写进文案（agent 不用自己猜 rust/zig/go）；
+    // 停用后整段消失。
+    #[test]
+    fn setting_line_in_prompt() {
+        let app = tmp_app("settingprompt");
+        let mut st = crate::setting::ProjectSetting::default();
+        st.compile = "zig build -Doptimize=ReleaseFast".to_string();
+        st.root = r"D:\dev\z".to_string();
+        st.name = "z".to_string();
+        st.cache(&app.store, "p1").unwrap();
+
+        let text = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None, Lang::Zh);
+        assert!(text.contains("编译 & 重载"), "应有一段编译说明: {text}");
+        assert!(text.contains("zig build"), "应带编译指令: {text}");
+
+        st.on = false;
+        st.cache(&app.store, "p1").unwrap();
+        let off = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None, Lang::Zh);
+        assert!(!off.contains("编译 & 重载"), "停用后不该出现: {off}");
+    }
+
+    // 项目级取消勾选 = 这个项目不用：文案里不能出现，否则 agent 还是会去读。
+    #[test]
+    fn project_cap_off_hides_it_from_prompt() {
+        let app = tmp_app("capprompt2");
+        app.store.set_cap_off("p1", "shot", true).unwrap();
+        let text = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None, Lang::Zh);
+        let line = text
+            .lines()
+            .find(|l| l.contains("通用能力"))
+            .expect("文案里应该有通用能力这一行");
+        assert!(!line.contains("shot"), "本项目关掉的能力不该出现: {line}");
+        assert!(line.contains("git-main"), "其他能力照旧: {line}");
+
+        // 另一个项目不受影响（项目级，不是全局）
+        let other = crate::ops::agent_prompt_from(&app.store, "p2", "proj2", &[], None, Lang::Zh);
+        let line2 = other
+            .lines()
+            .find(|l| l.contains("通用能力"))
+            .expect("文案里应该有通用能力这一行");
+        assert!(line2.contains("shot"), "别的项目应该还在: {line2}");
     }
 }

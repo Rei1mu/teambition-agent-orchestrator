@@ -218,9 +218,15 @@ tba skill-init --project <id> --name shot       :: 只推一个
 
 开关只存本地 `data/switches.toml`。不回写 Teambition。
 
-**GUI 里能编辑**：项目卡片展开后，每条 skill 后面有「编辑」「删除」和开关勾选框，
-底下有「+ 新建 skill」。编辑窗写名字 + markdown 正文，保存即推到 Teambition（同名覆盖）。
-删除 = 归档那条任务。
+**GUI 里能编辑**：项目卡片展开后有两栏，**默认都收起**：
+
+- **tb skill**：云端、按项目隔离。每条有开关勾选 + 「编辑」「删除」，底下「+ 新建 skill」。
+  编辑窗写名字 + markdown 正文，保存即推到 Teambition（同名覆盖）。删除 = 归档那条任务。
+- **通用 skill**：本机、跨项目的能力，**只给勾选**（要改正文去「通用能力 → 能力」）。
+  勾选 = 这个项目用；取消 = 这个项目不用，开工文案里不列、agent 搜不到。
+
+分两栏是因为两者语义不同：tb skill 关掉只影响这个项目，通用能力关掉分「整台机器」
+和「这个项目」两级——混在一个列表里分不清关的是哪一级。
 
 **内置模板不再往项目里推。** `shot` / `git-main` / `release` / `gui-notes` 这些是
 跟项目无关的通用能力，现在放在本地「能力」库里（见上一节 `tba cap`），所有项目共用，
@@ -541,9 +547,17 @@ tba cap path                                   :: 打印 caps.toml 路径
 窗口里在 **通用能力 → 能力（可编辑）**：列表带开关，每条能「编辑」「删除」，
 顶部「新增」「恢复内置」。改完立刻落盘，agent 下次 `tba cap <名字>` 读到的就是新正文。
 
-内置 5 条：`reload`（重载）/ `shot`（截图）/ `git-main`（提交推送）/ `release`（发版）/
-`gui-notes`（写 GUI 的注意事项）。内置条目正文可改、删了能恢复（`tba cap restore`）。
-「重载」页顶上也能直接跳到这条能力的编辑窗。
+内置 5 条：`no-console`（禁止弹命令行）/ `shot`（截图）/ `git-main`（提交推送）/
+`release`（发版）/ `gui-notes`（写 GUI 的注意事项）。内置条目正文可改、删了能恢复
+（`tba cap restore`）。内置清单升级时（比如这次新增 `no-console`）会自动补进老用户的
+`caps.toml`，但**不会**把你删掉的条目重新灌回来。
+
+**每个项目还能单独关**：项目卡片里的「通用 skill」栏，取消勾选 = 这个项目不用，
+开工文案里不列、agent 也就搜不到。存在 `data/projects/<id>/caps-off.toml`，
+只记「不用的」，所以以后新增能力默认对所有项目可用。
+
+> 「重载」已经不是通用能力了：它跟具体项目绑定（编译指令、exe 名每个项目都不同），
+> 现在在项目卡片的「编译 & 重载」里，参数存 Teambition。见下面那节。
 
 ### git / GitButler
 
@@ -593,19 +607,47 @@ tba doctor
 git 版本 / `but` 版本 / 当前是不是 GitButler 项目 / 有哪些中文字体 / 三个轮询参数。
 排查「为什么跑不通」时先跑这个，别一个个试。
 
-### 重载
+### 编译 & 重载（每个项目一份设置）
 
 关键流程不靠文字描述，固化成一个命令：**编译 → 杀旧 → 复制校验 → 启动**。
+参数不写在代码里、也不只存本机，而是存 **Teambition 状态为 `setting` 的任务**
+（标题固定「项目设置」，备注是 TOML）——换设备还在，网页上也能看能改。
 
 ```bat
-tba reload build      :: 重载（编译+替换+启动）
-tba reload restart    :: 只重启，不编译
-tba reload kill       :: 杀掉运行副本
-tba reload status     :: 看是否在跑
+tba setting                                  :: 看本项目的设置（缺省读 .tba/project 绑定）
+tba setting guess                            :: 按项目文件猜编译指令，只打印不保存
+tba setting set --compile "zig build -Doptimize=ReleaseFast"
+tba setting set --root D:\dev\zigapp --name zigapp --mode copy --args ""
+tba setting off                              :: 停用：agent 文案里不再出现编译 & 重载
 ```
 
-窗口里在左侧「通用能力 → 重载」，可改项目目录 / exe 基名 / 运行副本路径，四个按钮同上，
-还能直接看 `target/reload.log` 末尾。
+`setting` 任务的备注长这样（`tba setting set` 和窗口都写它，手改也认）：
+
+```toml
+on = true
+compile = "cargo build --release"
+root = "D:\\dev\\mcp"
+name = "tba"
+mode = "rename"          # rename=改名直跑 / copy=副本运行
+live = ""
+args = "ui"
+```
+
+**编译指令空着怎么办**：不猜死。开工文案会写「编译指令未填，先探测项目类型」，
+agent 跑 `tba setting guess`（认 `Cargo.toml` / `build.zig` / `CMakeLists.txt` /
+`package.json` / `Makefile` / `go.mod`），确认后 `tba setting set --compile "..."` 写回
+Teambition。下一次谁打开这个项目都直接能用。
+
+```bat
+tba reload build                             :: 编译 + 替换 + 启动（读项目设置）
+tba reload restart                           :: 只重启，不编译
+tba reload kill  /  tba reload status        :: 杀 / 看是否在跑
+tba reload build --compile "make"            :: 临时覆盖编译指令（不写回设置）
+```
+
+窗口里在项目卡片的 **编译 & 重载** 栏（默认收起）：勾选启用、编译指令、项目目录、
+exe 基名、启动模式、运行副本、启动参数，按钮是「保存到 Teambition」「从云端重读」
+和「编译 & 重载 / 只重启 / 杀掉 / 状态」，结果和 `target/reload.log` 末尾就在下面。
 
 约定：
 
@@ -613,19 +655,14 @@ tba reload status     :: 看是否在跑
 |---|---|
 | 退出码 | 唯一真值。`0` 成功，`1` 失败 |
 | 成功输出 | `OK <pid>` / `OK` / `RUNNING <pid>` / `STOPPED` |
-| 失败输出 | stderr 一行 `ERR <step>:<msg>` |
-| cargo 输出 | 只进 `<root>\target\reload.log`，不占 agent 上下文 |
-| 运行副本 | 缺省 `<root>\target\release\<name>_test.exe`（跟产物同目录，`data/` 只有一份），cargo 产物从不直接运行 |
+| 失败输出 | stderr 一行 `ERR <step>:<msg>`（`compile` 就是编译指令非零退出） |
+| 编译输出 | 只进 `<root>\target\reload.log`，不占 agent 上下文 |
+| 运行副本 | 缺省 `<root>\target\release\<name>_test.exe`（跟产物同目录，`data/` 只有一份） |
 | 自己重载自己 | 自动转后台：脚本等本进程退出后再编译，绕开 exe 文件锁 |
-
-其他项目也能用（这就是「通用」的意思）：
-
-```bat
-tba reload build --root D:\other\project
-tba reload build --root D:\other\project --name myapp --live D:\other\project\run\myapp_test.exe
-```
+| 弹窗 | 编译/启动全程不弹控制台（`CREATE_NO_WINDOW`） |
 
 脚本随二进制内置，运行时释放到 `data/capabilities/reload.ps1`，不用单独维护。
+编译前会 `Set-Location` 到项目目录（参数来自设置，调用方的 cwd 靠不住）。
 工具链路径可用环境变量覆盖：`TBA_MSVC_BIN` / `TBA_MSVC_LIB` / `TBA_SDK_LIB` / `TBA_EXTRA_LIB` / `TBA_CARGO`。
 
 > 杀软对 `*_test.exe` 这类名字比较敏感，若误报拦截启动，用 `--live` 换个名字即可：

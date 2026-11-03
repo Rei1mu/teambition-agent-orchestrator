@@ -27,9 +27,11 @@ pub struct Out {
 }
 
 fn run_in(dir: &Path, prog: &str, args: &[&str]) -> Result<Out, String> {
-    let o = Command::new(prog)
-        .args(args)
-        .current_dir(dir)
+    let mut c = Command::new(prog);
+    c.args(args).current_dir(dir);
+    // 别弹黑窗：窗口里点「提交推送」时最明显。
+    crate::proc::hide(&mut c);
+    let o = c
         .output()
         .map_err(|e| format!("起不来 {prog}: {e}"))?;
     Ok(Out {
@@ -387,13 +389,13 @@ fn github_token() -> Option<String> {
         }
     }
     // 退回 git 凭据：用户 git push 能用，说明 token 在凭据管理器里。
-    let mut c = Command::new("git")
-        .args(["credential", "fill"])
+    let mut cmd = Command::new("git");
+    cmd.args(["credential", "fill"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    crate::proc::hide(&mut cmd);
+    let mut c = cmd.spawn().ok()?;
     {
         let mut si = c.stdin.take()?;
         si.write_all(b"protocol=https\nhost=github.com\n\n").ok()?;

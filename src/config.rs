@@ -44,6 +44,9 @@ pub const ALL_STAGES: [&str; 5] = [
 // 两个状态由 tb 自动建（taskflow-update 的 tfsJson upsert），零手动。
 pub const SKILL_STATE: &str = "skill";
 pub const MEMORY_STATE: &str = "mem";
+// 状态 setting = 这个项目的「编译 & 重载」参数（一条任务，标题固定「项目设置」，
+// 备注是 TOML）。跟 skill/mem 一样由 tb 自动建，用户不用手动加。
+pub const SETTING_STATE: &str = "setting";
 
 // 记忆任务标题：`{节名} · {正文首行摘要}`，节名靠它被识别。
 pub const MEMORY_TITLE_SEP: &str = " · ";

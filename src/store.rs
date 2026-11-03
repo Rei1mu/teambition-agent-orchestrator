@@ -399,6 +399,57 @@ impl Store {
         self.root.join("projects").join(project_id)
     }
 
+    // ---- 通用能力：项目级「不用」名单 ----
+    //
+    // 全局开关在 data/caps.toml（这台机器有没有这条能力）；这里存的是
+    // 「这个项目不用哪几条」——比如截图能力对纯文档项目没意义。
+    // 单独一个文件，不塞进 switches.toml：那个文件是 skill 开关（默认关），
+    // 语义相反（能力默认开），混一起迟早把默认值搞错。
+    pub fn cap_off_path(&self, project_id: &str) -> PathBuf {
+        self.project_dir(project_id).join("caps-off.toml")
+    }
+
+    pub fn load_cap_off(&self, project_id: &str) -> Vec<String> {
+        #[derive(serde::Deserialize, Default)]
+        struct F {
+            #[serde(default)]
+            off: Vec<String>,
+        }
+        match std::fs::read_to_string(self.cap_off_path(project_id)) {
+            Ok(s) => toml::from_str::<F>(&s).unwrap_or_default().off,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// on=false 表示「这个项目不用这条能力」。文件只记不用的，省得每次
+    /// 新增能力还要回头给所有项目补一条。
+    pub fn set_cap_off(&self, project_id: &str, name: &str, off: bool) -> Result<(), String> {
+        let mut list = self.load_cap_off(project_id);
+        list.retain(|n| n != name);
+        if off {
+            list.push(name.to_string());
+        }
+        list.sort();
+        let p = self.cap_off_path(project_id);
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d).map_err(|e| format!("建目录失败: {e}"))?;
+        }
+        if list.is_empty() {
+            let _ = std::fs::remove_file(&p);
+            return Ok(());
+        }
+        let body = format!(
+            "# 这个项目不用的通用能力（GUI「通用 skill」里取消勾选即写入）
+off = [{}]
+",
+            list.iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        std::fs::write(&p, body).map_err(|e| format!("写 {} 失败: {e}", p.display()))
+    }
+
     // ---- tb 共享记忆开关（项目级，独立文件）----
     //
     // 读失败/文件不存在一律返回默认（enabled=false），不让开关文件损坏把命令卡死。

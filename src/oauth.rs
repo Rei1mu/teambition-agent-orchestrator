@@ -21,9 +21,10 @@ pub const TOKEN_PAGE: &str = "https://open.teambition.com/user-mcp";
 pub fn open_browser(url: &str) {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        crate::proc::hide(&mut c);
+        let _ = c.spawn();
     }
     #[cfg(target_os = "macos")]
     {

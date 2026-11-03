@@ -367,6 +367,16 @@ fn cap_cmd(
     }
 }
 
+
+// 打印设置时把空值显式标出来：空字符串在终端里看不见，容易以为命令没生效。
+fn dash(s: &str) -> &str {
+    if s.trim().is_empty() {
+        "（空）"
+    } else {
+        s
+    }
+}
+
 pub fn run() -> Result<(), String> {
     let store = Store::new();
     store.ensure_dirs()?;
@@ -1520,33 +1530,75 @@ pub fn run() -> Result<(), String> {
         }
         Cmd::Reload {
             action,
+            project,
             root,
             name,
             live,
             args,
             mode,
+            compile,
             elevate,
         } => {
-            let root = root.unwrap_or_else(crate::capability::guess_root);
-            let name = name.unwrap_or_else(|| crate::capability::guess_name(&root));
-            let live = live.unwrap_or_else(|| crate::capability::default_live(&root, &name));
-            // 重载 TBHub 自己时默认把窗口开回来
-            let args = args.unwrap_or_else(|| {
-                if name == "tba" {
-                    "ui".to_string()
-                } else {
-                    String::new()
+            // 参数优先级：命令行 > 项目设置（Teambition 的 setting 任务）> 推断。
+            // 项目设置是「这个项目怎么编译/怎么起」的唯一真值，agent 不该每次
+            // 重新拼 --root/--name；命令行只用来临时覆盖。
+            let pid = project
+                .or_else(crate::ops::read_project_binding)
+                .unwrap_or_default();
+            let st = if pid.is_empty() {
+                None
+            } else {
+                // 先本地缓存（快、离线可用），没有再联网拉一次。
+                match crate::setting::ProjectSetting::load_cached(&store, &pid) {
+                    Some(s) => Some(s),
+                    None => crate::setting::fetch(&store, &pid).ok().flatten(),
                 }
-            });
-            let mode = mode.unwrap_or_else(|| "rename".to_string());
+            };
+            let st = st.unwrap_or_default();
+            let root = root
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| Some(st.root.clone()).filter(|s| !s.trim().is_empty()))
+                .unwrap_or_else(crate::capability::guess_root);
+            let name = name
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| Some(st.name.clone()).filter(|s| !s.trim().is_empty()))
+                .unwrap_or_else(|| crate::capability::guess_name(&root));
+            let mode = mode
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| Some(st.mode.clone()).filter(|s| !s.trim().is_empty()))
+                .unwrap_or_else(|| "rename".to_string());
+            let live = live
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| Some(st.live.clone()).filter(|s| !s.trim().is_empty()))
+                .unwrap_or_else(|| crate::capability::default_live(&root, &name));
+            // 重载 TBHub 自己时默认把窗口开回来
+            let args = args
+                .or_else(|| Some(st.args.clone()).filter(|s| !s.trim().is_empty()))
+                .unwrap_or_else(|| {
+                    if name == "tba" {
+                        "ui".to_string()
+                    } else {
+                        String::new()
+                    }
+                });
+            let compile = compile.unwrap_or_else(|| st.compile.clone());
             if mode != "rename" && mode != "copy" {
                 return Err(format!("未知模式: {mode}（可选 rename|copy）"));
             }
+            let req = crate::capability::ReloadReq {
+                action: action.clone(),
+                root,
+                name,
+                live,
+                args,
+                mode,
+                compile,
+                elevate,
+                release_src: false,
+            };
             match action.as_str() {
                 "status" | "kill" => {
-                    let r = crate::capability::run_sync(
-                        &action, &root, &name, &live, &args, &mode, elevate, false,
-                    )?;
+                    let r = crate::capability::run_sync(&req)?;
                     if r.code == 0 {
                         println!("{}", r.out);
                     } else {
@@ -1555,17 +1607,9 @@ pub fn run() -> Result<(), String> {
                 }
                 "build" | "restart" => {
                     // 自己重载自己：先把 cargo 产物重命名挪开，链接器才写得进去
-                    let release_src = action == "build" && crate::capability::is_src(&root, &name);
-                    let r = crate::capability::run_sync(
-                        &action,
-                        &root,
-                        &name,
-                        &live,
-                        &args,
-                        &mode,
-                        elevate,
-                        release_src,
-                    )?;
+                    let mut req = req;
+                    req.release_src = action == "build" && crate::capability::is_src(&req.root, &req.name);
+                    let r = crate::capability::run_sync(&req)?;
                     if r.code == 0 {
                         println!("{}", r.out);
                     } else {
@@ -1576,6 +1620,127 @@ pub fn run() -> Result<(), String> {
                     return Err(format!(
                         "未知动作: {other}（可选 build|restart|kill|status）"
                     ))
+                }
+            }
+        }
+        Cmd::Setting {
+            action,
+            project,
+            compile,
+            root,
+            name,
+            mode,
+            live,
+            args,
+            on,
+            off,
+        } => {
+            let pid = project
+                .or_else(crate::ops::read_project_binding)
+                .ok_or_else(|| {
+                    "没指定项目：加 --project <id>，或在项目目录跑 `tba bind <id>` 记一次绑定"
+                        .to_string()
+                })?;
+            match action.as_str() {
+                "show" | "get" => {
+                    let st = crate::setting::fetch(&store, &pid)?;
+                    match st {
+                        Some(s) => {
+                            println!("项目设置（{pid}）");
+                            println!("  启用        {}", if s.on { "是" } else { "否" });
+                            println!("  编译指令    {}", dash(&s.compile));
+                            println!("  项目目录    {}", dash(&s.root));
+                            println!("  exe 基名    {}", dash(&s.name));
+                            println!("  启动模式    {}", dash(&s.mode));
+                            println!("  运行副本    {}", dash(&s.live));
+                            println!("  启动参数    {}", dash(&s.args));
+                            if s.compile.trim().is_empty() {
+                                println!(
+                                    "\n编译指令是空的：先 `tba setting guess` 看探测结果，\
+                                     确认后 `tba setting set --compile \"...\"`。"
+                                );
+                            }
+                        }
+                        None => {
+                            println!("这个项目还没有设置（没有 status=setting 的任务）。");
+                            println!("看探测结果: tba setting guess");
+                            println!("存一份:   tba setting set");
+                        }
+                    }
+                }
+                "guess" => {
+                    let cached = crate::setting::ProjectSetting::load_cached(&store, &pid);
+                    let root = root
+                        .or_else(|| cached.as_ref().map(|s| s.root.clone()))
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_else(|_| ".".to_string())
+                        });
+                    let mut s = cached.unwrap_or_default();
+                    s.root = root;
+                    s.fill_defaults();
+                    println!("按项目文件探测（还没保存）：");
+                    println!("  编译指令    {}", dash(&s.compile));
+                    println!("  项目目录    {}", s.root);
+                    println!("  exe 基名    {}", s.name);
+                    if s.compile.trim().is_empty() {
+                        println!(
+                            "\n没认出构建文件。看一眼项目根（build.zig / package.json / Makefile / \
+                             CMakeLists.txt），确认后用 `tba setting set --compile \"...\"` 写进去。"
+                        );
+                    } else {
+                        println!("\n确认无误就 `tba setting set` 存到 Teambition（status=setting）。");
+                    }
+                }
+                "set" => {
+                    // 以云端现有值为底：只改传进来的字段，没传的保持原样。
+                    let mut s = crate::setting::fetch(&store, &pid)?
+                        .or_else(|| crate::setting::ProjectSetting::load_cached(&store, &pid))
+                        .unwrap_or_default();
+                    if let Some(v) = compile {
+                        s.compile = v;
+                    }
+                    if let Some(v) = root {
+                        s.root = v;
+                    }
+                    if let Some(v) = name {
+                        s.name = v;
+                    }
+                    if let Some(v) = mode {
+                        s.mode = v;
+                    }
+                    if let Some(v) = live {
+                        s.live = v;
+                    }
+                    if let Some(v) = args {
+                        s.args = v;
+                    }
+                    if on {
+                        s.on = true;
+                    }
+                    if off {
+                        s.on = false;
+                    }
+                    s.fill_defaults();
+                    if !s.ready() {
+                        return Err(format!(
+                            "设置不完整（项目目录「{}」/ exe 名「{}」），补 --root / --name",
+                            s.root, s.name
+                        ));
+                    }
+                    println!("{}", crate::setting::save(&store, &pid, &s)?);
+                    println!(
+                        "  编译指令 {} | 目录 {} | exe {} | 模式 {}",
+                        dash(&s.compile),
+                        s.root,
+                        s.name,
+                        s.mode
+                    );
+                }
+                other => {
+                    return Err(format!("未知动作: {other}（可选 show|set|guess）"));
                 }
             }
         }
