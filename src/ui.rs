@@ -159,6 +159,9 @@ pub struct App {
     // 截图自验用：TBA_UI_OPEN=1 时所有项目卡片和折叠区默认展开
     // （GUI 没法用命令行点按钮，不展开就截不到里面的内容）。
     debug_open: bool,
+    // 构建工具链状态。None = 还没算过（resolve 会跑 vswhere，不能每帧算）。
+    // 改完路径就置 None，下一帧重算。
+    tc: Option<crate::toolchain::Resolved>,
 }
 
 // skill 编辑窗的编辑态。正文是整段 markdown，直接存 String。
@@ -457,6 +460,8 @@ impl App {
             cap_edit: cap_edit0,
             cap_del: None,
             debug_open: std::env::var("TBA_UI_OPEN").as_deref() == Ok("1"),
+            // 懒加载：设置页第一次打开时才算（要跑 vswhere，启动时不抢时间）。
+            tc: None,
         };
         if !needs_token {
             app.reload_projects();
@@ -2065,13 +2070,15 @@ impl App {
         };
         let pid2 = pid.to_string();
         let tx = self.tx.clone();
+        // 工具链路径要从配置里读，所以 store 得跟着进线程。
+        let store = self.store.clone();
         thread::spawn(move || {
             let mut req = req;
             // 自己重载自己：先把 cargo 产物重命名挪开，链接器才写得进去
             req.release_src =
                 req.action == "build" && crate::capability::is_src(&req.root, &req.name);
             let self_src = req.release_src;
-            match crate::capability::run_sync(&req) {
+            match crate::capability::run_sync(&req, &store) {
                 Ok(r) => {
                     let ok = r.code == 0;
                     let text = if ok {
@@ -2155,8 +2162,138 @@ impl App {
 
     // 设置：字体大小等界面偏好。改动即时生效（update 里按 applied_font 差异重设样式）
     // 并写入 data/ui.toml，重启窗口也会保留。
+    // 构建工具链（MSVC + Windows SDK）。
+    //
+    // 为什么要有这块：编译 & 重载要靠 link.exe 和 SDK 的库，而每台机器的 VS
+    // 版本、SDK 位置都不一样（有的还在别的盘）。自动探测只覆盖标准位置，
+    // 探不到时让用户点三次「选择」，比让人去翻文档快得多。
+    fn draw_toolchain(&mut self, ui: &mut egui::Ui) {
+        use crate::toolchain as tc;
+        if self.tc.is_none() {
+            self.tc = Some(tc::resolve(&self.store));
+        }
+        let ready = self.tc.as_ref().map(|r| r.ready()).unwrap_or(false);
+        let mut pick: Option<u8> = None;
+        let mut do_guess = false;
+        let mut do_clear = false;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("构建工具链");
+                if ready {
+                    ui.colored_label(egui::Color32::from_rgb(0x2e, 0x7d, 0x32), "✓ 可用");
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(0xc6, 0x28, 0x28), "✗ 不可用");
+                }
+                if let Some(r) = &self.tc {
+                    ui.label(format!("来源: {}", r.source.label()));
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "编译 & 重载要用 MSVC 的 link.exe 和 Windows SDK 的库。只认 MSVC——\
+                     发布包就是它编的，GNU 编出来的东西行为不一样。",
+                )
+                .small()
+                .weak(),
+            );
+            match &self.tc {
+                Some(r) if r.ready() => {
+                    ui.label(egui::RichText::new(format!("link.exe: {}", r.tc.msvc_bin)).small());
+                    ui.label(egui::RichText::new(format!("SDK lib : {}", r.tc.sdk_lib)).small());
+                }
+                Some(r) => {
+                    for p in &r.problems {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xc6, 0x28, 0x28),
+                            format!("· {p}"),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "点下面三个「选择」指到对应目录（里面有那个文件就行）；\
+                             选完立刻验活，路径不对不会保存。",
+                        )
+                        .small(),
+                    );
+                }
+                None => {}
+            }
+            ui.horizontal(|ui| {
+                if ui.button("选择 link.exe 目录").clicked() {
+                    pick = Some(0);
+                }
+                if ui.button("选择 MSVC lib 目录").clicked() {
+                    pick = Some(1);
+                }
+                if ui.button("选择 SDK lib 目录").clicked() {
+                    pick = Some(2);
+                }
+                if ui.button("自动探测").clicked() {
+                    do_guess = true;
+                }
+                if ui.button("清除").clicked() {
+                    do_clear = true;
+                }
+            });
+        });
+
+        if let Some(which) = pick {
+            let (title, hint) = match which {
+                0 => ("选择 MSVC 的 bin 目录", "里面有 link.exe"),
+                1 => ("选择 MSVC 的 lib 目录", "里面有 libcmt.lib"),
+                _ => ("选择 Windows SDK 的 lib 目录", "里面有 kernel32.lib"),
+            };
+            // 上次选的目录还在这附近的话，从那儿开始找，省得每次从头翻。
+            let start = self
+                .tc
+                .as_ref()
+                .map(|r| match which {
+                    0 => r.tc.msvc_bin.clone(),
+                    1 => r.tc.msvc_lib.clone(),
+                    _ => r.tc.sdk_lib.clone(),
+                })
+                .filter(|p| !p.trim().is_empty())
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_dir());
+            let mut dlg = rfd::FileDialog::new().set_title(format!("{title}（{hint}）"));
+            if let Some(d) = start {
+                dlg = dlg.set_directory(d);
+            }
+            if let Some(dir) = dlg.pick_folder() {
+                let d = dir.display().to_string();
+                let res = match which {
+                    0 => tc::set(&self.store, Some(&d), None, None, None),
+                    1 => tc::set(&self.store, None, Some(&d), None, None),
+                    _ => tc::set(&self.store, None, None, Some(&d), None),
+                };
+                self.status = match res {
+                    Ok(m) => m,
+                    Err(e) => e,
+                };
+                self.tc = None;
+            }
+        }
+        if do_guess {
+            self.status = match tc::guess(&self.store) {
+                Ok(m) => m,
+                Err(e) => e,
+            };
+            self.tc = None;
+        }
+        if do_clear {
+            self.status = match tc::clear(&self.store) {
+                Ok(m) => m,
+                Err(e) => e,
+            };
+            self.tc = None;
+        }
+    }
+
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("设置");
+        // 工具链放最上面：编译不了是最容易卡住人的一件事，比字号重要。
+        self.draw_toolchain(ui);
+        ui.add_space(12.0);
         ui.label(
             "界面偏好会单独存到 data/ui.toml，不会碰 Teambition 配置（token 等）。",
         );

@@ -8,8 +8,6 @@ rustflags = ["-C", "link-arg=/STACK:8388608"]
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/STACK:8388608"]
 
-# GNU 工具链不认 /STACK 语法，同样的 8MB 要用 ld 的参数写法。
-# 本机没装 Windows SDK 时 msvc 链不了，只能靠 gnu 跑测试和本地验证，
-# 所以这条也得有，否则 `tba --version` 在 gnu debug 下一样会爆栈。
-[target.x86_64-pc-windows-gnu]
-rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
+# 只认 MSVC：发布包是 msvc 目标编的，GNU 工具链的 exe 依赖 mingw 运行时，
+# 行为不一致。这里不给 gnu 兜底——本机缺 SDK 时用 `tba toolchain set` 指定
+# 位置（GUI 设置页也能点），而不是换一套工具链悄悄编出不一样的东西。

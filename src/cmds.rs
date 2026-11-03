@@ -62,6 +62,21 @@ fn doctor(store: &Store) -> String {
             (None, false) => "没装（tba gitbutler install 可装到运行目录）".to_string(),
         }
     ));
+    // 构建工具链：编译 & 重载要靠 link.exe + SDK 的库。缺了 agent 会以为是代码问题，
+    // 其实是这台机器没配路径——这一条能直接定位，省掉一轮瞎试。
+    let tcr = crate::toolchain::resolve(store);
+    s.push_str(&format!(
+        "编译:  {}\n",
+        if tcr.ready() {
+            format!("MSVC 可用（{}）", tcr.source.label())
+        } else {
+            format!(
+                "不可用（{}）：{} —— 用 tba toolchain set 指定位置",
+                tcr.source.label(),
+                tcr.problems.join("；")
+            )
+        }
+    ));
     if let Ok(root) = crate::git::repo_root() {
         s.push_str(&format!(
             "仓库:  {}（GitButler 项目: {}）\n",
@@ -417,6 +432,10 @@ pub fn run() -> Result<(), String> {
             | Cmd::Config { .. }
             | Cmd::Login { .. }
             | Cmd::Logout { .. }
+            // 工具链和自检是「装东西之前」就要能跑的命令：没装 but 也得能查
+            // 为什么编不了，否则用户卡在一个查不了的状态里。
+            | Cmd::Toolchain { .. }
+            | Cmd::Doctor
             | Cmd::Ui
     );
     if !gb_exempt && std::env::var("TBA_SKIP_GITBUTLER").is_err() {
@@ -436,6 +455,66 @@ pub fn run() -> Result<(), String> {
     }
 
     match cmd {
+        Cmd::Toolchain {
+            action,
+            msvc_bin,
+            msvc_lib,
+            sdk_lib,
+            extra_lib,
+        } => {
+            use crate::toolchain as tc;
+            match action.as_str() {
+                "set" => {
+                    if msvc_bin.is_none()
+                        && msvc_lib.is_none()
+                        && sdk_lib.is_none()
+                        && extra_lib.is_none()
+                    {
+                        return Err(
+                            "至少要给一个：--msvc-bin / --msvc-lib / --sdk-lib / --extra-lib"
+                                .to_string(),
+                        );
+                    }
+                    println!(
+                        "{}",
+                        tc::set(
+                            &store,
+                            msvc_bin.as_deref(),
+                            msvc_lib.as_deref(),
+                            sdk_lib.as_deref(),
+                            extra_lib.as_deref()
+                        )?
+                    );
+                }
+                "guess" => println!("{}", tc::guess(&store)?),
+                "clear" => println!("{}", tc::clear(&store)?),
+                "path" => println!("{}", tc::path(&store).display()),
+                _ => {
+                    let r = tc::resolve(&store);
+                    println!(
+                        "构建工具链（MSVC）：{}",
+                        if r.ready() { "可用" } else { "不可用" }
+                    );
+                    println!("  来源: {}", r.source.label());
+                    println!("{}", tc::show(&r.tc));
+                    if r.ready() {
+                        println!("\n✓ link.exe / libcmt.lib / kernel32.lib 都在");
+                    } else {
+                        println!("\n✗ 还差：");
+                        for p in &r.problems {
+                            println!("  - {p}");
+                        }
+                        println!("\n指定位置（换成你机器上的实际目录）：");
+                        println!("  tba toolchain set --msvc-bin <dir> --msvc-lib <dir> --sdk-lib <dir>");
+                        println!("    --msvc-bin: <VS>/VC/Tools/MSVC/<ver>/bin/Hostx64/x64");
+                        println!("    --msvc-lib: <VS>/VC/Tools/MSVC/<ver>/lib/x64");
+                        println!("    --sdk-lib : <Windows Kits>/10/Lib/<ver>/um/x64");
+                        println!("装的是标准位置就先用 `tba toolchain guess` 自动填一次。");
+                        return Err("构建工具链不可用".to_string());
+                    }
+                }
+            }
+        }
         Cmd::GitButler { action, path } => match action.as_str() {
             "set" => {
                 let p = path.ok_or("要指定 --path <but.exe 路径，或它所在目录>")?;
@@ -1621,7 +1700,7 @@ pub fn run() -> Result<(), String> {
             };
             match action.as_str() {
                 "status" | "kill" => {
-                    let r = crate::capability::run_sync(&req)?;
+                    let r = crate::capability::run_sync(&req, &store)?;
                     if r.code == 0 {
                         println!("{}", r.out);
                     } else {
@@ -1632,7 +1711,7 @@ pub fn run() -> Result<(), String> {
                     // 自己重载自己：先把 cargo 产物重命名挪开，链接器才写得进去
                     let mut req = req;
                     req.release_src = action == "build" && crate::capability::is_src(&req.root, &req.name);
-                    let r = crate::capability::run_sync(&req)?;
+                    let r = crate::capability::run_sync(&req, &store)?;
                     if r.code == 0 {
                         println!("{}", r.out);
                     } else {

@@ -95,8 +95,26 @@ fn build_cmd(req: &ReloadReq) -> Result<Command, String> {
 
 // 同步执行：脚本里完成 编译 -> 杀旧 -> (复制校验) -> 启动，退出码即结果。
 // mode: "rename" 改名直跑 / "copy" 副本运行。
-pub fn run_sync(req: &ReloadReq) -> Result<Outcome, String> {
+pub fn run_sync(req: &ReloadReq, store: &crate::store::Store) -> Result<Outcome, String> {
     let mut cmd = build_cmd(req)?;
+    // 编译要 link.exe 和 SDK 的库。路径由 toolchain 解析（环境变量 > 手选 > 自动探测），
+    // 脚本里不再写死——每台机器 VS 版本和 SDK 位置都不同，写死只会让别人的机器
+    // 报一句「找不到 link.exe」。
+    //
+    // 只有「cargo 编译」才需要 MSVC：zig / go / npm 走的是项目自己的编译指令，
+    // 缺 MSVC 不影响它们。restart / kill / status 更不需要。
+    let r = crate::toolchain::resolve(store);
+    let needs_msvc = req.action == "build" && req.compile.trim().is_empty();
+    if needs_msvc && !r.ready() {
+        return Err(format!(
+            "构建工具链不可用（{}）：\n  - {}\n\n指定一次位置就行：\n  \
+             tba toolchain set --msvc-bin <.../VC/Tools/MSVC/<ver>/bin/Hostx64/x64> \
+             --msvc-lib <.../VC/Tools/MSVC/<ver>/lib/x64> --sdk-lib <.../Windows Kits/10/Lib/<ver>/um/x64>",
+            r.source.label(),
+            r.problems.join("\n  - ")
+        ));
+    }
+    crate::toolchain::apply_env(&mut cmd, &r.tc);
     let out = cmd
         .output()
         .map_err(|e| format!("启动 reload.ps1 失败: {e}"))?;

@@ -15,6 +15,7 @@ mod setting;
 mod shot;
 mod store;
 mod tb;
+mod toolchain;
 mod tools;
 mod ui;
 
@@ -62,6 +63,26 @@ pub enum Cmd {
         /// set 用：but.exe 路径，或它所在的目录
         #[arg(long)]
         path: Option<String>,
+    },
+    /// 构建工具链（MSVC + Windows SDK）：status | set | guess | clear。
+    /// 只认 MSVC，不做 gnu 兜底；标准位置找不到就用 set 指定一次
+    #[command(name = "toolchain", visible_alias = "tc")]
+    Toolchain {
+        /// status | set | guess | clear
+        #[arg(default_value = "status")]
+        action: String,
+        /// MSVC 的 bin 目录（link.exe 所在）：VC/Tools/MSVC/<ver>/bin/Hostx64/x64
+        #[arg(long = "msvc-bin")]
+        msvc_bin: Option<String>,
+        /// MSVC 的 lib 目录（libcmt.lib 所在）：VC/Tools/MSVC/<ver>/lib/x64
+        #[arg(long = "msvc-lib")]
+        msvc_lib: Option<String>,
+        /// Windows SDK 的 lib 目录（kernel32.lib 所在）。多个用 ; 分隔
+        #[arg(long = "sdk-lib")]
+        sdk_lib: Option<String>,
+        /// 额外的库目录（可选）
+        #[arg(long = "extra-lib")]
+        extra_lib: Option<String>,
     },
     /// 列出企业下所有项目
     Projects,

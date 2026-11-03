@@ -108,7 +108,7 @@ $env:PATH -split ';' -contains "$env:USERPROFILE\tba"
 | `TBA_AGENT` | 会话标识，覆盖 `.tba/session` |
 | `TBA_SKIP_GITBUTLER` | 跳过 GitButler 检查（排查用） |
 | `TBA_BUT` | 指定 `but` 路径（exe 或目录都行）；也认 `GITBUTLER_BIN` / `BUT_BIN` |
-| `TBA_MSVC_BIN` / `TBA_MSVC_LIB` / `TBA_SDK_LIB` | 重载能力的工具链路径 |
+| `TBA_MSVC_BIN` / `TBA_MSVC_LIB` / `TBA_SDK_LIB` | 构建工具链路径，覆盖 `tba toolchain` 的设置 |
 | `TBA_EXTRA_LIB` / `TBA_CARGO` | 同上，附加库目录 / cargo 路径 |
 
 安装包**不写 token**。token 由 `tba login` 写进 `data/config.toml`，属于用户数据，升级时不要覆盖。
@@ -687,10 +687,41 @@ exe 基名、启动模式、运行副本、启动参数，按钮是「保存到 
 
 脚本随二进制内置，运行时释放到 `data/capabilities/reload.ps1`，不用单独维护。
 编译前会 `Set-Location` 到项目目录（参数来自设置，调用方的 cwd 靠不住）。
-工具链路径可用环境变量覆盖：`TBA_MSVC_BIN` / `TBA_MSVC_LIB` / `TBA_SDK_LIB` / `TBA_EXTRA_LIB` / `TBA_CARGO`。
+工具链路径不在脚本里写死，由 `tba toolchain` 解析后传进去（见下一节）。
 
 > 杀软对 `*_test.exe` 这类名字比较敏感，若误报拦截启动，用 `--live` 换个名字即可：
 > `tba reload build --live D:\dev\mcp\target\release\tb_run.exe`
+
+### 构建工具链（MSVC + Windows SDK）
+
+`reload build` 走 `cargo +stable-x86_64-pc-windows-msvc`，要 `link.exe` 和 Windows SDK
+的库（`kernel32.lib` 等）。**只认 MSVC**：发布包就是它编的，GNU 工具链产出的 exe 依赖
+mingw 运行时，窗口和路径行为都不一样，所以不做兜底——找不到就明确报错，让用户指定一次。
+
+路径按三条来源解析，优先级从高到低：
+
+1. 环境变量 `TBA_MSVC_BIN` / `TBA_MSVC_LIB` / `TBA_SDK_LIB` / `TBA_EXTRA_LIB`（CI、临时覆盖）
+2. `data/toolchain.toml`（手选一次，之后一直用）
+3. 自动探测（`vswhere` 找 VS + `Windows Kits\10\Lib\<ver>`）
+
+自动探测只覆盖标准位置，**不扫盘**：装了 VS 预览版或好几个 SDK 版本时，扫盘很容易
+挑错那一份，让用户点一次「选择」更准。
+
+```bat
+tba toolchain                     :: 状态：可用/不可用、来源、还差什么
+tba toolchain guess               :: 标准位置探测一遍并保存
+tba toolchain set --sdk-lib "D:/d/winsdk_libs"
+tba toolchain set --msvc-bin "<VS>/VC/Tools/MSVC/<ver>/bin/Hostx64/x64" ^
+                  --msvc-lib "<VS>/VC/Tools/MSVC/<ver>/lib/x64" ^
+                  --sdk-lib  "<Windows Kits>/10/Lib/<ver>/um/x64"
+tba toolchain clear               :: 清掉手选，回到自动探测
+```
+
+只给一项也行，其余字段保留原值（探测到的或上次存的）。保存前会验活：三个目录里
+分别要能找到 `link.exe` / `libcmt.lib` / `kernel32.lib`，找不到就不写，错误直接说
+缺哪个文件——比「选错了一层目录」这种猜谜强。
+
+窗口里在 **设置 → 构建工具链**：状态 + 来源 + 三个「选择…目录」按钮 + 自动探测 / 清除。
 
 ## 共享记忆
 

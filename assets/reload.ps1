@@ -80,9 +80,12 @@ if (-not (Test-Path $TARGET)) { New-Item -ItemType Directory -Force -Path $TARGE
 $LOG = Join-Path $TARGET "reload.log"
 
 # ---- toolchain ----
-$MSVC_BIN = if ($env:TBA_MSVC_BIN) { $env:TBA_MSVC_BIN } else { "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64" }
-$MSVC_LIB = if ($env:TBA_MSVC_LIB) { $env:TBA_MSVC_LIB } else { "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.44.35207\lib\x64" }
-$SDK_LIB  = if ($env:TBA_SDK_LIB)  { $env:TBA_SDK_LIB }  else { "D:\d\winsdk_libs" }
+# 路径由 tba 解析好、通过环境变量传进来（自动探测 / 手选 / CI 覆盖）。
+# 脚本里**不写死**：每台机器 VS 版本和 SDK 位置都不一样，写死只会让别人的机器
+# 报一句看不懂的「找不到 link.exe」。缺了就让用户跑 tba toolchain set。
+$MSVC_BIN = $env:TBA_MSVC_BIN
+$MSVC_LIB = $env:TBA_MSVC_LIB
+$SDK_LIB  = $env:TBA_SDK_LIB
 $EXTRA_LIB = $env:TBA_EXTRA_LIB
 $CARGO    = if ($env:TBA_CARGO) { $env:TBA_CARGO } else { "C:\Users\user\.cargo\bin\cargo.exe" }
 
@@ -253,8 +256,11 @@ switch ($Action) {
         if ($ReleaseSrc) {
             try { Release-Src } catch { Out-Err "release" "$($_.Exception.Message)" }
         }
-        $env:PATH = "$MSVC_BIN;$env:PATH"
-        $env:LIB = if ($EXTRA_LIB) { "$MSVC_LIB;$SDK_LIB;$EXTRA_LIB" } else { "$MSVC_LIB;$SDK_LIB" }
+        # 空串不能拼进 PATH/LIB：PATH 里的空段会被当成当前目录，LIB 里的空段
+        # 会让链接器多扫一遍 cwd。只在有值时才拼。
+        if ($MSVC_BIN) { $env:PATH = "$MSVC_BIN;$env:PATH" }
+        $libParts = @($MSVC_LIB, $SDK_LIB, $EXTRA_LIB) | Where-Object { $_ }
+        if ($libParts) { $env:LIB = $libParts -join ";" }
         if ($Compile) {
             # 编译指令来自项目设置（Teambition 的 setting 任务）：zig / go / npm 各不相同。
             # 用 cmd /c 跑整串，才能带参数和管道；输出照样进日志，不回灌调用方。
@@ -265,6 +271,11 @@ switch ($Action) {
                 Out-Err "compile" "exit $LASTEXITCODE (see $LOG)"
             }
         } else {
+            # 走到这里才是真正的 cargo 编译：没有 MSVC 就直接报清楚，
+            # 别让 cargo 抛一堆「link.exe not found」让人猜。
+            if (-not $MSVC_BIN -or -not $MSVC_LIB -or -not $SDK_LIB) {
+                Out-Err "toolchain" "MSVC/SDK not configured (run: tba toolchain set --msvc-bin <dir> --msvc-lib <dir> --sdk-lib <dir>)"
+            }
             & $CARGO +$Triple build --release *>&1 | Out-File -FilePath $LOG -Append -Encoding utf8
             if ($LASTEXITCODE -ne 0) {
                 Restore-Src
