@@ -47,7 +47,7 @@ Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出
 
 安装时做三件事，缺一个 agent 就找不到命令：
 
-1. 把 `tba.exe`（CLI + GUI）和 `tbaw.exe`（双击入口，GUI 子系统）放到安装目录（**可自定义**，安装页第二屏能改）。
+1. 把 `tba.exe`（CLI + GUI）和 `tbagui.exe`（双击入口，GUI 子系统）放到安装目录（**可自定义**，安装页第二屏能改）。
 2. 把安装目录写进**用户 PATH**（安装页「附加选项」里的可勾选项，默认勾上；取消就不写）。
 3. `data/` 不预置，首次运行自动生成（exe 同目录）。
 
@@ -66,8 +66,8 @@ Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出
 | 项 | 效果 | 可取消 |
 |---|---|---|
 | 把 tba 加到 PATH | 写进用户 PATH，新终端能直接敲 `tba` | 是（取消时会把已有条目摘掉） |
-| 开始菜单快捷方式 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\TBA\TBA.lnk`（指向 `tbaw.exe`，双击不闪黑框） | 是 |
-| 桌面快捷方式 | `%USERPROFILE%\Desktop\TBA.lnk`（同上，指向 `tbaw.exe`） | 是 |
+| 开始菜单快捷方式 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\TBA\TBA.lnk`（指向 `tbagui.exe`，双击不闪黑框） | 是 |
+| 桌面快捷方式 | `%USERPROFILE%\Desktop\TBA.lnk`（同上，指向 `tbagui.exe`） | 是 |
 | 卸载入口 | 同上开始菜单目录 `Uninstall TBA.lnk` | 否，始终创建 |
 
 卸载入口不跟着快捷方式走：取消了开始菜单图标，也得留一条卸载的路。
@@ -839,7 +839,7 @@ font = ""          # 空 = 自动（黑体优先）；也可填 simhei / msyh / 
 就给它分配控制台，早于 `main()`——代码里只能等跑起来再关，Win11 默认终端是 Windows
 Terminal，那一下还得等 WT 起窗，看着就是黑框闪一下。
 
-所以双击入口单独给一个 `tbaw.exe`：**GUI 子系统**，从创建起就没有控制台。它只做一件事，
+所以双击入口单独给一个 `tbagui.exe`：**GUI 子系统**，从创建起就没有控制台。它只做一件事，
 用 `CREATE_NO_WINDOW` 把 `tba.exe ui` 拉起来然后自己退出。安装包里的桌面 / 开始菜单
 快捷方式都指向它；PATH 里放的仍然是 `tba.exe`，命令行用法完全不变。
 
