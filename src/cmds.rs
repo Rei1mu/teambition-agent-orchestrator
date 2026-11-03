@@ -635,6 +635,19 @@ pub fn run() -> Result<(), String> {
             }
         }
         Cmd::Projects => {
+            // 离线：读上次同步下来的项目列表（缓存由在线时的 projects / 窗口自动写）。
+            if store.load_config().offline() {
+                let list = store.load_projects_cache();
+                if list.is_empty() {
+                    eprintln!(
+                        "离线模式：本地还没有项目缓存。联网跑一次 `tba projects` 就会存下来。"
+                    );
+                }
+                for (id, name) in &list {
+                    println!("{id}\t{name}");
+                }
+                return Ok(());
+            }
             let mut ctx = Ctx::new(store.clone(), false)?;
             let projects = ctx.list_projects()?;
             store.save_projects_cache(
@@ -738,7 +751,18 @@ pub fn run() -> Result<(), String> {
             println!("下一步: tb prompt --project {}", p.id);
         }
         Cmd::Skills { project } => {
-            let skills = list_skills(&store, &project)?;
+            // 离线：读项目能力的本地缓存（在线 list_skills 每次都会写一份）。
+            let skills = if store.load_config().offline() {
+                let cached = crate::ops::cached_skills(&store, &project);
+                if cached.is_empty() {
+                    eprintln!(
+                        "离线模式：这个项目还没有能力缓存。联网打开一次（或跑 `tba skills --project {project}`）就会存下来。"
+                    );
+                }
+                cached
+            } else {
+                list_skills(&store, &project)?
+            };
             let switches = store.load_switches();
             let sw = switches.get(&project).cloned().unwrap_or_default();
             if skills.is_empty() {
@@ -757,7 +781,12 @@ pub fn run() -> Result<(), String> {
         Cmd::Skill { name, project } => {
             // 按需读取：agent 文案里只列 skill 名字，用到哪个才来读哪个，
             // 不再把全部 skill 全文塞进文案（那是文案 token 的最大头）。
-            let skills = list_skills(&store, &project)?;
+            // 离线时读缓存——文案里写的就是 `tba skill <名字>`，断网也得能拿到正文。
+            let skills = if store.load_config().offline() {
+                crate::ops::cached_skills(&store, &project)
+            } else {
+                list_skills(&store, &project)?
+            };
             let k = skills
                 .iter()
                 .find(|k| k.name == name)

@@ -7,6 +7,13 @@ use serde_json::json;
 
 // 高层业务操作。CLI / MCP / UI 三处共用。
 
+/// 离线模式下所有「要连 Teambition」的操作统一报这句。
+/// 顺手把本地还能用的命令列出来，省得人去翻文档。
+pub const OFFLINE_ERR: &str = "当前是离线模式（不用 Teambition），这个操作需要联网。\n\
+本地仍然可用：tba projects（读缓存）/ tba skills / tba skill（读缓存）/ \
+tba setting text / tba reload / tba caps / tba shot / tba ui。\n\
+要联网：把 data/config.toml 里的 offline 改成 false，或去掉环境变量 TBA_OFFLINE。";
+
 // 工作流状态的 kind 三态（Teambition）：start=开始 / unset=进行中 / end=结束。
 // 只有 kind=end 的任务才算「已完成」(isDone=true)。按 TBHub 的阶段名固定分配：
 //   未完成=start（新任务落这里）、进行中=unset、已解决/已完成=end。
@@ -175,6 +182,12 @@ pub struct Ctx {
 
 impl Ctx {
     pub fn new(store: Store, refresh: bool) -> Result<Ctx, String> {
+        // 离线模式的唯一闸口：所有要连 Teambition 的操作都从 Ctx::new 进来，
+        // 在这里拦一次就够，而且能给出「哪些还能用」的清单——
+        // 比让用户对着「没有 token / 连接失败」猜半天强。
+        if store.load_config().offline() {
+            return Err(OFFLINE_ERR.to_string());
+        }
         let mut tb = Tb::new(store)?;
         tb.discover(refresh)?;
         let overrides = tb.cfg.tool_overrides.clone();
@@ -2844,7 +2857,12 @@ pub fn list_skills(store: &Store, project_id: &str) -> Result<Vec<SkillItem>, St
     // skill = 状态为 skill 的普通任务（不是任务类型、不限看板列）。
     let state = match ctx.find_state(project_id, SKILL_STATE)? {
         Some(s) => s,
-        None => return Ok(Vec::new()),
+        None => {
+            // 云端明确「没有 skill 状态」= 这个项目就是没有 skill，缓存也清空，
+            // 免得离线时还显示一批早就不存在的能力。
+            save_skills_cache(store, project_id, &[]);
+            return Ok(Vec::new());
+        }
     };
     let tasks = ctx.list_tasks(project_id, &state)?;
     if tasks.is_empty() {
@@ -2873,7 +2891,61 @@ pub fn list_skills(store: &Store, project_id: &str) -> Result<Vec<SkillItem>, St
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    // 顺手落一份本地缓存：离线模式（不用 Teambition）就靠它把项目能力摆出来。
+    // 写失败不影响正常流程——缓存只是离线时的兜底。
+    save_skills_cache(store, project_id, &out);
     Ok(out)
+}
+
+/// 项目能力的本地缓存：data/projects/<id>/skills.json。
+///
+/// 为什么缓存 skill：能力本质是一段提示词，勾选和拼装都在本地完成，只有「存哪儿」
+/// 依赖 Teambition。离线时读这份缓存，就能照常展开项目、勾选能力、复制开工文案。
+pub fn save_skills_cache(store: &Store, project_id: &str, items: &[SkillItem]) {
+    let arr: Vec<serde_json::Value> = items
+        .iter()
+        .map(|s| {
+            json!({
+                "task_id": s.task_id,
+                "name": s.name,
+                "content": s.content,
+                "on": s.on,
+            })
+        })
+        .collect();
+    let p = skills_cache_path(store, project_id);
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&arr) {
+        let _ = std::fs::write(p, s);
+    }
+}
+
+/// 读能力缓存。没有缓存返回空 vec（离线时就是「这个项目还没同步过」）。
+pub fn cached_skills(store: &Store, project_id: &str) -> Vec<SkillItem> {
+    let Ok(s) = std::fs::read_to_string(skills_cache_path(store, project_id)) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&s) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SkillItem> = v
+        .iter()
+        .map(|x| SkillItem {
+            task_id: x["task_id"].as_str().unwrap_or_default().to_string(),
+            name: x["name"].as_str().unwrap_or_default().to_string(),
+            content: x["content"].as_str().unwrap_or_default().to_string(),
+            on: x["on"].as_bool().unwrap_or(false),
+        })
+        .filter(|s| !s.name.trim().is_empty())
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn skills_cache_path(store: &Store, project_id: &str) -> std::path::PathBuf {
+    store.project_dir(project_id).join("skills.json")
 }
 
 pub fn push_skill(

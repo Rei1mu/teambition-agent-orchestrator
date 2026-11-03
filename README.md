@@ -137,6 +137,36 @@ tba gitbutler clear      :: 清掉手选路径，回到自动检测
 - 缺 GitButler/git 时，任何 `tba` 命令都会先打印引导再退出；排查问题可用 `TBA_SKIP_GITBUTLER=1` 强制跳过。
 - 窗口里 **设置页** 有一张 GitButler 状态卡（版本 + 来源 + 一键安装 + 指定位置），悬停版本号可看完整路径。它原来置顶在项目列表上方，一占就是小半屏，现在搬进设置；只有**缺件时**项目页顶部才留一行橙字提醒 + 「去设置」。窗口是全局的，「当前目录配没配」不在窗口里判断——真正用到 `but` 的是 `tba git`，它按你执行命令的那个项目目录自己判断（普通仓库走 git，GitButler 项目走 `but commit`）。
 
+## 离线模式（不用 Teambition）
+
+`data/config.toml` 里 `offline = true`，或环境变量 `TBA_OFFLINE=1`（`=0` 强制关，优先级高于配置）。
+打开后**完全不连 Teambition**，也不需要 token：
+
+| 能力 | 离线时 |
+|---|---|
+| 项目列表 | 读上次同步的缓存（`data/projects_cache.json`） |
+| 项目能力（tb skill） | 读缓存 `data/projects/<id>/skills.json`；勾选照常生效 |
+| 通用能力（`data/caps.toml`） | 本来就在本地，完全可用 |
+| 开工文案 / 复制文案 | **照常生成**——拼装全在本地，不依赖云端 |
+| 编译 & 重载 | 照常可用（本地）；「保存」写本地缓存 `setting.toml` |
+| 领任务 / done / ask / wait / 刷新项目 | 不可用，命令直接说明原因 |
+| 编辑/新建/删除 skill | 不可用（要写云端），按钮在窗口里置灰 |
+
+**缓存是联网时自动写的**：`tba projects`、`tba skills`、窗口打开项目时都会顺手落一份。
+所以第一次用某个项目前，先联网打开过一次。
+
+窗口里切换：**设置页 → 离线模式**（勾上立刻生效，不用重启）。
+侧栏和标题旁会出现橙色「离线」标记。
+
+```bat
+set TBA_OFFLINE=1 && tba projects          :: 读缓存的项目列表
+set TBA_OFFLINE=1 && tba skills --project <id>
+set TBA_OFFLINE=1 && tba setting text      :: 开工文案里的编译段（纯本地）
+```
+
+> 离线时点需要联网的操作会直接报一句 `当前是离线模式…`，并列出本地还能用的命令，
+> 而不是让人对着「token 无效」猜。
+
 ## 快速开始
 
 第一次使用要先拿 Teambition 访问令牌。
@@ -771,16 +801,20 @@ tba toolchain clear               :: 清掉手选，回到自动探测
 - 或者单独装：https://developer.microsoft.com/windows/downloads/windows-sdk/
 
 窗口里在 **设置 → 构建工具链**：状态 + 来源 + 三个「选择…目录」按钮 + 自动探测 / 清除。
-缺 MSVC 或 SDK 时，下面会多一行「手动安装」，**只给真正缺的那一项**：
+「手动安装」那一行**常显**——装好了也可能要重装、升级、换盘或换机器，
+只在缺件时给按钮等于装过的人想看下载地址都看不到：
 
-| 缺什么 | 按钮 | 打开的页面 |
+| 装什么 | 按钮 | 打开的页面 |
 |---|---|---|
-| `link.exe`（MSVC） | 下载 VS 生成工具（含 MSVC） | https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
-| `kernel32.lib`（SDK） | 下载 Windows SDK | https://developer.microsoft.com/windows/downloads/windows-sdk/ |
+| MSVC（`link.exe`） | 下载 VS 生成工具（含 MSVC） | https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
+| Windows SDK（`kernel32.lib`） | 下载 Windows SDK | https://developer.microsoft.com/windows/downloads/windows-sdk/ |
 
 点按钮用系统默认浏览器打开，不用自己搜。装 VS 生成工具时勾「使用 C++ 的桌面开发」，
 它自带 MSVC 和 Windows SDK；装完回来点「自动探测」就填好了。浏览器没弹出来，
 把鼠标停在按钮上能看到完整地址，手动打开也行。
+
+GitButler / git 同理：设置页那张卡里的「GitButler 下载页」「git 下载页」
+「安装到运行目录」也**常显**，已装好照样能重装或升级。
 
 ## 共享记忆
 

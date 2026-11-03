@@ -246,6 +246,17 @@ pub struct Config {
     // 多久查一次邮箱（IMAP 一次往返比读评论贵，所以默认比评论间隔长）。
     #[serde(default = "default_mail_poll")]
     pub mail_poll_secs: u64,
+
+    // ---- 离线模式 ----
+    //
+    // 不开 Teambition 也能用：项目列表、项目能力（skill）、开工文案全部走本地缓存，
+    // 通用能力（data/caps.toml）和编译 & 重载设置本来就是本地的，照旧。
+    // 需要云端才成立的操作（领任务、done、ask/wait、刷新项目）在离线时直接说明不可用。
+    //
+    // 为什么要有：项目可能在内网/断网环境，或者不想把项目结构同步到云端；
+    // 但「生成一份开工文案给 agent」这件事本身不需要云端。
+    #[serde(default)]
+    pub offline: bool,
 }
 
 // 默认值。字段一多就不能靠 derive：每个字段的默认值不一样，
@@ -282,6 +293,7 @@ impl Default for Config {
             wait_timeout_secs: default_wait_timeout(),
             wait_interval_secs: default_wait_interval(),
             mail_poll_secs: default_mail_poll(),
+            offline: false,
         }
     }
 }
@@ -302,6 +314,22 @@ impl Config {
 
     pub fn token(&self) -> Option<&str> {
         self.access_token.as_deref().filter(|t| !t.is_empty())
+    }
+
+    /// 这次运行是不是离线模式。
+    ///
+    /// 环境变量优先（`TBA_OFFLINE=1` 强开、`=0` 强关），没设就看 config.toml——
+    /// 这样脚本/排查能临时切换，不用改配置文件。
+    pub fn offline(&self) -> bool {
+        match std::env::var("TBA_OFFLINE")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("1") | Some("true") | Some("on") | Some("yes") => true,
+            Some("0") | Some("false") | Some("off") | Some("no") => false,
+            _ => self.offline,
+        }
     }
 }
 
@@ -393,5 +421,18 @@ mod tests {
     fn tasklists_ready_rejects_chinese_names() {
         // 用户拍板用数字；中文列名视为不齐，引导改成数字。
         assert!(!tasklists_ready(&["待处理", "进行中", "待回复", "已解决", "关闭"]));
+    }
+
+    // 离线开关要能落盘、读回来。默认在线（不能把老配置读成离线，
+    // 那会让人以为「tba 突然不干活了」）。
+    #[test]
+    fn offline_flag_roundtrips_in_toml() {
+        let mut c = Config::default();
+        assert!(!c.offline, "默认必须是在线");
+        c.offline = true;
+        let s = toml::to_string_pretty(&c).unwrap();
+        assert!(s.contains("offline = true"), "{s}");
+        let back: Config = toml::from_str(&s).unwrap();
+        assert!(back.offline, "写进去要能读回来");
     }
 }

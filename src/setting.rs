@@ -273,6 +273,11 @@ pub fn guess_compile(root: &str) -> String {
 
 /// 从 Teambition 读设置（不存在返回 None）。读完顺手更新本地缓存。
 pub fn fetch(store: &Store, project_id: &str) -> Result<Option<ProjectSetting>, String> {
+    // 离线：直接给本地缓存。返回 None 会让窗口提示「还没有设置」，
+    // 而实际上本地可能有一份，只是没联网同步。
+    if store.load_config().offline() {
+        return Ok(ProjectSetting::load_cached(store, project_id));
+    }
     let mut ctx = crate::ops::Ctx::new(store.clone(), false)?;
     let Some(state) = ctx.find_state(project_id, SETTING_STATE)? else {
         return Ok(None);
@@ -297,6 +302,14 @@ pub fn fetch(store: &Store, project_id: &str) -> Result<Option<ProjectSetting>, 
 
 /// 写回 Teambition（没有就建）。写完更新本地缓存。
 pub fn save(store: &Store, project_id: &str, s: &ProjectSetting) -> Result<String, String> {
+    // 离线：只落本地缓存。设置本来就是「这台机器怎么编译这个项目」，
+    // 断网时照样该能改——写云端等下次联网再说（不自动回写，避免把云端改成意外值）。
+    if store.load_config().offline() {
+        s.cache(store, project_id)?;
+        return Ok(format!(
+            "离线模式：已存到本地缓存（data/projects/{project_id}/setting.toml），没写云端"
+        ));
+    }
     let mut ctx = crate::ops::Ctx::new(store.clone(), false)?;
     let state = ctx.ensure_state(project_id, SETTING_STATE)?;
     let tasks = ctx.list_tasks(project_id, &state)?;

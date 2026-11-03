@@ -103,6 +103,9 @@ pub struct App {
     rx: Receiver<Ev>,
     // 没有 token 时显示引导面板
     needs_token: bool,
+    // 离线模式：不用 Teambition，项目列表 / 能力 / 文案全走本地缓存。
+    // 需要在设置页里切换，或 `TBA_OFFLINE=1` 强制打开。
+    offline: bool,
     token_input: String,
     setup_busy: bool,
     projects: Vec<(String, String)>,
@@ -455,7 +458,9 @@ impl App {
         let (tx, rx) = channel();
         // 先用缓存秒开，再后台刷新。
         let cached = store.load_projects_cache();
-        let needs_token = store.load_config().token().is_none();
+        // 离线模式：不要求 token，项目列表直接用上次同步下来的缓存。
+        let offline = store.load_config().offline();
+        let needs_token = !offline && store.load_config().token().is_none();
         let prefs = load_prefs(&store);
         let font_size = prefs.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         // 邮件表单要预填，先读一份配置（store 之后会被 move 进 App）。
@@ -485,6 +490,7 @@ impl App {
             tx,
             rx,
             needs_token,
+            offline,
             token_input: String::new(),
             setup_busy: false,
             projects: if needs_token { Vec::new() } else { cached },
@@ -495,6 +501,8 @@ impl App {
             loading_skill: None,
             status: if needs_token {
                 "还没有 Teambition 访问令牌".to_string()
+            } else if offline {
+                "离线模式：只用本地数据（项目列表、能力、文案都走缓存）".to_string()
             } else {
                 "正在连接 Teambition...".to_string()
             },
@@ -687,31 +695,61 @@ impl App {
             } else if let Some(v) = &self.git_ver {
                 ui.label(format!("git {v}"));
             }
-            // 缺 CLI 时给一键安装
-            let missing = gb.as_ref().map(|g| !g.found).unwrap_or(false);
-            if missing && !self.gb_busy {
-                ui.horizontal(|ui| {
-                    // 三个都是主操作，用同一种按钮：之前一个 button 一个 small_button，
-                    // 并排看着一大一小像层级关系，其实不是。
-                    if ui
-                        .button("选择 but.exe 位置")
-                        .on_hover_text("已经装了 GitButler、但装在别处？手动选一次，记到 config.toml")
-                        .clicked()
-                    {
-                        want_pick = true;
-                    }
-                    if ui.button("安装到运行目录 (data/bin)").clicked() {
-                        want_install = true;
-                    }
-                    if ui.button("复制官方安装命令").clicked() {
-                        ui.ctx()
-                            .copy_text(crate::gitbutler::OFFICIAL_INSTALL_CMD.to_string());
-                    }
-                });
+            // 手动安装入口**常显**：已经装好的人也可能要重装、升级、装到另一台机器，
+            // 或者装完才发现版本不对。只在「缺 CLI」时给按钮，等于装过的人想看下载地址都看不到。
+            ui.horizontal_wrapped(|ui| {
+                ui.label("手动安装：");
+                if ui
+                    .button("GitButler 下载页")
+                    .on_hover_text(format!(
+                        "{}\n已装也能用：重装 / 升级 / 换机器",
+                        crate::gitbutler::GB_DOWNLOAD_URL
+                    ))
+                    .clicked()
+                {
+                    open_url(crate::gitbutler::GB_DOWNLOAD_URL);
+                }
+                if ui
+                    .button("git 下载页")
+                    .on_hover_text(format!(
+                        "{}\n已装也能用：重装 / 升级 / 换机器",
+                        crate::gitbutler::GIT_DOWNLOAD_URL
+                    ))
+                    .clicked()
+                {
+                    open_url(crate::gitbutler::GIT_DOWNLOAD_URL);
+                }
+                if ui
+                    .button("选择 but.exe 位置")
+                    .on_hover_text("装了但装在别处、或自动检测认错了？手动选一次，记到 config.toml")
+                    .clicked()
+                {
+                    want_pick = true;
+                }
+                if ui
+                    .add_enabled(
+                        !self.gb_busy,
+                        egui::Button::new("安装到运行目录 (data/bin)"),
+                    )
+                    .on_hover_text("下载官方 MSI 并抽出 but.exe，无需管理员、不动注册表；已装时可用来升级")
+                    .clicked()
+                {
+                    want_install = true;
+                }
+                if ui
+                    .button("复制官方安装命令")
+                    .on_hover_text("官方一键命令仅 mac/linux 可用；Windows 走上面那个 MSI 抽取")
+                    .clicked()
+                {
+                    ui.ctx()
+                        .copy_text(crate::gitbutler::OFFICIAL_INSTALL_CMD.to_string());
+                }
+            });
+            if gb.as_ref().map(|g| !g.found).unwrap_or(false) {
                 ui.label(
                     egui::RichText::new(
-                        "Windows 官方只发 MSI：点安装会自动下载并抽取 but.exe 到 data/bin，\
-                         无需管理员、不动注册表。官方一键命令仅 mac/linux 可用。",
+                        "Windows 官方只发 MSI：点「安装到运行目录」会自动下载并抽取 but.exe 到 data/bin，\
+                         无需管理员、不动注册表。",
                     )
                     .small()
                     .weak(),
@@ -738,6 +776,19 @@ impl App {
     }
 
     fn reload_projects(&mut self) {
+        // 离线：不连 Teambition，直接用上次同步下来的项目列表。
+        // 「刷新」在这里的含义变成「重读缓存」，语义上说得通，按钮就不用换文案。
+        if self.offline {
+            self.projects = self.store.load_projects_cache();
+            self.loading_projects = false;
+            self.status = if self.projects.is_empty() {
+                "离线模式：本地还没有项目缓存。联网打开一次（或在设置里关掉离线）就会存下来。"
+                    .to_string()
+            } else {
+                format!("离线模式：{} 个项目（本地缓存）", self.projects.len())
+            };
+            return;
+        }
         self.loading_projects = true;
         self.status = "正在连接 Teambition...".to_string();
         self.skills.clear();
@@ -780,6 +831,19 @@ impl App {
             return;
         }
         self.loading_skill = Some(project_id.to_string());
+        // 离线：能力读本地缓存。能力本来就是「一段提示词 + 一个开关」，
+        // 勾选和拼装全在本地，只有存储依赖 Teambition。
+        if self.offline {
+            let items = crate::ops::cached_skills(&self.store, project_id);
+            let n = items.len();
+            self.skills.insert(project_id.to_string(), items);
+            self.loading_skill = None;
+            if n == 0 {
+                self.status = "离线模式：这个项目还没有能力缓存。联网打开一次就会存下来。"
+                    .to_string();
+            }
+            return;
+        }
         let store = self.store.clone();
         let tx = self.tx.clone();
         let pid = project_id.to_string();
@@ -888,9 +952,15 @@ impl eframe::App for App {
                             self.setting.insert(pid, st);
                         }
                         Ok(None) => {
-                            self.status = "还没有「编译 & 重载」设置：填好点「保存到 Teambition」，\
-                                          或让 agent 跑 `tba setting set --compile ...`"
-                                .to_string();
+                            self.status = if self.offline {
+                                "离线模式：这个项目还没有「编译 & 重载」设置。填好后保存会写本地缓存\
+                                 （data/projects/<id>/setting.toml），联网时再同步到 Teambition。"
+                                    .to_string()
+                            } else {
+                                "还没有「编译 & 重载」设置：填好点「保存到 Teambition」，\
+                                 或让 agent 跑 `tba setting set --compile ...`"
+                                    .to_string()
+                            };
                         }
                         Err(e) => self.status = format!("读取项目设置失败: {e}"),
                     }
@@ -1071,26 +1141,58 @@ impl eframe::App for App {
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(if self.needs_token {
-                            "未登录"
-                        } else {
-                            "已登录"
-                        })
-                        .small()
-                        .weak(),
-                    );
+                    if self.offline {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xb2, 0x6a, 0x00),
+                            egui::RichText::new("离线").small(),
+                        )
+                        .on_hover_text(
+                            "离线模式：不连 Teambition，项目列表 / 能力 / 文案都走本地缓存。\
+                             在设置页可切换",
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(if self.needs_token {
+                                "未登录"
+                            } else {
+                                "已登录"
+                            })
+                            .small()
+                            .weak(),
+                        );
+                    }
                 });
             });
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("tba · 项目与能力");
+                if self.offline {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xb2, 0x6a, 0x00),
+                        egui::RichText::new("离线").strong(),
+                    )
+                    .on_hover_text(
+                        "不用 Teambition：项目列表和能力都读本地缓存，开工文案照常生成。\
+                         领任务 / 完成任务这类要云端才成立的操作会说明不可用。",
+                    );
+                }
                 if !self.needs_token {
-                    if ui.button("刷新").clicked() {
+                    if ui
+                        .button(if self.offline { "重读缓存" } else { "刷新" })
+                        .clicked()
+                    {
                         self.reload_projects();
                     }
-                    if ui.button("重新登录").clicked() {
+                    if ui
+                        .add_enabled(!self.offline, egui::Button::new("重新登录"))
+                        .on_hover_text(if self.offline {
+                            "离线模式下不需要登录；先去设置里关掉离线"
+                        } else {
+                            "清掉本地 token 重新走登录流程"
+                        })
+                        .clicked()
+                    {
                         self.logout();
                     }
                     // 本地一个项目都没有时用这份：发给 agent，让它自己判断
@@ -1284,11 +1386,13 @@ impl eframe::App for App {
                             ui.horizontal_wrapped(|ui| {
                                 let busy = self.skillmem_busy.as_deref() == Some(pid.as_str());
                                 if ui
-                                    .add_enabled(!busy, egui::Button::new("下载 skill+mem 到本地"))
-                                    .on_hover_text(
+                                    .add_enabled(!busy && !self.offline, egui::Button::new("下载 skill+mem 到本地"))
+                                    .on_hover_text(if self.offline {
+                                        "离线模式：导出要从 Teambition 拉 skill 和记忆，先关掉离线"
+                                    } else {
                                         "从 Teambition 重新拉一次，写成 data/projects/<id>/skillmem/\
-                                         skill.md 和 mem.md（多个 skill、多条记忆都合并进去）",
-                                    )
+                                         skill.md 和 mem.md（多个 skill、多条记忆都合并进去）"
+                                    })
                                     .clicked()
                                 {
                                     self.skillmem_busy = Some(pid.clone());
@@ -1911,16 +2015,23 @@ impl App {
             .default_open(self.debug_open)
             .show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new(
-                        "存 Teambition 云端、按项目隔离。勾选 = 这个项目启用；编辑/删除都改云端那条任务。",
-                    )
+                    egui::RichText::new(if self.offline {
+                        "离线模式：这一份来自本地缓存（data/projects/<id>/skills.json）。\
+                         勾选仍然生效；编辑 / 删除要联网，已置灰。"
+                    } else {
+                        "存 Teambition 云端、按项目隔离。勾选 = 这个项目启用；编辑/删除都改云端那条任务。"
+                    })
                     .small()
                     .weak(),
                 );
                 if loading {
                     ui.label("正在加载…");
                 } else if rows.is_empty() {
-                    ui.label("没有 tb skill。");
+                    ui.label(if self.offline {
+                        "离线模式：这个项目还没有能力缓存（联网打开一次就会存下来）。"
+                    } else {
+                        "没有 tb skill。"
+                    });
                 }
                 for row in rows {
                     let mut on = row.on;
@@ -1935,21 +2046,35 @@ impl App {
                             self.status =
                                 format!("skill「{}」已{}", row.name, if on { "开启" } else { "关闭" });
                         }
-                        // 编辑 / 删除都走后台线程：要联网写 Teambition。
-                        if ui.button("编辑").clicked() {
+                        // 编辑 / 删除都走后台线程：要联网写 Teambition。离线时置灰，
+                        // 点了也只会报错，不如直接不给点。
+                        if ui
+                            .add_enabled(!self.offline, egui::Button::new("编辑"))
+                            .on_hover_text(if self.offline {
+                                "离线模式：改云端 skill 要联网"
+                            } else {
+                                "改正文并写回 Teambition"
+                            })
+                            .clicked()
+                        {
                             *edit_req = Some((row.name.clone(), row.content.clone(), false));
                         }
-                        if ui.button("删除").clicked() {
+                        if ui
+                            .add_enabled(!self.offline, egui::Button::new("删除"))
+                            .clicked()
+                        {
                             *del_req = Some(row.name.clone());
                         }
                     });
                 }
                 if ui
-                    .button("+ 新建 skill")
-                    .on_hover_text(
+                    .add_enabled(!self.offline, egui::Button::new("+ 新建 skill"))
+                    .on_hover_text(if self.offline {
+                        "离线模式：新建 skill 要写 Teambition，先关掉离线"
+                    } else {
                         "写一段 markdown 存到 Teambition 的 skill 状态任务里。\
-                         agent 用 `tba skills` 看到名字，用到才读正文（省 token）",
-                    )
+                         agent 用 `tba skills` 看到名字，用到才读正文（省 token）"
+                    })
                     .clicked()
                 {
                     *edit_req = Some((String::new(), String::new(), true));
@@ -2129,9 +2254,17 @@ impl App {
                     if ui
                         .add_enabled(
                             self.setting_busy.as_deref() != Some(pid),
-                            egui::Button::new("保存到 Teambition"),
+                            egui::Button::new(if self.offline {
+                                "保存（离线·存本地）"
+                            } else {
+                                "保存到 Teambition"
+                            }),
                         )
-                        .on_hover_text("写进状态 setting 的任务备注，换设备也还在")
+                        .on_hover_text(if self.offline {
+                            "离线模式：写本地缓存 data/projects/<id>/setting.toml，不碰云端"
+                        } else {
+                            "写进状态 setting 的任务备注，换设备也还在"
+                        })
                         .clicked()
                     {
                         save = true;
@@ -2149,7 +2282,11 @@ impl App {
                     if ui
                         .add_enabled(
                             self.setting_busy.as_deref() != Some(pid),
-                            egui::Button::new("从云端重读"),
+                            egui::Button::new(if self.offline {
+                                "重读本地"
+                            } else {
+                                "从云端重读"
+                            }),
                         )
                         .clicked()
                     {
@@ -2432,43 +2569,40 @@ impl App {
                         )
                         .small(),
                     );
-                    // 没装就用手动安装：直接开浏览器，别让人自己去搜下载页。
-                    // 只给真正缺的那一项，免得两行按钮看着像「都得装」。
-                    let need_msvc = r.tc.msvc_bin.trim().is_empty()
-                        || !std::path::Path::new(r.tc.msvc_bin.trim()).join("link.exe").is_file();
-                    let need_sdk = r.tc.sdk_lib.trim().is_empty();
-                    if need_msvc || need_sdk {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("手动安装：");
-                            if need_msvc
-                                && ui
-                                    .button("下载 VS 生成工具（含 MSVC）")
-                                    .on_hover_text(VS_BUILD_TOOLS_URL)
-                                    .clicked()
-                            {
-                                open_url(VS_BUILD_TOOLS_URL);
-                            }
-                            if need_sdk
-                                && ui
-                                    .button("下载 Windows SDK")
-                                    .on_hover_text(SDK_URL)
-                                    .clicked()
-                            {
-                                open_url(SDK_URL);
-                            }
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "装 VS 生成工具时勾「使用 C++ 的桌面开发」，它自带 MSVC 和 Windows SDK；\
-                                 装完回来点「自动探测」就能填好。浏览器没弹出来，就手动打开上面悬停显示的地址。",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    }
                 }
                 None => {}
             }
+            // 手动安装入口**常显**：不管当前探没探到，这两个下载地址都在。
+            // 装好了也可能是别人装的旧版、或者要装到另一台机器/另一个盘，
+            // 只在缺件时给按钮，等于逼人去搜官网。
+            ui.horizontal_wrapped(|ui| {
+                ui.label("手动安装：");
+                if ui
+                    .button("下载 VS 生成工具（含 MSVC）")
+                    .on_hover_text(format!("{VS_BUILD_TOOLS_URL}\n（已装也能用：重装/换盘/换机器）"))
+                    .clicked()
+                {
+                    open_url(VS_BUILD_TOOLS_URL);
+                }
+                if ui
+                    .button("下载 Windows SDK")
+                    .on_hover_text(format!("{SDK_URL}\n（已装也能用：重装/换盘/换机器）"))
+                    .clicked()
+                {
+                    open_url(SDK_URL);
+                }
+            });
+            ui.label(
+                egui::RichText::new(if ready {
+                    "当前这套已经能用了；上面两个地址留着重装或换机器时用。\
+                     装 VS 生成工具时勾「使用 C++ 的桌面开发」，它自带 MSVC 和 Windows SDK。"
+                } else {
+                    "装 VS 生成工具时勾「使用 C++ 的桌面开发」，它自带 MSVC 和 Windows SDK；\
+                     装完回来点「自动探测」就能填好。浏览器没弹出来，就手动打开上面悬停显示的地址。"
+                })
+                .small()
+                .weak(),
+            );
             ui.horizontal(|ui| {
                 if ui.button("选择 link.exe 目录").clicked() {
                     pick = Some(0);
@@ -2542,7 +2676,59 @@ impl App {
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("设置");
-        // 工具链放最上面：编译不了是最容易卡住人的一件事，比字号重要。
+        // 离线模式：不用 Teambition 也能跑。放最上面——它决定下面这些还连不连网。
+        let env_forced = std::env::var("TBA_OFFLINE").is_ok();
+        let mut off = self.offline;
+        let resp = ui
+            .add_enabled(
+                !env_forced,
+                egui::Checkbox::new(&mut off, "离线模式（不用 Teambition）"),
+            )
+            .on_hover_text(
+                "勾上就不连 Teambition：项目列表、项目能力、开工文案全部走本地缓存，\
+                 通用能力和编译 & 重载本来就是本地的，照旧可用。\n\
+                 需要云端才成立的操作（领任务、done、ask/wait）会提示不可用。\n\
+                 缓存是联网时自动存的——所以第一次用某个项目前，先联网打开过一次。",
+            );
+        if resp.changed() {
+            let mut cfg = self.store.load_config();
+            cfg.offline = off;
+            match cfg.save(&self.store.root) {
+                Ok(()) => {
+                    self.offline = off;
+                    // 立刻生效：token 门禁、项目列表、能力缓存全跟着切。
+                    self.needs_token = !off && cfg.token().is_none();
+                    self.skills.clear();
+                    self.reload_projects();
+                    self.status = if off {
+                        "已切到离线模式：只用本地缓存".to_string()
+                    } else {
+                        "已切回在线模式：重新连 Teambition".to_string()
+                    };
+                }
+                Err(e) => self.status = format!("保存失败: {e}"),
+            }
+        }
+        if env_forced {
+            ui.label(
+                egui::RichText::new(
+                    "当前由环境变量 TBA_OFFLINE 强制指定，这里的勾选不生效（去掉环境变量即可）",
+                )
+                .small()
+                .weak(),
+            );
+        }
+        ui.label(
+            egui::RichText::new(if self.offline {
+                "离线中：项目与能力来自本地缓存；开工文案照常能复制。"
+            } else {
+                "在线：联网读写 Teambition。"
+            })
+            .small()
+            .weak(),
+        );
+        ui.add_space(8.0);
+        // 工具链紧跟其后：编译不了是最容易卡住人的一件事，比字号重要。
         self.draw_toolchain(ui);
         ui.add_space(12.0);
         // GitButler / git 也从主界面搬到这里：优先级仍然最高（缺它 TBHub 不干活），
