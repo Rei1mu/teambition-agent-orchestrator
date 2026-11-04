@@ -45,6 +45,10 @@ enum Ev {
     SkillMem(Result<String, String>),
     /// skill 新建 / 编辑 / 删除的结果。带回项目 id，好重新拉一次列表。
     SkillSaved(String, Result<String, String>),
+    /// 「接入项目」页：扫目录得到的候选项目名
+    CreateScanned(Vec<crate::create::Row>),
+    /// 「接入项目」页：建/复用项目的结果（输出全文，直接显示在结果框里）
+    Created(Result<String, String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -53,6 +57,8 @@ enum View {
     /// 通用能力：本地、跨项目的文本能力库，可增删改查
     Caps,
     Settings,
+    /// 接入项目：选目录 -> 列候选名 -> 点一个 -> 建项目 + 写绑定 + 开工文案
+    Create,
 }
 
 // 界面偏好。单独存 data/ui.toml，不碰 config.toml（那里有 token 和工具映射，
@@ -171,6 +177,13 @@ pub struct App {
     tc: Option<crate::toolchain::Resolved>,
     // 只读文本查看窗（标题, 正文）。给「查看文案」这类「只想看一眼」的内容用。
     text_view: Option<(String, String)>,
+    // 「接入项目」页。目录可以选任意位置，不必是窗口进程的 cwd。
+    create_dir: String,
+    create_rows: Vec<crate::create::Row>,
+    create_pick: Option<usize>,
+    create_custom: String,
+    create_busy: bool,
+    create_out: String,
 }
 
 // skill 编辑窗的编辑态。正文是整段 markdown，直接存 String。
@@ -502,6 +515,7 @@ impl App {
                 // 截图验证用：GUI 没法用命令行点按钮，起个指定页才好自查界面。
                 Ok("settings") => View::Settings,
                 Ok("caps") => View::Caps,
+                Ok("create") => View::Create,
                 _ => View::Projects,
             },
             cap_off: HashMap::new(),
@@ -534,6 +548,14 @@ impl App {
             // 懒加载：设置页第一次打开时才算（要跑 vswhere，启动时不抢时间）。
             tc: None,
             text_view: text_view0,
+            create_dir: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            create_rows: Vec::new(),
+            create_pick: None,
+            create_custom: String::new(),
+            create_busy: false,
+            create_out: String::new(),
         };
         if !needs_token {
             app.reload_projects();
@@ -610,6 +632,169 @@ impl App {
             return Some("没检测到 git，GitButler 依赖它".to_string());
         }
         None
+    }
+
+    // 「接入项目」页：选目录 -> 扫候选 -> 点一个 -> 建项目。
+    // 扫描和创建都要联网，放后台线程；结果通过 Ev 回主线程，窗口不卡住。
+    fn scan_create_candidates(&mut self) {
+        let store = self.store.clone();
+        let tx = self.tx.clone();
+        let dir = std::path::PathBuf::from(self.create_dir.trim());
+        self.create_busy = true;
+        self.status = "正在扫描目录、核对 Teambition 同名项目...".to_string();
+        thread::spawn(move || {
+            let rows = crate::create::scan(&store, &dir, None);
+            let _ = tx.send(Ev::CreateScanned(rows));
+        });
+    }
+
+    fn do_create_project(&mut self, name: String) {
+        let store = self.store.clone();
+        let tx = self.tx.clone();
+        let dir = std::path::PathBuf::from(self.create_dir.trim());
+        self.create_busy = true;
+        self.status = format!("正在接入「{name}」...");
+        thread::spawn(move || {
+            let r = crate::create::create(&store, &dir, &name, None, Lang::Zh)
+                .map(|c| c.report());
+            let _ = tx.send(Ev::Created(r));
+        });
+    }
+
+    fn draw_create(&mut self, ui: &mut egui::Ui) {
+        ui.heading("接入项目");
+        ui.label("给一个还没接 Teambition 的仓库建项目。一条命令的窗口版：选目录、扫候选、点一个、直接建好。");
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            ui.label("目录:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.create_dir)
+                    .desired_width(f32::INFINITY),
+            );
+            if ui.button("选目录…").clicked() {
+                let start = std::path::PathBuf::from(self.create_dir.trim());
+                let mut dlg = rfd::FileDialog::new().set_title("选择要接入的仓库目录");
+                if start.is_dir() {
+                    dlg = dlg.set_directory(&start);
+                }
+                if let Some(p) = dlg.pick_folder() {
+                    self.create_dir = p.display().to_string();
+                    self.create_rows.clear();
+                    self.create_pick = None;
+                    self.create_out.clear();
+                }
+            }
+        });
+
+        let offline = self.offline;
+        let need_token = self.needs_token;
+        ui.horizontal(|ui| {
+            let scan = ui.add_enabled(
+                !self.create_busy,
+                egui::Button::new("扫描候选项目名"),
+            );
+            if scan.clicked() {
+                self.scan_create_candidates();
+            }
+            if ui.button("复制 CLI 命令").clicked() {
+                ui.ctx().copy_text(format!(
+                    "tba create --dir \"{}\"",
+                    self.create_dir.trim()
+                ));
+                self.status = "已复制 tba create 命令".to_string();
+            }
+        });
+        if offline || need_token {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xE0, 0x7B, 0x39),
+                "当前离线或没登录：可以扫候选名，但建项目需要先联网。",
+            );
+        }
+
+        ui.separator();
+        ui.label("候选项目名（点一个选中；名字要由你拍板，工具不会自己挑）：");
+        if self.create_rows.is_empty() {
+            ui.label(egui::RichText::new("还没扫描。点上面的「扫描候选项目名」。").weak());
+        }
+        let rows = self.create_rows.clone();
+        for (i, r) in rows.iter().enumerate() {
+            let label = format!("{}. {}    来源: {}    {}", i + 1, r.name, r.source, r.mark);
+            if ui
+                .selectable_label(self.create_pick == Some(i), label)
+                .clicked()
+            {
+                self.create_pick = Some(i);
+                self.create_custom.clear();
+            }
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("或自己填名字:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.create_custom)
+                    .hint_text("候选都不对时填这里")
+                    .desired_width(240.0),
+            );
+            if resp.changed() {
+                self.create_pick = None;
+            }
+        });
+        let picked = self
+            .create_pick
+            .and_then(|i| self.create_rows.get(i))
+            .map(|r| r.name.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let c = self.create_custom.trim().to_string();
+                (!c.is_empty()).then_some(c)
+            });
+
+        ui.add_space(4.0);
+        let can = !self.create_busy && !offline && !need_token && picked.is_some();
+        let btn = ui.add_enabled(can, egui::Button::new("建 / 复用这个项目"));
+        if btn.clicked() {
+            if let Some(name) = picked {
+                self.do_create_project(name);
+            }
+        }
+        if let Some(name) = self
+            .create_pick
+            .and_then(|i| self.create_rows.get(i))
+            .map(|r| r.name.as_str())
+        {
+            ui.label(format!("将使用: {name}"));
+        }
+        if self.create_busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("处理中…");
+            });
+        }
+
+        if !self.create_out.is_empty() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("结果 / 开工文案").strong());
+                if ui.button("复制全文").clicked() {
+                    ui.ctx().copy_text(self.create_out.clone());
+                    self.status = "已复制接入结果和开工文案".to_string();
+                }
+                if ui.button("清空").clicked() {
+                    self.create_out.clear();
+                }
+            });
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.create_out)
+                            .desired_width(f32::INFINITY)
+                            .code_editor(),
+                    );
+                });
+        }
     }
 
     /// GitButler 状态卡：CLI 装没装、什么版本、从哪来、当前目录配没配；
@@ -1028,6 +1213,26 @@ impl eframe::App for App {
                         }
                     }
                 }
+                Ev::CreateScanned(rows) => {
+                    self.create_rows = rows;
+                    self.create_pick = None;
+                    self.create_busy = false;
+                    self.status = format!("扫出 {} 个候选项目名，点一个再建", self.create_rows.len());
+                }
+                Ev::Created(r) => {
+                    self.create_busy = false;
+                    match r {
+                        Ok(out) => {
+                            self.create_out = out;
+                            self.status = "项目已接入。开工文案在下面，可直接复制。".to_string();
+                            self.reload_projects();
+                        }
+                        Err(e) => {
+                            self.create_out = e.clone();
+                            self.status = format!("接入失败: {e}");
+                        }
+                    }
+                }
             }
         }
         // 后台在工作时保持界面响应
@@ -1037,6 +1242,7 @@ impl eframe::App for App {
             || self.reload_busy.is_some()
             || self.setting_busy.is_some()
             || self.skillmem_busy.is_some()
+            || self.create_busy
         {
             ctx.request_repaint();
         }
@@ -1109,6 +1315,14 @@ impl eframe::App for App {
                     .clicked()
                 {
                     self.view = View::Projects;
+                }
+
+                if ui
+                    .selectable_label(self.view == View::Create, "接入项目")
+                    .on_hover_text("选目录 -> 列候选项目名 -> 点一个 -> 直接建好并出开工文案")
+                    .clicked()
+                {
+                    self.view = View::Create;
                 }
 
                 ui.add_space(12.0);
@@ -1204,6 +1418,13 @@ impl eframe::App for App {
                                        等你拍板后 `tba ensure-project --name <你选的名字>`。"
                             .to_string();
                     }
+                    if ui
+                        .button("直接接入项目…")
+                        .on_hover_text("不用复制文案：选目录 -> 列候选 -> 点一个 -> 直接建好")
+                        .clicked()
+                    {
+                        self.view = View::Create;
+                    }
                 }
             });
             ui.label(&self.status);
@@ -1241,6 +1462,14 @@ impl eframe::App for App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         self.draw_settings(ui);
+                    });
+                return;
+            }
+            if self.view == View::Create {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.draw_create(ui);
                     });
                 return;
             }

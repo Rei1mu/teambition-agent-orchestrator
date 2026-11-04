@@ -435,62 +435,67 @@ fn dash(s: &str) -> &str {
     }
 }
 
-// `ensure-project --dry-run`：只报候选，不建、不写绑定。
+// `ensure-project --dry-run` / `tba create --dry`：只报候选，不建、不写绑定。
 //
 // 目的很具体：建项目前得先知道这个仓库该叫什么。目录名经常不可靠
 // （可能叫 code / tmp / TBHub），所以扫 git remote、构建清单、子目录里的项目，
 // 把候选连同来源列出来，由用户拍板。
+// 扫与标注共用 create::scan，窗口「接入项目」页看到的是同一份数据。
 fn print_name_candidates(store: &Store, given: Option<&str>, project: Option<&str>) {
     let dir = std::env::current_dir().unwrap_or_default();
     println!("扫描目录: {}", dir.display());
-
-    let list = match given.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(n) => vec![crate::naming::Candidate {
-            name: n.to_string(),
-            source: "命令行 --name".to_string(),
-        }],
-        None => crate::naming::candidates(&dir),
-    };
-
-    if list.is_empty() {
+    let rows = crate::create::scan(store, &dir, given);
+    if rows.is_empty() {
         println!("没找到可用的名字线索：没有 git remote，也没有 Cargo.toml / package.json 这类清单。");
-        println!("直接问用户要一个项目名，再跑 `tba ensure-project --name \"<名字>\"`。");
+        println!("直接问用户要一个项目名，再跑 `tba create --name \"<名字>\"`。");
         return;
     }
-
-    // 核对 Teambition 里有没有同名：决定「新建」还是「复用」，用户拍板时要知道。
-    // 连不上（离线/网络）就不拦，标一句「未核对」即可。
-    let cfg = store.load_config();
-    let existing: Option<Vec<(String, String)>> = if cfg.offline() {
-        None
-    } else {
-        crate::ops::Ctx::new(store.clone(), false)
-            .and_then(|mut c| c.list_projects())
-            .ok()
-            .map(|all| {
-                all.iter()
-                    .map(|p| (p.id.clone(), p.name.clone()))
-                    .collect()
-            })
-    };
-
     if let Some(p) = project.map(str::trim).filter(|s| !s.is_empty()) {
         println!("指定项目 id: {p}（dry-run 不校验）");
     }
     println!("\n候选项目名（把这份原样交给用户拍板，不要自己挑）：");
-    for (i, c) in list.iter().enumerate() {
-        let mark = match &existing {
-            None => "未核对（连不上 Teambition）".to_string(),
-            Some(all) => match all.iter().filter(|(_, n)| n == &c.name).count() {
-                0 => "Teambition 里没有，会新建".to_string(),
-                1 => "已有同名，会复用".to_string(),
-                n => format!("有 {n} 个同名，需要 --project 指定"),
-            },
-        };
-        println!("  {}. {}\t来源: {}\t{}", i + 1, c.name, c.source, mark);
-    }
-    println!("\n用户选定后：tba ensure-project --name \"<选定的名字>\"");
+    print_name_rows(&rows);
+    println!("\n用户选定后：tba create --name \"<选定的名字>\"");
     println!("以上只是列候选：没有创建项目，也没有改本地绑定。");
+}
+
+fn print_name_rows(rows: &[crate::create::Row]) {
+    for (i, r) in rows.iter().enumerate() {
+        println!("  {}. {}\t来源: {}\t{}", i + 1, r.name, r.source, r.mark);
+    }
+}
+
+/// `tba create` 的交互拍板。返回用户选中的项目名。
+/// 非交互（agent 管道调用、stdin 不是终端）时不阻塞，直接报错让 agent 去问用户。
+fn pick_name_interactive(rows: &[crate::create::Row]) -> Result<String, String> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Err(
+            "没有终端可以选号。把上面的候选原样交给用户拍板，再跑 \
+             `tba create --name \"<选定的名字>\"`。没有创建项目。"
+                .to_string(),
+        );
+    }
+    print!("\n输入编号（1..{}）或直接输入项目名，回车 = 取消: ", rows.len());
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("读取输入失败: {e}"))?;
+    let t = line.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("q") {
+        return Err("已取消，没有创建项目。".to_string());
+    }
+    if let Ok(n) = t.parse::<usize>() {
+        if n == 0 {
+            return Err(format!("编号从 1 开始（1..{}），没有创建项目。", rows.len()));
+        }
+        return rows
+            .get(n - 1)
+            .map(|r| r.name.clone())
+            .ok_or_else(|| format!("编号超出范围（1..{}），没有创建项目。", rows.len()));
+    }
+    Ok(t.to_string())
 }
 
 pub fn run() -> Result<(), String> {
@@ -526,9 +531,14 @@ pub fn run() -> Result<(), String> {
             // - git 通用能力（status / main / create / tag）只依赖系统 git，不依赖
             //   GitButler CLI。is_gb_project 在 but 不存在时自然返回 false 走普通 git 分支；
             //   拦住它等于「没装 GitButler 就建不了 GitHub 仓库」，纯属误伤。
+            // - 项目接入链路（create / ensure-project / prompt --init）只连 Teambition，
+            //   不需要 but.exe。没装 GitButler 的设备正是最需要接入的设备，拦住等于死锁。
             | Cmd::Toolchain { .. }
             | Cmd::Doctor
             | Cmd::Git { .. }
+            | Cmd::Create { .. }
+            | Cmd::EnsureProject { .. }
+            | Cmd::Prompt { init: true, .. }
             | Cmd::Ui
     );
     if !gb_exempt && std::env::var("TBA_SKIP_GITBUTLER").is_err() {
@@ -863,6 +873,49 @@ pub fn run() -> Result<(), String> {
             println!("记忆状态: {} ({})", mem.name, mem.id);
             println!("本地绑定: {}", bound.display());
             println!("下一步: tb prompt --project {}", p.id);
+        }
+        Cmd::Create {
+            name,
+            dir,
+            project,
+            dry,
+            lang,
+        } => {
+            let lang = Lang::parse(&lang)
+                .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
+            let target = match dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(d) => std::path::PathBuf::from(d),
+                None => std::env::current_dir().map_err(|e| format!("拿不到当前目录: {e}"))?,
+            };
+            let target = std::fs::canonicalize(&target)
+                .map_err(|e| format!("目录不存在或打不开 {}: {e}", target.display()))?;
+
+            println!("扫描目录: {}", target.display());
+            let rows = crate::create::scan(&store, &target, None);
+            if rows.is_empty() {
+                return Err(
+                    "没找到可用的名字线索：没有 git remote，也没有 Cargo.toml / package.json 这类清单。\n\
+                     直接问用户要一个项目名，再跑 `tba create --name \"<名字>\"`。"
+                        .to_string(),
+                );
+            }
+            println!("\n候选项目名（编号 + 名字 + 来源 + Teambition 同名情况）：");
+            print_name_rows(&rows);
+
+            if dry {
+                println!("\n--dry：只列候选。没有创建项目，也没有写任何文件。");
+                println!("拍板后跑：tba create --name \"<选定的名字>\" --dir \"{}\"", target.display());
+                return Ok(());
+            }
+
+            // 给了 --name 就是用户已拍板，直接用；否则在终端里停下等选号。
+            let picked = match name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(n) => n.to_string(),
+                None => pick_name_interactive(&rows)?,
+            };
+            println!("\n已选项目名: {picked}");
+            let r = crate::create::create(&store, &target, &picked, project.as_deref(), lang)?;
+            print!("{}", r.report());
         }
         Cmd::Skills { project } => {
             // 离线：读项目能力的本地缓存（在线 list_skills 每次都会写一份）。

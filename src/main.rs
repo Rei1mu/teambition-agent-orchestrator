@@ -4,6 +4,7 @@ mod capability;
 mod caps;
 mod cmds;
 mod config;
+mod create;
 mod git;
 mod gitbutler;
 mod mail;
@@ -108,6 +109,25 @@ pub enum Cmd {
         /// 确实要用当前目录名当项目名（不给 --name / --project 时必须显式加这个）
         #[arg(long)]
         yes: bool,
+    },
+    /// 接入项目：扫目录列候选名 -> 你拍板 -> 建/复用项目 -> 补 7 状态 ->
+    /// 写 .tba/project -> 补 AGENTS.md 入口 -> 打印开工文案。一条命令跑完初始化文案
+    Create {
+        /// 项目名。给了就直接用，跳过交互拍板
+        #[arg(long)]
+        name: Option<String>,
+        /// 目标目录。缺省当前目录；窗口里可以选任意目录
+        #[arg(long)]
+        dir: Option<String>,
+        /// 已有项目 id：同名多个时指定复用哪个
+        #[arg(long)]
+        project: Option<String>,
+        /// 只列候选，不建项目、不写文件
+        #[arg(long)]
+        dry: bool,
+        /// 开工文案语言：zh / en
+        #[arg(long, default_value = "zh")]
+        lang: String,
     },
     /// 列出项目的所有 skill 及本地开关
     Skills {

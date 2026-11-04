@@ -152,15 +152,23 @@ pub fn read_project_binding() -> Option<String> {
     None
 }
 
-// 把 project id 记到当前目录的 .tba/project。返回写入的文件路径。
-pub fn write_project_binding(project_id: &str) -> Result<std::path::PathBuf, String> {
-    let dir = std::env::current_dir().map_err(|e| format!("拿不到当前目录: {e}"))?;
+// 把 project id 记到指定目录的 .tba/project。返回写入的文件路径。
+// 窗口「接入项目」可以选任意目录，不能写死进程 cwd。
+pub fn write_project_binding_at(
+    dir: &std::path::Path,
+    project_id: &str,
+) -> Result<std::path::PathBuf, String> {
     let d = dir.join(LOCAL_DIR);
     std::fs::create_dir_all(&d).map_err(|e| format!("创建 {LOCAL_DIR} 目录失败: {e}"))?;
     let path = d.join("project");
     std::fs::write(&path, format!("{project_id}\n"))
         .map_err(|e| format!("写项目绑定失败: {e}"))?;
     Ok(path)
+}
+
+pub fn write_project_binding(project_id: &str) -> Result<std::path::PathBuf, String> {
+    let dir = std::env::current_dir().map_err(|e| format!("拿不到当前目录: {e}"))?;
+    write_project_binding_at(&dir, project_id)
 }
 
 // 当前目录名，给「没指定项目名」时兜底用。
@@ -3864,6 +3872,9 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
             "之后在本目录直接跑 `{exe} prompt`（不带 --project）即可，id 已写进 .tba/project。\n\
              出错就把 stdout 原样报给用户：不要改 data/config.toml，不要自己拼 Teambition 接口。\n"
         ));
+        s.push_str(&format!(
+            "\n**更省事**：用户本人跑 `{exe} create` 即可一条命令走完全流程（列候选 -> 他选号 -> 建项目 -> 开工文案）。\n"
+        ));
     } else {
         s.push_str(
             "# Onboard this repo to Teambition\n\
@@ -3904,6 +3915,9 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
         s.push_str(&format!(
             "Afterwards just run `{exe} prompt` in this dir (no --project); the id is in .tba/project.\n\
              On error report stdout as-is: do not edit data/config.toml, do not call Teambition APIs by hand.\n"
+        ));
+        s.push_str(&format!(
+            "\n**Shorter**: the user can run `{exe} create` to do all of the above in one command.\n"
         ));
     }
     s
@@ -4029,12 +4043,16 @@ fn prompt_exe_of(cfg: &crate::config::Config) -> String {
     }
 }
 
-// 在当前目录补一个 AGENTS.md 入口。两个块各自检测标记，缺哪个补哪个——
+// 在指定目录补一个 AGENTS.md 入口。两个块各自检测标记，缺哪个补哪个——
 // 这样已经生成过入口的老项目，下次 tba g 也能自动补上后加的编码纪律。
 // 失败不报错：入口文件只是省几个字，没有它 `tba g` 一样能跑。
+pub fn ensure_entry_in(store: &Store, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    ensure_entry_at(dir, &entry_cmd(store))
+}
+
 fn ensure_entry_file(store: &Store) -> Option<std::path::PathBuf> {
     let dir = std::env::current_dir().ok()?;
-    ensure_entry_at(&dir, &entry_cmd(store))
+    ensure_entry_in(store, &dir)
 }
 
 // 实际干活的那一半，单独抽出来是为了能测（不碰全局 cwd）。
