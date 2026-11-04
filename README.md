@@ -980,18 +980,32 @@ Terminal，那一下还得等 WT 起窗，看着就是黑框闪一下。
 
 ## 工具识别不准时
 
-Teambition MCP 的工具名由服务端动态下发。自动识别靠名字关键词。不准时：
+Teambition MCP 的工具名由服务端动态下发。自动识别靠名字关键词打分。不准时：
 
-1. `tba tools` 看真实工具名。
-2. 编辑 `data/config.toml`，在 `[tool_overrides]` 里指定，例如：
+```bat
+tba tools               :: 看真实工具名 + 每个角色认到了哪个工具
+tba tools --overrides   :: 直接输出一份能用的 [tool_overrides] 片段
+```
+
+把 `--overrides` 的输出贴进 `data/config.toml` 即可（只列当前工具集里真实存在的名字）：
 
 ```toml
 [tool_overrides]
-list_projects = "真实工具名"
-claim_task = "真实工具名"
+get_task = "teambition.task.query"
 ```
 
-可用角色：list_projects / get_project / list_taskflows / get_taskflow / create_taskflow / list_stages / create_stage / create_task / update_task / move_task / list_tasks / get_task。
+可用角色：list_projects / get_project / list_taskflows / get_taskflow / create_taskflow /
+list_stages / create_stage / list_task_types / create_task_type / create_task / update_task /
+move_task / list_tasks / get_task / move_to_list / read_activity / comment。
+
+两条兜底，避免一条写错的配置把功能弄死：
+
+- **覆盖值必须真实存在**。写了工具集里没有的名字会被忽略、退回自动识别，`tba tools` 会列出
+  「这些名字在当前工具集里不存在，已忽略」并提示重跑 `--overrides`。
+- **`get_task` / `create_stage` 不再依赖手写覆盖**。真实工具名是 `teambition.task.query`
+  和 `teambition.project.taskflow-update`，早期规则把 `query` / 不带 stage 字样的名字排除了，
+  导致只有手写过 `[tool_overrides]` 的机器能跑——换台机器 `tba note` 就报「找不到 get_task 角色」。
+  现在空配置也能自己认出来（有单测钉着）。
 
 改完运行 `tba tools --refresh`。
 

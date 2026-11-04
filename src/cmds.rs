@@ -1752,8 +1752,16 @@ pub fn run() -> Result<(), String> {
                 append_memory(&store, &project, &section, &body, force)?
             );
         }
-        Cmd::Tools { refresh, json } => {
+        Cmd::Tools {
+            refresh,
+            json,
+            overrides,
+        } => {
             let ctx = Ctx::new(store.clone(), refresh)?;
+            if overrides {
+                print!("{}", ctx.map.overrides_toml());
+                return Ok(());
+            }
             if json {
                 // 完整 schema，用来排查参数问题
                 println!("[");
@@ -1777,6 +1785,15 @@ pub fn run() -> Result<(), String> {
             println!("\n角色识别结果:");
             for (role, tool) in ctx.map.summary() {
                 println!("  {role}\t{tool}");
+            }
+            // 手写的覆盖值过期时不能静默：这类问题表现为「某个命令单独坏掉」，
+            // 报错只说找不到角色，很难联想到 config 里那行旧名字。
+            if !ctx.map.stale_overrides.is_empty() {
+                println!("\n⚠ config.toml [tool_overrides] 里这些名字在当前工具集里不存在，已忽略：");
+                for (role, tool) in &ctx.map.stale_overrides {
+                    println!("  {role} = \"{tool}\"");
+                }
+                println!("  跑 `tba tools --overrides` 拿一份可用的片段覆盖掉它们。");
             }
         }
         Cmd::Serve => {

@@ -37,6 +37,9 @@ pub struct ToolMap {
     pub read_activity: Option<String>,
     // 发评论。tb ask 把问题写到任务上。
     pub comment: Option<String>,
+    // config.toml [tool_overrides] 里写了、但当前工具集里**不存在**的那些。
+    // 不报错但要说出来：手写的名字过期后，静默失败最难查。
+    pub stale_overrides: Vec<(String, String)>,
 }
 
 // 一个角色的识别规则。
@@ -174,12 +177,16 @@ const R_LIST_STAGES: Rule = Rule {
 };
 
 const R_CREATE_STAGE: Rule = Rule {
-    must: &["stage", "taskflowstatus", "status", "tfs"],
+    // 真实工具是 `teambition.project.taskflow-update`：名字里既没有 stage 也没有
+    // status/tfs，只靠 "taskflow" 才能命中——建阶段在这个 API 里就是「更新任务流」。
+    must: &["stage", "taskflowstatus", "status", "tfs", "taskflow"],
     deny: &[
-        "update", "move", "delete", "query", "node", "customfield",
+        "move", "delete", "query", "node", "customfield",
         "executor", "validator", "archive", "restore",
+        // 建任务流是另一个角色（create_taskflow），别在这里抢
+        "create", "name",
     ],
-    bonus: &[("create", 10), ("add", 9), ("project", 2)],
+    bonus: &[("add", 9), ("update", 8), ("project", 2)],
     desc: &["阶段", "stage"],
 };
 
@@ -264,13 +271,24 @@ const R_LIST_TASKS: Rule = Rule {
 
 const R_GET_TASK: Rule = Rule {
     must: &["task"],
+    // 注意：这里**不能** deny "query"。真实工具名就是 `teambition.task.query`
+    // （按任务 ID / 父任务 / TQL 查），deny 掉 query 会让这个角色永远识别不出来，
+    // 只能靠 config.toml 里手写 [tool_overrides] 兜——换台机器就 `tba note` 报错。
+    // 靠 bonus 的 "task.query" 权重把 `project.task-query`（按项目查列表）压下去。
     deny: &[
-        "flow", "list", "query", "search", "all", "create", "update",
+        "flow", "list", "search", "all", "create", "update",
         "move", "delete", "node", "comment", "dependency", "trace", "user",
         "parent", "type", "tags", "members", "count", "file", "archive",
         "restore", "stage", "status",
     ],
-    bonus: &[("get", 10), ("detail", 10), ("info", 10), ("project", 2)],
+    bonus: &[
+        ("task.query", 20),
+        ("get", 10),
+        ("detail", 10),
+        ("info", 10),
+        ("query", 6),
+        ("project", 2),
+    ],
     desc: &["任务", "task"],
 };
 
@@ -314,7 +332,21 @@ fn pick_suffix(tools: &[ToolInfo], suffixes: &[&str]) -> Option<String> {
 impl ToolMap {
     pub fn resolve(tools: &[ToolInfo], overrides: &HashMap<String, String>) -> ToolMap {
         let mut m = ToolMap::default();
-        let get = |role: &str| overrides.get(role).cloned();
+        let mut stale: Vec<(String, String)> = Vec::new();
+        // 覆盖值必须真实存在，否则退回自动识别：
+        // 工具集换版后名字会变，一条过期的 override 不该让整个角色失效。
+        let mut get = |role: &str| -> Option<String> {
+            let v = overrides.get(role)?.trim().to_string();
+            if v.is_empty() {
+                return None;
+            }
+            if tools.iter().any(|t| t.name == v) {
+                Some(v)
+            } else {
+                stale.push((role.to_string(), v));
+                None
+            }
+        };
 
         m.list_projects = get("list_projects").or_else(|| pick(tools, &R_LIST_PROJECTS));
         m.create_project = get("create_project").or_else(|| pick(tools, &R_CREATE_PROJECT));
@@ -336,8 +368,22 @@ impl ToolMap {
             .or_else(|| pick_suffix(tools, &["task.update-stage", "task.update-list"]));
         m.read_activity = get("read_activity").or_else(|| pick_suffix(tools, &["task.activity"]));
         m.comment = get("comment").or_else(|| pick_suffix(tools, &["task.comment"]));
+        m.stale_overrides = stale;
 
         m
+    }
+
+    // 当前识别结果写成能直接贴进 config.toml 的 [tool_overrides] 片段。
+    // 工具集换版、角色识别不出来时，跑 `tba tools --overrides` 复制过去即可。
+    pub fn overrides_toml(&self) -> String {
+        let mut s = String::from("# 由 `tba tools --overrides` 生成；只保留当前工具集里真实存在的\n[tool_overrides]\n");
+        for (role, tool) in self.summary() {
+            if tool == "(未找到)" {
+                continue;
+            }
+            s.push_str(&format!("{role} = \"{tool}\"\n"));
+        }
+        s
     }
 
     // 人读摘要。tb tools 命令用。
@@ -620,4 +666,80 @@ fn parse_tags(v: &Value) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn t(name: &str, desc: &str) -> ToolInfo {
+        ToolInfo {
+            name: name.to_string(),
+            description: desc.to_string(),
+            input_schema: json!({}),
+        }
+    }
+
+    // 真实 MCP（v2）里与任务相关的几个名字，用来钉住识别结果。
+    fn real_set() -> Vec<ToolInfo> {
+        vec![
+            t("teambition.task.query", "按任务 ID、父任务 ID 或企业级 TQL 查询可见项目任务"),
+            t("teambition.project.task-query", "查询项目中的任务"),
+            t("teambition.project.task-list-query", "查询项目任务列表"),
+            t("teambition.project.task-count", "统计任务数量"),
+            t("teambition.task.update", "更新任务"),
+            t("teambition.task.create", "创建任务"),
+            t("teambition.task.activity", "获取任务动态列表"),
+            t("teambition.task.comment", "为任务发表评论"),
+            t("teambition.project.query", "查询项目"),
+            t("teambition.project.tfs-query", "查询工作流状态"),
+        ]
+    }
+
+    // 没有 [tool_overrides] 时，get_task 也必须能自己认出来。
+    // 这里踩过坑：规则里 deny 了 "query"，而真实工具名就叫 task.query，
+    // 于是永远识别不出来，只有手写 override 的机器能跑——换台机器 `tba note` 就报错。
+    #[test]
+    fn get_task_resolves_without_overrides() {
+        let m = ToolMap::resolve(&real_set(), &HashMap::new());
+        assert_eq!(m.get_task.as_deref(), Some("teambition.task.query"));
+    }
+
+    // 覆盖值写错（工具改名/手滑）时退回自动识别，并且要记下来告诉用户。
+    #[test]
+    fn stale_override_falls_back_to_detection() {
+        let mut o = HashMap::new();
+        o.insert("get_task".to_string(), "teambition.task.get".to_string());
+        let m = ToolMap::resolve(&real_set(), &o);
+        assert_eq!(m.get_task.as_deref(), Some("teambition.task.query"));
+        assert_eq!(m.stale_overrides.len(), 1);
+        assert_eq!(m.stale_overrides[0].0, "get_task");
+    }
+
+    // 覆盖值有效时以它为准（有人就是想把角色指到另一个工具）。
+    #[test]
+    fn valid_override_wins() {
+        let mut o = HashMap::new();
+        o.insert(
+            "get_task".to_string(),
+            "teambition.project.task-query".to_string(),
+        );
+        let m = ToolMap::resolve(&real_set(), &o);
+        assert_eq!(
+            m.get_task.as_deref(),
+            Some("teambition.project.task-query")
+        );
+        assert!(m.stale_overrides.is_empty());
+    }
+
+    #[test]
+    fn overrides_toml_skips_missing_roles() {
+        let m = ToolMap::resolve(&real_set(), &HashMap::new());
+        let s = m.overrides_toml();
+        assert!(s.contains("[tool_overrides]"), "{s}");
+        assert!(s.contains("get_task = \"teambition.task.query\""), "{s}");
+        // 认不出来的角色不该写出空行，否则贴回去又是一条坏配置
+        assert!(!s.contains("(未找到)"), "{s}");
+    }
 }

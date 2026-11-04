@@ -197,9 +197,20 @@ impl Ctx {
 
     fn need(&self, role: &str, name: &Option<String>) -> Result<String, String> {
         name.clone().ok_or_else(|| {
+            // 过期覆盖值是这类报错最常见的原因：config 里写着旧工具名，看着「配了」其实没生效。
+            let stale = self
+                .map
+                .stale_overrides
+                .iter()
+                .find(|(r, _)| r == role)
+                .map(|(_, t)| {
+                    format!("\n注意：config.toml 里 {role} = \"{t}\" 在当前工具集里不存在，已忽略。")
+                })
+                .unwrap_or_default();
             format!(
-                "MCP 工具列表里找不到「{role}」角色的工具。请运行 tb tools 查看真实工具名，\
-                 然后在 data/config.toml 的 [tool_overrides] 里手工指定，例如 {role} = \"真实工具名\""
+                "MCP 工具列表里找不到「{role}」角色的工具。{stale}\n\
+                 跑 `tba tools` 看真实工具名和角色识别结果，或 `tba tools --overrides` \
+                 直接生成一份可用的 [tool_overrides] 贴进 data/config.toml。"
             )
         })
     }

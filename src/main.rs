@@ -388,6 +388,9 @@ pub enum Cmd {
         /// 输出每个工具的完整 inputSchema(JSON)。排查参数问题时用
         #[arg(long)]
         json: bool,
+        /// 只输出 [tool_overrides] 片段：识别不对时贴进 data/config.toml
+        #[arg(long)]
+        overrides: bool,
     },
     /// 以 MCP server (stdio) 运行。给 agent 挂载用
     Serve,
