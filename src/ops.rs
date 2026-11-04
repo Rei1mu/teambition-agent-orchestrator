@@ -4078,7 +4078,8 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          3=已收尾。\n\
          **禁止 run_in_background，绝不结束会话**——断了没人接你回复。\
          只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
-         **通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git main -m` 提交推送 / \
+         **通用能力**（别自己拼脚本）：`doctor` 环境自检 / \
+         `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / \
          `publish` 发版 / `shot` 截图。先 `{exe} --help`。\n\
          **编译 & 重载**：`{exe} setting` 看本项目的编译指令和 exe 名（存 Teambition 的 \
          setting 任务），再 `{exe} reload build`。\n"
@@ -4110,12 +4111,15 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     let mut old = std::fs::read_to_string(&path).unwrap_or_default();
 
     // 已经是新版就不用动：入口段只有一份、带绝对路径、带「交回」「流转」「通用能力」。
-    // 这三句当版本号用——老入口缺哪句，就整段替换成新版（不会重复追加）。
+    // 这几句当版本号用——老入口缺哪句，就整段替换成新版（不会重复追加）。
+    // `git create` 也算版本号：v0.2.20 通用能力名单里加了它，老 AGENTS.md 缺这句
+    // 的话 agent 进项目仍读不到「别装 gh」，得整段重写一次。
     let entry_ok = old.matches(ENTRY_MARK).count() == 1
         && old.contains(&exe)
         && old.contains("**交回**")
         && old.contains("**流转**")
-        && old.contains("**通用能力**");
+        && old.contains("**通用能力**")
+        && old.contains("git create");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
 
     // 转发脚本：PATH 没生效时 agent 也能直接跑 `tba.cmd g`，不用找 exe。
@@ -4713,7 +4717,9 @@ mod tests {
         // 英文约 +310，英文说明比中文长），——
         // 只列名字 agent 猜不出用途，等于没写；正文仍然按需读，没有内联。
         // 再涨就说明文案又变长了，要主动确认。
-        for (tag, p, budget) in [("中文", &zh, 2600usize), ("英文", &en, 3400usize)] {
+        // v0.2.20 新增内置能力 git-create（索引多一行，英文约 +55 字符）：这是预期增长，
+        // 英文预算 3400 -> 3500。中文 2600 仍有大量余量，不动。
+        for (tag, p, budget) in [("中文", &zh, 2600usize), ("英文", &en, 3500usize)] {
             assert!(
                 p.chars().count() < budget,
                 "{tag}版文案体积失控: {} 字符（预算 {budget}）",
@@ -4787,6 +4793,42 @@ mod tests {
         assert!(s.contains(RULES_MARK), "老项目没补上纪律块");
         assert_eq!(s.matches(ENTRY_MARK).count(), 1, "入口块被重复写了");
         assert_eq!(s.matches(RULES_MARK).count(), 1, "纪律块被重复写了");
+    }
+
+    // v0.2.20：老 AGENTS.md 的通用能力名单里没有 git create，agent 进项目就
+    // 读不到「别装 gh」。它必须被整段重写一次，且不能重复追加。
+    #[test]
+    fn entry_file_refreshes_when_git_create_missing() {
+        let store = tmp_store("entry-gitcreate");
+        let dir = store.root.clone();
+        let p = dir.join("AGENTS.md");
+
+        // 造一份「其它都齐全、唯独通用能力名单是旧的」入口。
+        let old = format!(
+            "# 用户说明\n\n{ENTRY_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
+             ## 任务队列入口\n\n\
+             **工具**：`tba`（项目根的 tba.cmd 等价）。\n\n\
+             **交回**：做完两步。`ask` 后 **流转** 到待回复。\n\n\
+             **通用能力**（别自己拼脚本）：`doctor` / `git main -m` / `publish` / `shot`。\n\n\
+             {RULES_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 编码纪律\n\n四条。\n"
+        );
+        std::fs::write(&p, old).unwrap();
+
+        assert!(
+            ensure_entry_at(&dir, "tba").is_some(),
+            "缺 git create 的老入口必须重写"
+        );
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("git create"), "新名单要带 git create");
+        assert!(s.contains("别装 gh"), "要点明不用装 gh");
+        assert_eq!(s.matches(ENTRY_MARK).count(), 1, "重写不能重复追加入口块");
+        assert!(s.contains("# 用户说明"), "用户自己的内容不能丢");
+
+        // 重写后再跑一次：已经是最新的，不该再写。
+        assert!(
+            ensure_entry_at(&dir, "tba").is_none(),
+            "已是新版就不该反复重写"
+        );
     }
 
     // go() 输出头里的「交回」提示丢了，agent 就会干完直接结束回合——

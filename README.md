@@ -620,13 +620,14 @@ tba cap path                                   :: 打印 caps.toml 路径
 通用能力，用到才读正文（`tba cap <名字>`）
 - shot        看界面/验收 UI：一条命令出 png，后台窗口也能截
 - git-main    要提交推送：GitButler 项目自动走 but
+- git-create  要新建/连接 GitHub 仓库：一条命令建好并推送，别装 gh
 - release     要发版：生成 workflow / 打 tag / 等 CI
 - gui-notes   改 GUI 前先读：字体、黑体、别出豆腐块
 - no-console  【常驻】绝不弹黑框：所有命令都隐藏窗口调用
 ```
 
 只列名字是不够的：`gui-notes` 光看名字 agent 猜不出干什么，等于这条能力不存在。
-但正文也不能全贴进去（5 条正文合计 2600 字符，全内联每次开工多付 3 倍 token），
+但正文也不能全贴进去（6 条正文合计 3400 字符，全内联每次开工多付 3 倍 token），
 所以是「索引带触发条件 + 正文按需读」。
 
 **常驻（`always`）** 是给「动手前就得知道、等踩了坑再去读已经晚了」的约束型能力用的
@@ -635,8 +636,9 @@ tba cap path                                   :: 打印 caps.toml 路径
 窗口里在 **通用能力 → 能力（可编辑）**：列表带开关，每条能「编辑」「删除」，
 顶部「新增」「恢复内置」。改完立刻落盘，agent 下次 `tba cap <名字>` 读到的就是新正文。
 
-内置 5 条：`no-console`（禁止弹命令行，常驻）/ `shot`（截图）/ `git-main`（提交推送）/
-`release`（发版）/ `gui-notes`（写 GUI 的注意事项）。内置条目正文可改、删了能恢复
+内置 6 条：`no-console`（禁止弹命令行，常驻）/ `shot`（截图）/ `git-main`（提交推送）/
+`git-create`（创建/连接 GitHub 仓库）/ `release`（发版）/ `gui-notes`（写 GUI 的注意事项）。
+内置条目正文可改、删了能恢复
 （`tba cap restore`）。内置清单升级时会自动补进老用户的 `caps.toml`，但**不会**把你删掉的
 条目重新灌回来。
 
@@ -655,10 +657,36 @@ tba cap path                                   :: 打印 caps.toml 路径
 ```bat
 tba git status                        :: 分支 / 脏文件 / 远端领先落后 / 是不是 GitButler 项目
 tba git main -m "feat: xxx"           :: 提交并推送（默认推到 origin/HEAD 指向的分支）
+tba git update -m "xxx"               :: 同 main（给「更新到 GitHub」一个对得上话的名字）
 tba git main -m "xxx" --land          :: GitButler 项目里再跑 but land，直接落到目标分支
 tba git main -m "xxx" --dry           :: 只打印会跑哪些命令
 tba git tag --tag v1.2.3              :: 打 tag 并推
 ```
+
+### 创建 / 连接 GitHub 仓库（不用装 gh）
+
+被叫「建个 GitHub 仓库」「把这个项目传到 GitHub」时用这一条，**别让用户去装 `gh`，
+也别自己拼 `git remote add` + `git push`**：
+
+```bat
+tba git create                        :: 用当前目录名建公开仓库 + 加 origin + 推送
+tba git create --name my-app          :: 指定仓库名
+tba git create --private              :: 建私有仓库
+tba git create --dry                  :: 只打印会做什么，不真的建/推
+```
+
+一条命令做完：调 GitHub API 建仓库 → 加 `origin` 远端 →（没有提交就建初始提交）→ 推送。
+**幂等，可反复跑**：`origin` 已指向 GitHub 就不重复建、直接推送（等于「更新到 GitHub」）；
+指向别处会报错而不覆盖；目录还不在 git 仓库里会自动 `git init`。
+之后改代码仍用 `tba git main -m "..."`。
+
+前置只要一个 GitHub token，二选一：环境变量 `GH_TOKEN` / `GITHUB_TOKEN`，
+或者 `git push` 本来就能用（token 在 git 凭据里，tba 会读出来）。`tba doctor` 会显示是哪种。
+token 只在本次 push 的 HTTP header 里注入，**不会写进 `.git/config`**，避免 PAT 泄漏到远端 URL。
+
+> 这一条不依赖 GitButler CLI。`tba git` 整族只需要系统 git；即便没装 `but`，
+> `create` / `status` / `main` 都能正常跑（普通仓库路径）。
+> 反过来，如果 `tba git main` 发现没有 `origin`，会直接提示先跑 `tba git create`。
 
 自动判断走哪条路：
 

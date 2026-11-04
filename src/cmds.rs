@@ -105,6 +105,18 @@ fn doctor(store: &Store) -> String {
     } else {
         s.push_str("仓库:  当前目录不在 git 仓库里\n");
     }
+    // GitHub token：tba git create 唯一的外部依赖。只查环境变量，
+    // 不跑 `git credential fill`（可能弹凭据窗）；git 凭据那条由命令自己兜底。
+    let gh_env = ["GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .find(|k| std::env::var(k).map(|v| !v.trim().is_empty()).unwrap_or(false));
+    s.push_str(&format!(
+        "GitHub: {}\n",
+        match gh_env {
+            Some(k) => format!("{k} 已设（tba git create 可建仓库）"),
+            None => "没设 GH_TOKEN/GITHUB_TOKEN；若 `git push` 能用，tba git create 会读 git 凭据".to_string(),
+        }
+    ));
 
     // 字体：中文界面缺字体就会满屏口口，这条能直接定位。
     let fonts: Vec<&str> = [
@@ -511,8 +523,12 @@ pub fn run() -> Result<(), String> {
             | Cmd::Logout { .. }
             // 工具链和自检是「装东西之前」就要能跑的命令：没装 but 也得能查
             // 为什么编不了，否则用户卡在一个查不了的状态里。
+            // - git 通用能力（status / main / create / tag）只依赖系统 git，不依赖
+            //   GitButler CLI。is_gb_project 在 but 不存在时自然返回 false 走普通 git 分支；
+            //   拦住它等于「没装 GitButler 就建不了 GitHub 仓库」，纯属误伤。
             | Cmd::Toolchain { .. }
             | Cmd::Doctor
+            | Cmd::Git { .. }
             | Cmd::Ui
     );
     if !gb_exempt && std::env::var("TBA_SKIP_GITBUTLER").is_err() {
@@ -1822,12 +1838,19 @@ pub fn run() -> Result<(), String> {
             branch,
             land,
             tag,
+            name,
+            private,
+            remote,
             dry,
         } => match action.as_str() {
             "status" | "st" => println!("{}", crate::git::status()?),
-            "main" | "push" => println!(
+            "main" | "push" | "update" => println!(
                 "{}",
                 crate::git::main_push(message.as_deref(), branch.as_deref(), land, dry)?
+            ),
+            "create" | "new" => println!(
+                "{}",
+                crate::git::create_repo(name.as_deref(), private, &remote, dry)?
             ),
             "tag" => {
                 let t = tag
@@ -1837,7 +1860,7 @@ pub fn run() -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "未知动作: {other}（可选 status | main | tag）"
+                    "未知动作: {other}（可选 status | main | update | create | tag）"
                 ))
             }
         },

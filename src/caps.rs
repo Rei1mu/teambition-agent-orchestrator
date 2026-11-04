@@ -73,7 +73,9 @@ impl Default for CapsFile {
 /// 当前内置清单版本。加/删内置条目、或改内置条目的索引说明时 +1。
 ///
 /// v3：索引说明改成「何时用」句式，并给 no-console 标上常驻。
-const SEED: u32 = 3;
+/// v4：新增 git-create（建 GitHub 仓库）——以前没这条，agent 被叫「建仓库」
+///     时不知道 tba 能干，就退化去让用户装 gh 了。
+const SEED: u32 = 4;
 
 // ---- 内置正文 ----
 //
@@ -117,6 +119,50 @@ pub const BODY_GIT: &str = "\
 - 不 force push。push 被拒先 `git pull --rebase`。
 - 不提交 `.env`、token、`data/`。
 - 提交信息写清「改了什么」，别用「update」。
+
+## 仓库还不存在 / 没连到 GitHub
+先 `tba git create`，别自己拼 `git remote add`，也别去装 `gh`。
+详见 `tba cap git-create`。
+";
+
+pub const BODY_GIT_CREATE: &str = "\
+# 创建 / 连接 GitHub 仓库
+
+## 什么时候用
+用户说「建个 GitHub 仓库」「把这个项目传到 GitHub」「创建仓库」「更新到 GitHub」，
+而当前目录**还没有 GitHub 远端**时，用这一条。
+
+## 一条命令
+`tba git create [--name 仓库名] [--private] [--dry]`
+
+会做完：调 GitHub API 建仓库 -> 加 `origin` 远端 -> （没有提交就建初始提交）-> 推送。
+**不要装 `gh`**，也不要自己拼 `git remote add` + `git push`，更不要让用户去网页上手动建。
+
+## 参数
+- `--name <名>`：缺省用当前目录名；中文/空格会洗成 `-`。
+  名字**全是中文**时洗完为空，会报错要求你显式给个英文名。
+- `--private`：建私有仓库（默认公开）。
+- `--remote <名>`：远端名，默认 `origin`。
+- `--dry`：只打印会做什么，不真的建/推。拿不准先跑一次。
+
+## 幂等（可以反复跑）
+- `origin` 已指向 GitHub -> **不重复建**，直接推送，等于「更新到 GitHub」。
+- `origin` 指向别处（如 GitLab）-> 报错不覆盖，先 `git remote remove origin` 或换 `--remote`。
+- 目录还不在 git 仓库里 -> 自动 `git init`。
+
+## 前置条件
+需要 GitHub token，二选一：
+- 环境变量 `GH_TOKEN` / `GITHUB_TOKEN`（最稳，gh CLI 也认）；
+- 或 `git push` 本来就能用（token 在 git 凭据里，tba 会读出来）。
+`tba doctor` 会显示当前是哪种。token 只用于本次推送的 HTTP header，不会写进 `.git/config`。
+
+## 之后要更新代码
+`tba git main -m \"改了什么\"`（别名 `tba git update`）。GitButler 项目自动走 `but`。
+
+## 红线
+- 别让用户装 `gh`：建仓库这一件事 tba 已经能干。
+- 别 force push；别提交 `.env`、token、`data/`。
+- 建完把 `https://github.com/<owner>/<repo>` 报给用户。
 ";
 
 pub const BODY_RELEASE: &str = "\
@@ -224,6 +270,13 @@ pub const BUILTIN: &[(&str, &str, &str, bool, &str)] = &[
         "commit & push: `but` automatically for GitButler projects",
         false,
         BODY_GIT,
+    ),
+    (
+        "git-create",
+        "要新建/连接 GitHub 仓库：一条命令建好并推送，别装 gh",
+        "create/attach a GitHub repo: one command, no `gh` needed",
+        false,
+        BODY_GIT_CREATE,
     ),
     (
         "release",
@@ -615,6 +668,47 @@ mod tests {
         assert!(get(&store, "shot").is_none());
         restore(&store, Some("shot")).unwrap();
         assert_eq!(get(&store, "shot").unwrap().body, BODY_SHOT);
+    }
+
+    // 老用户（v3）升级到 v4：git-create 要自动出现在列表里，
+    // 否则老设备上的 agent 永远看不到这条能力，还会继续叫用户装 gh。
+    #[test]
+    fn seed_upgrade_adds_git_create_without_touching_user_caps() {
+        let store = tmp("seed-git-create");
+        let mut f = load(&store);
+        // 模拟老配置：没有 git-create，seeded=3，用户改过 git-main 的正文和开关。
+        f.caps.retain(|c| c.name != "git-create");
+        f.seeded = 3;
+        for c in f.caps.iter_mut() {
+            if c.name == "git-main" {
+                c.body = "我自己写的提交流程".into();
+                c.on = false;
+            }
+        }
+        save(&store, &f).unwrap();
+
+        let after = load(&store);
+        let created = after
+            .caps
+            .iter()
+            .find(|c| c.name == "git-create")
+            .expect("v3 升级后必须补上 git-create");
+        assert!(created.on && created.builtin);
+        assert_eq!(created.body, BODY_GIT_CREATE);
+        assert!(created.summary.contains("GitHub"));
+
+        let main = after.caps.iter().find(|c| c.name == "git-main").unwrap();
+        assert_eq!(main.body, "我自己写的提交流程", "升级不许覆盖用户正文");
+        assert!(!main.on, "升级不许覆盖用户开关");
+        assert_eq!(after.seeded, SEED);
+    }
+
+    // 新增的内置能力正文里必须点明「别装 gh」：这正是这次要解决的问题。
+    #[test]
+    fn git_create_body_forbids_installing_gh() {
+        assert!(BODY_GIT_CREATE.contains("gh"));
+        assert!(BODY_GIT_CREATE.contains("tba git create"));
+        assert!(BODY_GIT_CREATE.contains("GH_TOKEN"));
     }
 
     // 编辑同名条目不该产生第二条；开关以传入值为准（GUI 编辑时带原值，不会误开）。

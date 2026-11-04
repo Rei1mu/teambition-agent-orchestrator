@@ -411,9 +411,10 @@ pub enum Cmd {
         #[arg(long, default_value = "fast")]
         level: String,
     },
-    /// 通用能力：git。status 看状态 / main 提交并推送 / tag 打标签
+    /// 通用能力：git。status 看状态 / main(别名 update) 提交并推送 /
+    /// create 建 GitHub 仓库并推送（不用装 gh）/ tag 打标签
     Git {
-        /// status | main | tag
+        /// status | main | update | create | tag
         #[arg(default_value = "status")]
         action: String,
         /// main 的提交信息
@@ -428,6 +429,15 @@ pub enum Cmd {
         /// tag 动作的参数，如 v0.2.0（可省略 v）
         #[arg(long)]
         tag: Option<String>,
+        /// create 用：仓库名。缺省用当前目录名（中文/空格洗成 -，全中文要显式给名）
+        #[arg(long)]
+        name: Option<String>,
+        /// create 用：建私有仓库（默认公开）
+        #[arg(long)]
+        private: bool,
+        /// create 用：远端名，默认 origin
+        #[arg(long, default_value = "origin")]
+        remote: String,
         /// 只打印将要执行的命令，不执行
         #[arg(long)]
         dry: bool,

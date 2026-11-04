@@ -250,6 +250,16 @@ pub fn main_push(
         return Ok(log.trim_end().to_string());
     }
 
+    // 没有 origin 时别只丢一句「push 失败」——agent 会以为要装 gh 或自己拼 remote。
+    // 放在提交之前：先提交再报错会留下一个用户没预期的本地 commit。
+    if remote_url(&root, "origin").is_none() {
+        return Err(format!(
+            "没有 origin 远端，推不上去。\n\
+             先把这个目录建到 GitHub：`tba git create`（不用装 gh，会自动建仓库+加远端+推送），\n\
+             之后再用 `tba git main -m \"...\"` 更新。"
+        ));
+    }
+
     if !files.is_empty() {
         let r = git(&root, &["add", "-A"])?;
         if r.code != 0 {
@@ -777,6 +787,319 @@ pub fn init_workflow(exe: Option<&str>, force: bool) -> Result<String, String> {
     ))
 }
 
+// ---- 创建 GitHub 仓库 ----
+//
+// 为什么要内置：agent 被叫「建个 GitHub 仓库」时，没有这条能力就只能退化去让用户装 `gh`，
+// 或者自己拼 `git remote add` + push（还容易拼错远端 URL、漏了 token）。
+// 固化成一条命令后，agent 只需要 `tba git create`，行为由这里保证：
+// 退出码 + 人读的一行行文字，token 不在 .git/config 落明文。
+
+// 内置 base64：只给 push 时注入 token 的 HTTP header 用，token 是 ASCII，不值得为它拉依赖。
+fn b64_encode(input: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i < input.len() {
+        let b0 = input[i];
+        let b1 = *input.get(i + 1).unwrap_or(&0);
+        let b2 = *input.get(i + 2).unwrap_or(&0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(CHARS[((n >> 18) & 63) as usize] as char);
+        out.push(CHARS[((n >> 12) & 63) as usize] as char);
+        out.push(if i + 1 < input.len() { CHARS[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if i + 2 < input.len() { CHARS[(n & 63) as usize] as char } else { '=' });
+        i += 3;
+    }
+    out
+}
+
+// POST 到 GitHub API（建仓库用）。
+fn api_post(url: &str, token: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("tba-cli")
+        .build()
+        .map_err(|e| format!("建 HTTP 客户端失败: {e}"))?
+        .post(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("token {token}"))
+        .header("Content-Type", "application/json")
+        .body(
+            serde_json::to_string(body).map_err(|e| format!("序列化请求体失败: {e}"))?,
+        )
+        .send()
+        .map_err(|e| format!("GitHub 请求失败: {e}"))?;
+    let code = resp.status().as_u16();
+    let text = resp.text().unwrap_or_default();
+    match code {
+        200 | 201 => serde_json::from_str(&text).map_err(|e| format!("解析 JSON 失败: {e}")),
+        401 => Err(
+            "GitHub token 无效或未授权（401）：检查 GH_TOKEN / GITHUB_TOKEN 或 git 凭据".to_string(),
+        ),
+        422 => Err(format!("GitHub 拒绝创建（422）：{}", api_err_msg(&text))),
+        _ => Err(format!("GitHub API {code}: {}", api_err_msg(&text))),
+    }
+}
+
+fn api_err_msg(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v["message"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| text.chars().take(300).collect())
+}
+
+fn remote_url(root: &Path, name: &str) -> Option<String> {
+    let o = git(root, &["remote", "get-url", name]).ok()?;
+    if o.code == 0 && !o.out.trim().is_empty() {
+        Some(o.out.trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn is_github_url(u: &str) -> bool {
+    u.contains("github.com")
+}
+
+// GitHub 仓库名只接受 ASCII 字母数字、-_.；其它字符（中文/空格）替换成 -。
+// 目录名里带中文时不清洗会直接被 API 422 拒掉，agent 又得回头猜原因。
+fn sanitize_repo_name(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn current_branch(root: &Path) -> String {
+    if let Ok(o) = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        let b = o.out.trim();
+        if o.code == 0 && !b.is_empty() && b != "HEAD" {
+            return b.to_string();
+        }
+    }
+    default_branch(root)
+}
+
+// 用 token 注入 HTTP header 推送，不在 .git/config 留明文（避免 PAT 泄漏到 remote URL）。
+fn push_with_token(
+    root: &Path,
+    remote: &str,
+    branch: &str,
+    token: &str,
+) -> Result<String, String> {
+    let header = format!("Authorization: Basic {}", b64_encode(format!(":{token}").as_bytes()));
+    // 只在 github.com 上注入：写死域名，token 不会随任何重定向跑到第三方域。
+    // 注意 key 里带 URL，git 的 -c 按第一个 = 分割，value 里的 = (base64 padding) 会保留。
+    let mut c = Command::new("git");
+    c.current_dir(root).args([
+        "-c",
+        &format!("http.https://github.com/.extraHeader={header}"),
+        "push",
+        "-u",
+        remote,
+        &format!("HEAD:{branch}"),
+    ]);
+    crate::proc::hide(&mut c);
+    let o = c
+        .output()
+        .map_err(|e| format!("起不来 git: {e}"))?;
+    let out = Out {
+        code: o.status.code().unwrap_or(-1),
+        out: String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        err: String::from_utf8_lossy(&o.stderr).trim().to_string(),
+    };
+    if out.code != 0 {
+        return Err(format!(
+            "git push 失败: {}\n（确认 token 有 repo 权限；私有仓库需要 `repo` scope）",
+            tail(&out)
+        ));
+    }
+    Ok(format!("已推送 {branch} -> {remote}（新建上游分支）\n"))
+}
+
+// 确保本地至少有一个提交；没有就 stage 全部并建一个 init 提交。返回当前分支名。
+fn ensure_commit(root: &Path) -> Result<String, String> {
+    let has = git(root, &["rev-parse", "--verify", "HEAD"])
+        .map(|o| o.code == 0)
+        .unwrap_or(false);
+    if has {
+        return Ok(current_branch(root));
+    }
+    let (_, files) = porcelain(root)?;
+    if files.is_empty() {
+        return Err(
+            "当前目录没有任何可提交的文件，没法推送。先放点内容，或确认改动没被 .gitignore 吞掉。"
+                .to_string(),
+        );
+    }
+    let r = git(root, &["add", "-A"])?;
+    if r.code != 0 {
+        return Err(format!("git add 失败: {}", tail(&r)));
+    }
+    let r = git(root, &["commit", "-m", "init: 初始化仓库"])?;
+    if r.code != 0 {
+        return Err(format!("初始提交失败: {}", tail(&r)));
+    }
+    Ok(current_branch(root))
+}
+
+// --dry 的纯预览：不碰 token、不建仓库、不 git init。
+// 「先看看会做什么」不该有前置条件，否则没配 token 的设备连预览都跑不了。
+fn dry_preview(name: &str, private: bool, remote: &str, existing: Option<&str>) -> String {
+    match existing {
+        Some(u) if is_github_url(u) => format!(
+            "[dry] 远端 {remote} 已指向 GitHub（{u}）\n  \
+             不重复建仓库，直接：git push -u {remote} HEAD:<当前分支>（更新）"
+        ),
+        Some(u) => format!(
+            "[dry] 会报错并停止：远端 {remote} 已指向 {u}（不是 GitHub），不会覆盖。\n  \
+             先 `git remote remove {remote}`，或换一个 --remote 名字"
+        ),
+        None => format!(
+            "[dry] 将执行：\n  \
+             POST https://api.github.com/user/repos  name={name} private={private}\n  \
+             git remote add {remote} https://github.com/<你>/{name}.git\n  \
+             （没有提交就建初始提交）\n  \
+             git push -u {remote} <当前分支>"
+        ),
+    }
+}
+
+// 创建 GitHub 仓库并推送当前目录。幂等：
+//   - 远端已指向 GitHub -> 走更新（直接推，不重复建）
+//   - 远端指向别处 -> 报错，不覆盖
+//   - 没有远端 -> 调 API 建仓库、加远端、推
+pub fn create_repo(
+    name: Option<&str>,
+    private: bool,
+    remote: &str,
+    dry: bool,
+) -> Result<String, String> {
+    // 1. 仓库根。不在 git 仓库里就自动 git init，让「把文件夹变成 GitHub 仓库」一步到位。
+    //    dry 时绝不 init：预览不该改用户的目录。
+    let root = match repo_root() {
+        Ok(r) => r,
+        Err(_) => {
+            let cwd = std::env::current_dir().map_err(|e| format!("取当前目录失败: {e}"))?;
+            if !dry {
+                if !cwd.join(".git").exists() {
+                    let r = git(&cwd, &["init"])?;
+                    if r.code != 0 {
+                        return Err(format!("git init 失败: {}", tail(&r)));
+                    }
+                }
+            }
+            cwd
+        }
+    };
+
+    // 2. 名字：命令行 > 目录名。GitHub 不接受中文/空格，过滤成 ASCII 安全字符。
+    let raw_name = match name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".to_string()),
+    };
+    let name = sanitize_repo_name(&raw_name);
+    if name.is_empty() {
+        return Err(format!(
+            "仓库名 {raw_name:?} 洗完是空的（全是中文/符号）。用 `tba git create <英文名>` 指定一个"
+        ));
+    }
+
+    let existing = remote_url(&root, remote);
+    if dry {
+        return Ok(dry_preview(&name, private, remote, existing.as_deref()));
+    }
+
+    // 3. token：只有真要建仓库/推送时才要。dry 已经提前返回，不会走到这里。
+    let token = github_token().ok_or_else(|| {
+        "没有 GitHub token，没法建仓库或推送：\n  \
+         - 设环境变量 GH_TOKEN（gh CLI 也认这个，最稳）\n  \
+         - 或在 git 凭据里存过 github.com 的令牌（tba 会读出来）"
+            .to_string()
+    })?;
+
+    // 4. 已有远端？
+    if let Some(url) = &existing {
+        if is_github_url(url) {
+            let mut log = format!("远端 {remote} 已指向 GitHub（{url}），跳过创建直接推送\n");
+            let branch = ensure_commit(&root)?;
+            log.push_str(&push_with_token(&root, remote, &branch, &token)?);
+            if let Some(slug) = repo_slug(&root) {
+                log.push_str(&format!("\n仓库页: https://github.com/{slug}\n"));
+            }
+            return Ok(log.trim_end().to_string());
+        }
+        return Err(format!(
+            "远端 {remote} 已指向 {url}（不是 GitHub）。\n\
+             要换到 GitHub：先 `git remote remove {remote}`，或换一个 --remote 名字。"
+        ));
+    }
+
+    // 5. 建仓库（422 多半是已存在，GET 确认后当已存在继续）。
+    let body = serde_json::json!({
+        "name": name,
+        "private": private,
+        "auto_init": false,
+        "description": ""
+    });
+    let created = match api_post("https://api.github.com/user/repos", &token, &body) {
+        Ok(v) => v,
+        Err(e) => {
+            // 422 最常见是「同名仓库已存在」。这时不该让 agent 卡住重试，
+            // 而是查到那个仓库、连上去推送。GET /repos 必须带 owner，
+            // 先 /user 取当前登录名（POST /user/repos 建的就在它名下）。
+            if e.contains("422") {
+                let owner = api_get("https://api.github.com/user", Some(&token))
+                    .ok()
+                    .and_then(|v| v["login"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                if owner.is_empty() {
+                    return Err(e);
+                }
+                match api_get(
+                    &format!("https://api.github.com/repos/{owner}/{name}"),
+                    Some(&token),
+                ) {
+                    Ok(v) if v["full_name"].as_str().is_some() => v,
+                    _ => return Err(e),
+                }
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    let owner = created["owner"]["login"].as_str().unwrap_or("").to_string();
+    let repo_name = created["name"].as_str().unwrap_or(&name).to_string();
+    let html_url = created["html_url"].as_str().unwrap_or("").to_string();
+
+    // 6. 加远端（plain URL，推送时才临时注入 token，不在 .git/config 留明文）。
+    let clone_url = format!("https://github.com/{owner}/{repo_name}.git");
+    let r = git(&root, &["remote", "add", remote, &clone_url])?;
+    if r.code != 0 {
+        return Err(format!("git remote add 失败: {}", tail(&r)));
+    }
+
+    // 7. 没有提交先建一个初始提交（仅当有文件可提交）。
+    let branch = ensure_commit(&root)?;
+
+    // 8. 推送。
+    let mut log = format!("已创建仓库: {html_url}\n");
+    log.push_str(&push_with_token(&root, remote, &branch, &token)?);
+    log.push_str(&format!("\n克隆地址: git clone {clone_url}"));
+    Ok(log.trim_end().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,5 +1141,57 @@ mod tests {
         let z = workflow_yaml("app", None);
         assert!(z.contains("Compress-Archive"));
         assert!(!z.contains("iscc"));
+    }
+
+    #[test]
+    fn b64_encode_matches_known_vectors() {
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        // token 注入用的是 Basic base64(":<token>")，冒号开头不能漏。
+        assert_eq!(b64_encode(b":abc"), "OmFiYw==");
+    }
+
+    #[test]
+    fn sanitize_repo_name_keeps_github_legal_chars() {
+        assert_eq!(sanitize_repo_name(" my.repo_v2 "), "my.repo_v2");
+        assert_eq!(sanitize_repo_name("Hello World"), "Hello-World");
+        // 中文/空格全替换成 -，尾部的再 trim 掉
+        assert_eq!(sanitize_repo_name("tba 工具"), "tba");
+        assert_eq!(sanitize_repo_name("tbhub"), "tbhub");
+        // 全是非法字符时会清空：调用方必须给个兜底名，别把空串发给 API
+        assert_eq!(sanitize_repo_name("我的项目"), "");
+    }
+
+    #[test]
+    fn is_github_url_accepts_https_and_ssh() {
+        assert!(is_github_url("https://github.com/foo/bar.git"));
+        assert!(is_github_url("git@github.com:foo/bar.git"));
+        assert!(!is_github_url("https://gitlab.com/foo/bar.git"));
+        assert!(!is_github_url(""));
+    }
+
+    #[test]
+    fn dry_preview_covers_all_three_remote_states() {
+        let none = dry_preview("my-app", false, "origin", None);
+        assert!(none.contains("POST https://api.github.com/user/repos"));
+        assert!(none.contains("git remote add origin"));
+
+        let github = dry_preview("my-app", true, "origin", Some("https://github.com/me/my-app.git"));
+        assert!(github.contains("不重复建仓库"), "已有 GitHub 远端要走更新: {github}");
+        assert!(!github.contains("POST"), "更新分支不该再建仓库");
+
+        let other = dry_preview("my-app", false, "origin", Some("https://gitlab.com/me/x.git"));
+        assert!(other.contains("会报错并停止"), "非 GitHub 远端不能覆盖: {other}");
+    }
+
+    #[test]
+    fn api_err_msg_pulls_github_message() {
+        assert_eq!(
+            api_err_msg(r#"{"message":"name already exists on this account"}"#),
+            "name already exists on this account"
+        );
+        assert!(api_err_msg("not json").starts_with("not json"));
     }
 }
