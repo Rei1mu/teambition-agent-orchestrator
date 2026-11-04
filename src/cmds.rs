@@ -163,8 +163,8 @@ fn resolve_project(project: Option<&str>) -> Result<String, String> {
     match read_project_binding() {
         Some(b) => Ok(b),
         None => Err(
-            "没指定项目，当前目录也没绑定。先 `tba ensure-project`（项目名取目录名），\
-             或加 --project <id>"
+            "没指定项目，当前目录也没绑定。先 `tba ensure-project --dry-run` 看候选项目名、\
+             让用户挑一个再 `--name`，或加 --project <id>"
                 .to_string(),
         ),
     }
@@ -421,6 +421,64 @@ fn dash(s: &str) -> &str {
     } else {
         s
     }
+}
+
+// `ensure-project --dry-run`：只报候选，不建、不写绑定。
+//
+// 目的很具体：建项目前得先知道这个仓库该叫什么。目录名经常不可靠
+// （可能叫 code / tmp / TBHub），所以扫 git remote、构建清单、子目录里的项目，
+// 把候选连同来源列出来，由用户拍板。
+fn print_name_candidates(store: &Store, given: Option<&str>, project: Option<&str>) {
+    let dir = std::env::current_dir().unwrap_or_default();
+    println!("扫描目录: {}", dir.display());
+
+    let list = match given.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => vec![crate::naming::Candidate {
+            name: n.to_string(),
+            source: "命令行 --name".to_string(),
+        }],
+        None => crate::naming::candidates(&dir),
+    };
+
+    if list.is_empty() {
+        println!("没找到可用的名字线索：没有 git remote，也没有 Cargo.toml / package.json 这类清单。");
+        println!("直接问用户要一个项目名，再跑 `tba ensure-project --name \"<名字>\"`。");
+        return;
+    }
+
+    // 核对 Teambition 里有没有同名：决定「新建」还是「复用」，用户拍板时要知道。
+    // 连不上（离线/网络）就不拦，标一句「未核对」即可。
+    let cfg = store.load_config();
+    let existing: Option<Vec<(String, String)>> = if cfg.offline() {
+        None
+    } else {
+        crate::ops::Ctx::new(store.clone(), false)
+            .and_then(|mut c| c.list_projects())
+            .ok()
+            .map(|all| {
+                all.iter()
+                    .map(|p| (p.id.clone(), p.name.clone()))
+                    .collect()
+            })
+    };
+
+    if let Some(p) = project.map(str::trim).filter(|s| !s.is_empty()) {
+        println!("指定项目 id: {p}（dry-run 不校验）");
+    }
+    println!("\n候选项目名（把这份原样交给用户拍板，不要自己挑）：");
+    for (i, c) in list.iter().enumerate() {
+        let mark = match &existing {
+            None => "未核对（连不上 Teambition）".to_string(),
+            Some(all) => match all.iter().filter(|(_, n)| n == &c.name).count() {
+                0 => "Teambition 里没有，会新建".to_string(),
+                1 => "已有同名，会复用".to_string(),
+                n => format!("有 {n} 个同名，需要 --project 指定"),
+            },
+        };
+        println!("  {}. {}\t来源: {}\t{}", i + 1, c.name, c.source, mark);
+    }
+    println!("\n用户选定后：tba ensure-project --name \"<选定的名字>\"");
+    println!("以上只是列候选：没有创建项目，也没有改本地绑定。");
 }
 
 pub fn run() -> Result<(), String> {
@@ -737,7 +795,28 @@ pub fn run() -> Result<(), String> {
                 println!("    建好后重跑一次 tb init 校验。");
             }
         }
-        Cmd::EnsureProject { name, project } => {
+        Cmd::EnsureProject {
+            name,
+            project,
+            dry_run,
+            yes,
+        } => {
+            if dry_run {
+                print_name_candidates(&store, name.as_deref(), project.as_deref());
+                return Ok(());
+            }
+            // 没给名字也没给 id：先让用户看到候选再决定。
+            // 以前这里直接用目录名建——目录名经常是 code / tmp / 工具名，
+            // 一建就是错名字的项目，删起来还得去网页。真要目录名就显式 --yes。
+            let no_name = name.as_deref().map(str::trim).unwrap_or("").is_empty();
+            let no_id = project.as_deref().map(str::trim).unwrap_or("").is_empty();
+            if no_name && no_id && !yes {
+                print_name_candidates(&store, None, None);
+                return Err("没给项目名，先别建：让用户从上面挑一个，再跑 \
+                            `tba ensure-project --name \"<选定的名字>\"`。\
+                            确实要用当前目录名就加 `--yes`。"
+                    .to_string());
+            }
             let mut ctx = Ctx::new(store.clone(), false)?;
             // 没给名字也没给 id 时用当前目录名——这条命令本来就是「给这个目录接项目」，
             // 显式调用即代表用户同意按目录名新建。
@@ -1027,7 +1106,8 @@ pub fn run() -> Result<(), String> {
                     println!("NO_BINDING {cwd}");
                     eprintln!("当前目录没有绑定 Teambition 项目（缺 .tba/project）。停，不领任务。");
                     eprintln!(
-                        "要接入：`tba ensure-project`（项目名取目录名），或 `tba ensure-project --name <名字>`"
+                        "要接入：先 `tba ensure-project --dry-run` 扫候选项目名，\
+                         把候选列给用户挑，再 `tba ensure-project --name \"<选定的名字>\"`"
                     );
                     let _ = std::io::stdout().flush();
                     std::process::exit(3);

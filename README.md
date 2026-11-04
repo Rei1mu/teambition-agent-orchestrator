@@ -875,6 +875,33 @@ tba prompt --project <id> --task-file .\todo.md        :: 任务正文从文件�
 
 两个按钮的差别是**刻意的**：点「领列1任务」时哪怕输入框里还留着上次写的草稿，文案里也不会出现——否则 agent 会自建任务而不是去领，行为就跑偏了。
 
+### 还没有项目时：先扫候选，再拍板
+
+顶栏的 `复制项目初始化文案` 不再让 agent「拿目录名直接建」。文案要求它先跑：
+
+```bat
+tba ensure-project --dry-run
+```
+
+这条命令扫当前目录，把候选项目名连**来源**一起列出来（数字越小越可信）：
+
+| 来源 | 例子 |
+|---|---|
+| git remote origin | `teambition-agent-orchestrator` |
+| 构建清单里的包名（Cargo.toml / package.json / pyproject.toml / go.mod / composer.json / pubspec.yaml） | `tba-cli` |
+| 子目录里的项目（会话目录常装着好几个仓库） | `web` → `acme-web` |
+| git 仓库根目录名 | `mcp` |
+| 当前目录名（最弱，经常是 `code` / `tmp` / 工具名） | `workspace` |
+
+同时标出 Teambition 里是否已有同名（新建 / 复用 / 有多个同名），离线则标「未核对」。
+agent 必须把这份**原样列给用户**，由用户挑一个，再跑 `tba ensure-project --name "<选定的名字>"`。
+只有一个候选也要问一次。
+
+`tba ensure-project` 不带 `--name` / `--project` 时会**拒绝创建**，只打候选并退出码 1——
+目录名不该在用户没点头的情况下变成项目名。确实要用目录名就显式加 `--yes`。
+
+`tba prompt --init` 打印的就是这份接入文案；`--name` 给了名字则跳过候选直接用它。
+
 ### 省 token 设计（英文速查表 + skill 按需读）
 
 文案是发给 agent 的、人基本不读，所以按 token 成本优化过：

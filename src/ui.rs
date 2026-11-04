@@ -1187,21 +1187,21 @@ impl eframe::App for App {
                     {
                         self.logout();
                     }
-                    // 本地一个项目都没有时用这份：发给 agent，让它自己判断
-                    // 它跑的那个仓库在 Teambition 建没建，没建就建。
-                    // 所以这里不带项目名——名字由 agent 用所在目录名决定。
+                    // 本地一个项目都没有时用这份：发给 agent，让它先扫所在仓库、
+                    // 把候选项目名列给用户拍板，确认了才建。所以这里不带项目名。
                     if ui
                         .button("复制项目初始化文案")
                         .on_hover_text(
-                            "还没有 Teambition 项目时用：把这段发给 agent，它会在所在仓库跑 \
-                             tb ensure-project，先判断项目建没建，没有就新建（项目名默认取目录名）",
+                            "还没有 Teambition 项目时用：把这段发给 agent。它会先在仓库里跑 \
+                             tba ensure-project --dry-run，扫出候选项目名（git remote / Cargo.toml / \
+                             package.json / 子目录里的项目）连来源一起列给你，你选定之后才建。",
                         )
                         .clicked()
                     {
                         let text = crate::ops::init_prompt(&self.store, None, Lang::Zh);
                         ui.ctx().copy_text(text);
-                        self.status = "已复制项目初始化文案：发给 agent，它会自己判断项目建没建、\
-                                       没建就用仓库目录名新建。"
+                        self.status = "已复制项目初始化文案：发给 agent，它会先扫仓库列出候选项目名，\
+                                       等你拍板后 `tba ensure-project --name <你选的名字>`。"
                             .to_string();
                     }
                 }

@@ -3797,9 +3797,10 @@ fn direct_workflow_text(exe: &str, project_id: &str, lang: Lang) -> String {
 // 和开工文案是两件事：这份只管「项目存不存在 / 建没建 / 阶段齐不齐」，
 // 不涉及任务队列，所以不带任务、不带 skill、不带记忆——那要等项目建好之后才有。
 //
-// 项目名默认不写死（传 None）：让 agent 用它所在目录名当项目名，
-// 因为只有 agent 知道它跑在哪个仓库。GUI 顶栏按钮就是这个用法——
-// 那会儿本地可能一个项目都没有，谈不上「选哪个项目」。
+// 项目名不写死（传 None）：GUI 那个按钮只知道「要接入」，不知道 agent 跑在哪个仓库，
+// 所以文案里让它先跑 `ensure-project --dry-run` 扫候选，再交用户拍板。
+// 不这么做的后果是实打实踩过的：agent 拿目录名（甚至界面上的工具名 TBHub）当项目名，
+// 一建就是个错名字的项目，后面还得删。
 pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> String {
     let cfg = store.load_config();
     // 跟开工文案同一套路径策略：配了短命令就用短的（现在默认裸 `tba`）。
@@ -3810,19 +3811,34 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
     } else {
         cfg.tool_path.trim().to_string()
     };
-    // 有名字就固定用它；没有就写裸命令，并交代「默认取目录名、不对就 --name」。
+    // 有名字就固定用它；没有就走「先扫候选、用户拍板」的流程。
     let given = project_name.map(str::trim).filter(|s| !s.is_empty());
     let zh = lang == Lang::Zh;
     let mut s = String::new();
     if zh {
-        s.push_str("# TBHub 项目接入\n这个仓库还没接 Teambition。先判断项目建没建，没有就建（幂等，有就复用）：\n\n");
+        s.push_str(
+            "# 给当前仓库接入 Teambition\n\
+             「TBHub / tba」是工具名，**不是项目名**，不要拿它当项目名。\n\
+             这个仓库还没接 Teambition。建项目之前先搞清楚它该叫什么：\n\n",
+        );
         match given {
             Some(n) => s.push_str(&format!("1. 跑 `{exe} ensure-project --name \"{n}\"`\n")),
             None => {
-                s.push_str(&format!("1. 在仓库根目录跑 `{exe} ensure-project`\n"));
+                s.push_str(&format!("1. 在仓库根目录跑 `{exe} ensure-project --dry-run`\n"));
                 s.push_str(
-                    "   不带 --name 时项目名取当前目录名；目录名不是想要的就加 `--name \"<名字>\"`。\n",
+                    "   它会扫这个目录（git remote、Cargo.toml / package.json / pyproject.toml / go.mod、\
+                     子目录里的项目），把候选项目名连来源一起列出来，并标出 Teambition 里是否已有同名。\n\n",
                 );
+                s.push_str(
+                    "2. **把候选原样列给用户，让用户拍板**（编号 + 名字 + 来源）。\n  \
+                     - 不要自己挑一个就用，也不要默认拿目录名。\n  \
+                     - 只有一个候选也要问一次。\n  \
+                     - 候选都不对（新仓库、目录名没意义）就问用户要叫什么；\
+                     他要是只给了一句描述，你据此起 2~3 个名字再让他选。\n\n",
+                );
+                s.push_str(&format!(
+                    "3. 用户确认后（假设他选了 `<名字>`）：`{exe} ensure-project --name \"<名字>\"`\n"
+                ));
             }
         }
         s.push_str(
@@ -3831,7 +3847,7 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
         );
         s.push_str("   成功最后一行是 `项目就绪: <id>  <名字>（新建/复用）`。\n");
         s.push_str(&format!(
-            "2. 用那个 id 继续：`{exe} prompt --project <id>`，照输出开工。\n\n"
+            "4. 用那个 id 继续：`{exe} prompt --project <id>`，照输出开工。\n\n"
         ));
         s.push_str(&format!(
             "之后在本目录直接跑 `{exe} prompt`（不带 --project）即可，id 已写进 .tba/project。\n\
@@ -3839,15 +3855,31 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
         ));
     } else {
         s.push_str(
-            "# TBHub project onboarding\nThis repo is not linked to Teambition yet. Check whether the project exists; create it if not (idempotent):\n\n",
+            "# Onboard this repo to Teambition\n\
+             \"TBHub / tba\" is the tool name, **not the project name** - do not use it as one.\n\
+             This repo is not linked to Teambition yet. Settle the name before creating anything:\n\n",
         );
         match given {
             Some(n) => s.push_str(&format!("1. Run `{exe} ensure-project --name \"{n}\"`\n")),
             None => {
-                s.push_str(&format!("1. In the repo root run `{exe} ensure-project`\n"));
+                s.push_str(&format!(
+                    "1. In the repo root run `{exe} ensure-project --dry-run`\n"
+                ));
                 s.push_str(
-                    "   Without --name the project name is the current directory name; add `--name \"<name>\"` if that is not what you want.\n",
+                    "   It scans this directory (git remote, Cargo.toml / package.json / pyproject.toml / go.mod, \
+                     projects in subdirectories) and lists candidate project names with their source, \
+                     marking which ones already exist in Teambition.\n\n",
                 );
+                s.push_str(
+                    "2. **Show the candidates to the user and let them decide** (number + name + source).\n  \
+                     - Do not pick one yourself, and do not default to the directory name.\n  \
+                     - Ask even when there is only one candidate.\n  \
+                     - If none fit (new repo, meaningless directory name), ask the user for a name; \
+                     if they only describe the project, propose 2-3 names and let them choose.\n\n",
+                );
+                s.push_str(&format!(
+                    "3. After the user confirms (say they picked `<name>`): `{exe} ensure-project --name \"<name>\"`\n"
+                ));
             }
         }
         s.push_str(
@@ -3856,7 +3888,7 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
         );
         s.push_str("   Last line is `项目就绪: <id>  <name> (new/reused)`.\n");
         s.push_str(&format!(
-            "2. Continue with that id: `{exe} prompt --project <id>` and follow the output.\n\n"
+            "4. Continue with that id: `{exe} prompt --project <id>` and follow the output.\n\n"
         ));
         s.push_str(&format!(
             "Afterwards just run `{exe} prompt` in this dir (no --project); the id is in .tba/project.\n\
@@ -3865,7 +3897,6 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
     }
     s
 }
-
 // ---- tb go：一句话开工 ----
 //
 // 用户只发一句话（`tba g`），剩下的判定全在这里做，用**退出码**交给 agent 分支：
@@ -4351,6 +4382,27 @@ mod tests {
             }
         }
         cjk + other / 4
+    }
+
+    // 项目接入文案：不带名字时必须走「先扫候选、用户拍板」，不能又退回「拿目录名直接建」。
+    // 也不能把工具名 TBHub 当项目名（这是踩过的坑）。
+    #[test]
+    fn init_prompt_asks_user_to_pick_name() {
+        let store = tmp_store("init-prompt");
+        let zh = init_prompt(&store, None, Lang::Zh);
+        assert!(zh.contains("ensure-project --dry-run"), "{zh}");
+        assert!(zh.contains("拍板"), "{zh}");
+        assert!(zh.contains("不要自己挑"), "{zh}");
+        // 不再把工具名当项目名
+        assert!(!zh.contains("TBHub 项目接入"), "{zh}");
+        assert!(zh.contains("不是项目名"), "{zh}");
+        // 不带 --name 直接建的那条老指令必须消失（否则 agent 会照着做）
+        assert!(!zh.contains("ensure-project`\n"), "{zh}");
+
+        // 给了名字就固定用它，不再让用户挑
+        let named = init_prompt(&store, Some("MarinIME"), Lang::Zh);
+        assert!(named.contains("--name \"MarinIME\""), "{named}");
+        assert!(!named.contains("--dry-run"), "{named}");
     }
 
     // 「复制agent文案(本次任务)」：填了正文就带草稿，标题取首行。

@@ -8,6 +8,7 @@ mod git;
 mod gitbutler;
 mod mail;
 mod mcp_server;
+mod naming;
 mod oauth;
 mod ops;
 mod proc;
@@ -94,12 +95,19 @@ pub enum Cmd {
     /// 给当前目录接一个 Teambition 项目：有就复用，没有就新建，并补齐阶段/记忆状态。
     /// 幂等，可反复跑。成功后把 project id 记到 .tba/project
     EnsureProject {
-        /// 项目名。给了但项目不存在就新建；不给则用当前目录名
+        /// 项目名。给了但项目不存在就新建
         #[arg(long)]
         name: Option<String>,
         /// 已有项目 id（跳过按名字查找）
         #[arg(long)]
         project: Option<String>,
+        /// 只扫目录列出候选项目名（含来源、是否已有同名），不创建、不写绑定。
+        /// 给人拍板用：先看候选，再决定 --name 填什么
+        #[arg(long)]
+        dry_run: bool,
+        /// 确实要用当前目录名当项目名（不给 --name / --project 时必须显式加这个）
+        #[arg(long)]
+        yes: bool,
     },
     /// 列出项目的所有 skill 及本地开关
     Skills {
@@ -330,8 +338,8 @@ pub enum Cmd {
         /// 文案语言：zh=中文(准本，默认) / en=英文(压缩版，省 token)
         #[arg(long, default_value = "zh")]
         lang: String,
-        /// 只打印「项目接入文案」：让 agent 自己判断项目建没建、没建就建。
-        /// 不解析也不新建项目，用 --name（缺省取当前目录名）当项目名
+        /// 只打印「项目接入文案」：让 agent 先扫仓库列出候选项目名、由用户拍板，再建项目。
+        /// 不解析也不新建项目。--name 给了就固定用那个名字
         #[arg(long)]
         init: bool,
     },
