@@ -1,6 +1,6 @@
 [package]
 name = "tba-cli"
-version = "0.2.22"
+version = "0.2.23"
 edition = "2021"
 description = "TBA - Teambition Agent (CLI + MCP + egui 窗口)"
 default-run = "tba"

@@ -550,7 +550,7 @@ fn mcp_install() -> Result<String, String> {
 fn auto_bootstrap(store: &Store) -> Result<(), String> {
     println!(
         "tba 是本机已安装的命令行工具（在 PATH 里）。直接执行它。\n\
-         不要搜 exe、不要验证路径、不要读源码。跑不通就把错误原样报给用户。\n"
+         不要为了找它去搜 exe、不要验证路径。跑不通就把错误原样报给用户。\n"
     );
     let dir = std::env::current_dir().unwrap_or_default();
     println!("当前目录 {} 还没接入 Teambition 项目。\n", dir.display());

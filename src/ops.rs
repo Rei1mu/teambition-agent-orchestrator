@@ -4067,40 +4067,27 @@ fn strip_tba_block(s: &str, mark: &str) -> String {
     format!("{}{}", &s[..start], &s[end..])
 }
 
-// 零上下文短块。不同 agent 读不同的约定文件：只写 AGENTS.md 会有漏网的，
-// 它们看不到入口就自己去搜 exe。四个文件都写同一块，各自独立检测标记，
-// 缺哪个补哪个，绝不覆盖用户原有内容。
+// 零上下文短块，只写 AGENTS.md 一份。CLAUDE.md 用 @AGENTS.md 导入，不重复写。
+// 「别搜 exe」只限定在定位 tba 这件事上：写成「禁止读源码」会挡住正常开发。
 const BOOTSTRAP_MARK: &str = "<!-- tba:bootstrap";
-const BOOTSTRAP_FILES: [&str; 4] = [
-    "AGENTS.md",
-    "CLAUDE.md",
-    ".cursorrules",
-    ".github/copilot-instructions.md",
-];
 const BOOTSTRAP_BLOCK: &str = "<!-- tba:bootstrap 由 tba 自动生成，删掉不影响功能 -->\n\
     tba 是本机已安装的命令行工具，在 PATH 里。当前项目用它管任务队列。\n\
-    **直接执行 `tba`。不要搜索 exe、不要验证路径、不要读源码、不要 `where tba`。**\n\
+    **直接执行 `tba`。不要为了找它去搜 exe、不要验证路径、不要 `where tba`。**\n\
     跑不通就把错误原样报给用户。只有用户明确要求排查时才 `tba doctor`。\n\
     `tba --help` 看全部命令。\n";
 
-fn ensure_bootstrap_files(dir: &std::path::Path) {
-    for f in BOOTSTRAP_FILES {
-        let p = dir.join(f);
-        let old = std::fs::read_to_string(&p).unwrap_or_default();
-        if old.contains(BOOTSTRAP_MARK) {
-            continue;
-        }
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // 放最前面：约定文件里越靠前越不容易被后面的长文档挤到看不见。
-        let _ = std::fs::write(&p, format!("{BOOTSTRAP_BLOCK}\n{old}"));
+fn ensure_bootstrap_block(path: &std::path::Path) {
+    let old = std::fs::read_to_string(path).unwrap_or_default();
+    if old.contains(BOOTSTRAP_MARK) {
+        return;
     }
+    // 放最前面：约定文件里越靠前越不容易被后面的长文档挤到看不见。
+    let _ = std::fs::write(path, format!("{BOOTSTRAP_BLOCK}\n{old}"));
 }
 
 fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBuf> {
-    ensure_bootstrap_files(dir);
     let path = dir.join("AGENTS.md");
+    ensure_bootstrap_block(&path);
 
     // 裸命令，不写本机绝对路径。那个路径换台设备就失效，会逼 agent 全盘搜 exe。
     let exe = cmd.to_string();

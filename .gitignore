@@ -18,7 +18,7 @@ testh.s
 
 # tba 生成的约定文件要入库：另一台设备 clone 后陌生 agent 才有入口。
 # 内容只用裸命令 tba / tba.exe，不含本机绝对路径，跨设备有效。
-# AGENTS.md / CLAUDE.md / .cursorrules / .github/copilot-instructions.md / tba.cmd
+# 只有 AGENTS.md 一份约定文件；CLAUDE.md 用 @AGENTS.md 导入，不重复写。
 
 # 验证用截图（生成物，不进仓库）
 tools/*.png
