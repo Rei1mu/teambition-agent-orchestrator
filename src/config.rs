@@ -102,6 +102,11 @@ pub fn tasklists_ready(names: &[&str]) -> bool {
     TASKLIST_WANT.iter().all(|w| names.contains(w))
 }
 
+/// Teambition 网页里的项目页前缀。任务链接是 `https://www.teambition.com/task/<id>`，
+/// 项目按同一站点约定拼 `/project/<id>`。看板列网页 API 建不了，得把这条链接给人，
+/// 让他自己进去手动新建 1~5。链接规则变了只改这一个常量。
+pub const PROJECT_URL_PREFIX: &str = "https://www.teambition.com/project/";
+
 // 会话心跳阈值（秒）。running 状态的 claim 超过这个时间没续命，
 // 就判定「会话已断开」，回滚成 未完成 + 列1。waiting 状态永不超时。
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 300;

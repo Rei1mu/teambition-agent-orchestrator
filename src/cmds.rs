@@ -654,9 +654,10 @@ fn claim_and_print(
     project: Option<&str>,
     lang: Lang,
     write_entry: bool,
+    guide_tasklists: bool,
 ) -> Result<(), String> {
     use std::io::Write;
-    match go(store, project, lang, write_entry)? {
+    match go(store, project, lang, write_entry, guide_tasklists)? {
         GoOutcome::NoBinding { cwd } => {
             println!("NO_BINDING {cwd}");
             eprintln!("当前目录没有绑定 Teambition 项目（缺 .tba/project）。停，不领任务。");
@@ -677,9 +678,19 @@ fn claim_and_print(
             }
             // 「绑定还在、线上项目没了」也算没有对应空间：别把 agent 卡在
             // ensure-project 上，按工作区重新列候选，交用户拍板后走 create --go。
-            eprintln!("本地绑定/目录名对应的项目在 Teambition 里查不到，按工作区重新接一次：");
+            eprintln!("没有对应的 Teambition 项目空间。tba 不会自己建：项目名必须用户拍板。");
+            eprintln!("按工作区重新接一次，候选如下：");
+            // 这里只列名字线索，纯本地。别用 create::scan：它会再开一个 Ctx 联网
+            // 核对同名项目 —— go() 刚查完项目列表才走到这，再握手一次就是白等一分钟。
             let dir = std::env::current_dir().unwrap_or_default();
-            let rows = crate::create::scan(store, &dir, None);
+            let rows: Vec<crate::create::Row> = crate::naming::candidates(&dir)
+                .into_iter()
+                .map(|c| crate::create::Row {
+                    name: c.name,
+                    source: c.source,
+                    mark: "本地线索，未联网核对".to_string(),
+                })
+                .collect();
             if rows.is_empty() {
                 eprintln!("没扫到候选名：直接问用户要一个项目名。");
             } else {
@@ -688,6 +699,9 @@ fn claim_and_print(
             }
             eprintln!(
                 "用户点头后只跑 `tba create --name \"<选定的>\" --go`：复用/新建项目并重写本地绑定。"
+            );
+            eprintln!(
+                "建完会打印项目链接，并提示你在该链接里手动新建 1、2、3、4、5 五个看板列。"
             );
             let _ = std::io::stdout().flush();
             std::process::exit(4);
@@ -734,6 +748,12 @@ fn finish_bootstrap(
     if let Some(p) = &r.entry {
         println!("AGENTS.md 入口: {}", p.display());
     }
+    // 建/复用完就把项目链接和 1~5 五列引导给人：网页 API 建不了列，只能手动建。
+    // 用 create() 查到的列信息，不再让 go() 查第二遍（guide_tasklists=false）。
+    print!(
+        "{}",
+        crate::ops::tasklist_guidance(&r.project_id, r.tasklists.as_deref())
+    );
 
     // MCP 只是给「下一次会话」准备：写失败不能挡住接入和领任务。
     match mcp_install() {
@@ -748,7 +768,7 @@ fn finish_bootstrap(
     // 用刚建/复用出来的项目 id，别让 go() 去读 cwd 的 .tba/project：
     // `--dir <别的目录>` 时绑定写在 dir，进程 cwd 里根本没有。
     // create() 已经在 dir 写过入口文件，这里 write_entry=false，别再往 cwd 补一份。
-    claim_and_print(store, Some(r.project_id.as_str()), lang, false)
+    claim_and_print(store, Some(r.project_id.as_str()), lang, false, false)
 }
 
 /// 无参数 + 没有 .tba/project 时的一次性自举卡。
@@ -1115,27 +1135,30 @@ pub fn run() -> Result<(), String> {
                 println!("  {}\t{}{}", s.id, s.name, tag);
             }
 
-            // 看板列：网页 API 不能建/改名列，只能手动建。校验 5 个数字列 1..5 齐全，
-            // 不齐就引导用户去 Teambition 网页手动补。
-            let lists = ctx.task_lists(&project).unwrap_or_default();
-            let names: Vec<&str> = lists.iter().map(|l| l.name.as_str()).collect();
-            let ok = tasklists_ready(&names);
-            println!(
-                "\n看板列（任务列表，网页维护）: 找到 {} 个 -> {}",
-                lists.len(),
-                if names.is_empty() { "(无)".to_string() } else { names.join(", ") }
-            );
-            if ok {
-                println!("  ✓ 5 个数字列 1/2/3/4/5 齐全，本地列配置已设为 1/2/3/4/5。");
-            } else {
-                println!("  ✗ 数字列不齐。Teambition 网页 API 建不了列，请手动去项目看板补足，");
-                println!("    名字就用数字、按顺序建（别改中文，太麻烦）:");
-                println!("      列 1 = {STAGE_TODO}  （队列：没人接的任务）");
-                println!("      列 2 = 进行中  （agent 正在干）");
-                println!("      列 3 = 待回复  （等用户在 Teambition 评论回复）");
-                println!("      列 4 = 已解决  （已完成）");
-                println!("      列 5 = {STAGE_CLOSED}  （作废）");
-                println!("    建好后重跑一次 tb init 校验。");
+            // 看板列：网页 API 不能建/改名列，只能手动建。补齐状态后共用一份
+            // 「项目链接 + 1~5 五列」引导（和 create / go 同一段，说法不会漂移）。
+            // 查询失败不算「一列都没有」，别拿一次接口失败误导人去重建 5 列。
+            match ctx.task_lists(&project) {
+                Ok(lists) => {
+                    let names: Vec<String> = lists.into_iter().map(|l| l.name).collect();
+                    println!(
+                        "\n看板列（任务列表，网页维护）: 找到 {} 个 -> {}",
+                        names.len(),
+                        if names.is_empty() { "(无)".to_string() } else { names.join(", ") }
+                    );
+                    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                    if tasklists_ready(&refs) {
+                        println!("  本地列配置已设为 1/2/3/4/5。");
+                    }
+                    print!("{}", crate::ops::tasklist_guidance(&project, Some(&names)));
+                }
+                Err(e) => {
+                    eprintln!("\n看板列查询失败（{e}），本次不判断 1~5 是否齐全。");
+                    print!(
+                        "{}",
+                        crate::ops::tasklist_guidance(&project, None::<&[&str]>)
+                    );
+                }
             }
         }
         Cmd::EnsureProject {
@@ -1495,7 +1518,7 @@ pub fn run() -> Result<(), String> {
                 let _ = std::io::stdout().flush();
                 return Ok(());
             }
-            claim_and_print(&store, project.as_deref(), lang, !no_entry)?;
+            claim_and_print(&store, project.as_deref(), lang, !no_entry, true)?;
         }
         Cmd::Claim { project, name } => {
             let project = resolve_project(project.as_deref())?;

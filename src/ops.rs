@@ -2003,6 +2003,65 @@ pub fn task_url(task_id: &str) -> String {
     format!("https://www.teambition.com/task/{task_id}")
 }
 
+/// 项目页链接。跟 task_url 同一站点约定，见 config::PROJECT_URL_PREFIX。
+pub fn project_url(project_id: &str) -> String {
+    format!("{PROJECT_URL_PREFIX}{project_id}")
+}
+
+/// 「去项目里手动新建 5 个数字看板列」的引导。`create` / `go` / `init` 共用这一份，
+/// 免得三处说法漂移、或漏给项目链接。
+///
+/// 网页 API 只能查列、不能建列/改列名，所以这段只能打印给人看。
+/// `names = None` = 这次没查到列信息（刚建的项目 / 接口没回）：照样给链接和步骤，
+/// 但不谎报「缺哪几列」。`Some` 且 1/2/3/4/5 齐全时只回一段短确认，不刷屏。
+pub fn tasklist_guidance<S: AsRef<str>>(project_id: &str, names: Option<&[S]>) -> String {
+    let mut s = format!(
+        "\n===== Teambition 项目 =====\n项目链接: {}\n",
+        project_url(project_id)
+    );
+    s.push_str(&format!(
+        "（链接打不开就从 Teambition 首页进项目；项目 id: {project_id}）\n"
+    ));
+    match names {
+        Some(v) => {
+            let owned: Vec<&str> = v.iter().map(|x| x.as_ref()).collect();
+            if tasklists_ready(&owned) {
+                s.push_str("✓ 看板列 1/2/3/4/5 已齐全，不用手动建。\n");
+                return s;
+            }
+            s.push_str(&format!(
+                "当前看板列: {}\n",
+                if owned.is_empty() {
+                    "(无)".to_string()
+                } else {
+                    owned.join(", ")
+                }
+            ));
+            let missing: Vec<&str> = TASKLIST_WANT
+                .iter()
+                .copied()
+                .filter(|w| !owned.contains(w))
+                .collect();
+            if !missing.is_empty() {
+                s.push_str(&format!("还缺: {}\n", missing.join(", ")));
+            }
+        }
+        None => s.push_str("看板列这次没查到（新建项目 / 接口没回），按下面手动建齐即可。\n"),
+    }
+    s.push_str(
+        "\n===== 请手动新建 5 个看板列 =====\n\
+         Teambition 网页 API 建不了任务列表（列），只能你在网页里手动建。\n\
+         打开上面的项目链接 → 看板 → 新建 5 个任务列表，名字就用数字 1、2、3、4、5：\n\
+           列 1 = 未完成  （队列：还没人接的任务）\n\
+           列 2 = 进行中  （agent 正在干）\n\
+           列 3 = 待回复  （等你在 Teambition 评论回复）\n\
+           列 4 = 已解决  （已完成，待确认）\n\
+           列 5 = 已完成  （关闭 / 作废）\n\
+         建齐之前 tba 不会自动移列；建好后重跑 `tba go` 或 `tba init --project <id>` 校验。\n",
+    );
+    s
+}
+
 // 同步等待：agent 挂在会话里等用户回复 ----
 //
 // 为什么需要它：WorkBuddy 这类会话没有对外 CLI 入口，外部没法把 agent「叫醒」。
@@ -3877,6 +3936,12 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
              之后只跑一条 `{exe} create --name \"<选定的>\" --go`，\
              建项目 + 写 MCP 配置 + 当场领任务一次做完。\n"
         ));
+        s.push_str(&format!(
+            "\n**建完项目要给用户两样东西**：输出里的「项目链接」（`https://www.teambition.com/project/<id>`），\n\
+             以及「请手动新建 5 个看板列」那段 —— 让用户去链接里手动建 5 个任务列表，\
+             名字就叫 1、2、3、4、5。网页 API 建不了列，别自己编接口去建。\n\
+             以后每次 `{exe} go` 若发现 5 列不齐，也会打印同一段链接和提示，照着转给用户即可。\n"
+        ));
     } else {
         s.push_str(
             "# Onboard this repo to Teambition\n\
@@ -3922,6 +3987,14 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
             "\n**Shorter**: after the user picks a name, run just one command \
              `{exe} create --name \"<picked>\" --go` to link the repo, write the MCP config \
              and claim one task in a single shot.\n"
+        ));
+        s.push_str(&format!(
+            "\n**Always hand the user two things after creating a project**: the project link \
+             (`https://www.teambition.com/project/<id>`) from the output, and the \
+             \"create 5 board columns\" block - they must manually create 5 task lists named \
+             1, 2, 3, 4, 5 in that project. The web API cannot create columns; do not invent one.\n\
+             Every later `{exe} go` prints the same link + reminder whenever the 5 columns are missing; \
+             just forward it to the user.\n"
         ));
     }
     s
@@ -4211,11 +4284,15 @@ fn claim_header(c: &Claim, exe: &str) -> String {
     )
 }
 
+/// `guide_tasklists`：是否在领任务前校验看板列 1~5 并打印「项目链接 + 手动补列」引导。
+/// 正常 `tba go` 传 true；自举 `create --go` 传 false —— 那一路 create 已经查过并打印过，
+/// 不重复打一整块，也不重复发一次列查询。
 pub fn go(
     store: &Store,
     project: Option<&str>,
     lang: Lang,
     write_entry: bool,
+    guide_tasklists: bool,
 ) -> Result<GoOutcome, String> {
     // 等待中断的检查不在这里做，挪进了 claim：那边才知道「列1 有谁」，
     // 才能把用户拖回列1 的任务排除掉（拖回列1 = 用户要求重来，那条等待作废）。
@@ -4282,6 +4359,23 @@ pub fn go(
     // 按目录名认回来的项目，顺手把绑定补上，下次不用再查。
     if adopted {
         let _ = write_project_binding(&proj.id);
+    }
+
+    // 看板列 1~5 只能在网页手动建，API 建不了；缺列时「移列」会静默失效。
+    // 每次 tba go 都用**现有 ctx** 查一次（复用已完成的握手，不额外再连一遍），
+    // 缺了就把项目链接和补列步骤直接打出来，别让人疑惑任务怎么没挪列。
+    if guide_tasklists {
+        match ctx.task_lists(&proj.id) {
+            Ok(lists) => {
+                let names: Vec<String> = lists.into_iter().map(|l| l.name).collect();
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                if !tasklists_ready(&refs) {
+                    print!("{}", tasklist_guidance(&proj.id, Some(&names)));
+                }
+            }
+            // 查不到 ≠ 缺列：一次接口失败不该误导人去重建 5 列，只留一行诊断。
+            Err(e) => eprintln!("看板列查询失败（{e}），本次跳过 1~5 列校验。"),
+        }
     }
 
     // 3) 领活。队列空是正常结果，不是错误。
@@ -4369,6 +4463,47 @@ pub fn agent_prompt_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 项目链接 + 1~5 五列引导：create / go / init 共用这一份，缺一样都算回归。
+    #[test]
+    fn project_url_uses_project_path_and_id() {
+        assert_eq!(
+            project_url("abc123"),
+            "https://www.teambition.com/project/abc123"
+        );
+        assert_ne!(project_url("abc123"), task_url("abc123"));
+    }
+
+    #[test]
+    fn tasklist_guidance_always_gives_link_and_five_columns() {
+        let s = tasklist_guidance("p1", None::<&[&str]>);
+        assert!(s.contains("https://www.teambition.com/project/p1"));
+        assert!(s.contains("请手动新建 5 个看板列"));
+        for w in ["列 1", "列 2", "列 3", "列 4", "列 5"] {
+            assert!(s.contains(w), "引导里少了 {w}");
+        }
+        assert!(s.contains("没查到"), "查不到列时要说明，别谎报缺哪几列");
+        assert!(!s.contains("还缺:"));
+    }
+
+    #[test]
+    fn tasklist_guidance_lists_only_missing_columns() {
+        let have: Vec<String> = vec!["1".into(), "2".into()];
+        let s = tasklist_guidance("p1", Some(&have));
+        assert!(s.contains("https://www.teambition.com/project/p1"));
+        assert!(s.contains("还缺: 3, 4, 5"));
+        assert!(s.contains("当前看板列: 1, 2"));
+        assert!(!s.contains("已齐全"));
+    }
+
+    #[test]
+    fn tasklist_guidance_is_quiet_when_all_five_exist() {
+        let have: Vec<&str> = vec!["5", "3", "1", "4", "2"]; // 顺序不强制
+        let s = tasklist_guidance("p1", Some(&have));
+        assert!(s.contains("https://www.teambition.com/project/p1"));
+        assert!(s.contains("已齐全"));
+        assert!(!s.contains("请手动新建"), "列齐了就别再刷补列步骤");
+    }
 
     // 外部收尾判定：用户网页手动改状态、或拖到列4/列5，都算「已完成」。
     // 列名用数字（1..5），列优先于状态名（可能只拖了列没改状态）。
