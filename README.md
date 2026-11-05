@@ -29,6 +29,19 @@
 
 数据放在 exe 同目录的 `data/`。所有 agent 共享这一个目录。
 
+## 陌生 agent：一个词就够
+
+`tba` 是装包时写进用户 PATH 的全局命令。agent 不需要知道 exe 在哪，也不需要记子命令。
+
+1. 在项目目录里敲 `tba`。有绑定就领任务；没绑定就列候选项目名，停下等用户拍板。
+2. 约定文件 `AGENTS.md` / `CLAUDE.md` / `.cursorrules` / `.github/copilot-instructions.md`
+   都提交进仓库。开头是同一段红线：直接执行 `tba`，禁止搜索 exe、禁止验证路径、禁止读源码。
+3. 入口只写裸 `tba`，不写本机绝对路径。换设备不会因为路径失效而逼 agent 全盘搜文件。
+
+**给 agent 的全局一句话**（贴进 agent 产品的自定义指令，跟账号走，跨设备）：
+
+> `tba` 是本机已装好的全局命令，在 PATH 里。要用就直接敲 `tba`。不要搜文件、不要验证路径、不要读源码、不要 `where tba`。跑不通就把错误原样报给用户，不要自己排查。
+
 ## 安装包要求（GitHub Actions 打包用）
 
 **产物**：推 `v*` tag 触发 `.github/workflows/release.yml`，两个包挂到 Release：
@@ -475,13 +488,15 @@ tba wait <claim_id>               :: 单独等（ask 超时后重跑它，或只
 - 标题取 `--title` > 正文首个 `# 标题` 行 > 文件名；正文落盘到 `data/tasks/<标题>.md`，agent 用 `--file` 读。
 - **同名幂等**：本项目里已有同名任务的活动 claim 时直接复用，不会因为点了两次复制就建出两条。
 
-### 一句话开工：`tba g`
+### 零上下文开工：`tba`
 
-不复制文案也能开工。在项目目录里跑 `tba g`（别名 `go` / `r` / `run`），它做三件事：
+不复制文案、不记子命令。在项目目录里跑 `tba`（不带参数）：
 
-1. 按 `.tba/project` 认出项目。
-2. 从列「未完成」领最早一条。
-3. 打印任务正文 + 完整流程规则。
+1. 有 `.tba/project` → 等于 `tba g`：按绑定认项目、从列「未完成」领最早一条、打印任务正文 + 完整流程规则。
+2. 没有 → 打印候选项目名，停下等用户拍板。不建项目、不自己起名。用户点头后 `tba create --name "<选定的>"`。
+3. 两种情况都先打印一句「tba 是什么」。陌生 agent 跑一次就够，不需要预先搜索 exe。
+
+`tba g` / `go` / `r` / `run` 仍是别名，行为不变。窗口用 `tba ui` 或双击 `tbagui.exe`。
 
 #### 直连模式：`tba go -off <这次要做的事>`
 
@@ -551,7 +566,7 @@ tba wait -off                          :: 直接返回（直连下没有「等 T
 编码纪律为什么放 `AGENTS.md` 而不是塞进 prompt：这四条是通用编码习惯，跟任务流程无关，而且每条都要解释才管用。
 塞进 prompt 每次会话固定多 1500 字；`AGENTS.md` 是 agent 进项目就会读的约定文件，成本几乎为零。
 
-补上之后用户说「开工」就够了；换项目、换设备没有入口文件时，`tba g` 照样能跑，只是多打几个字符。
+补上之后用户说「开工」就够了；换项目、换设备没有入口文件时，`tba` 一个词照样能跑。
 
 - `--no-entry` 不补入口文件。
 - `--lang en` 用英文规则（省 token）。
@@ -1006,10 +1021,17 @@ Terminal，那一下还得等 WT 起窗，看着就是黑框闪一下。
 > 为什么不把 `tba.exe` 直接改成 GUI 子系统：那样 PowerShell / cmd 不会等它结束，
 > 输出也会丢（实测 PowerShell 29ms 就返回），CLI 就废了。两个 exe 各干一件事最稳。
 
-`tba.exe` 里仍保留 `FreeConsole()` + `ShowWindow(SW_HIDE)` 兜底：直接双击 `tba.exe`
-或从 PATH 里不带参数敲 `tba` 时，黑框会立刻消失（不再是进程存活期内一直挂着）。
+`tba.exe` 里保留 `FreeConsole()` + `ShowWindow(SW_HIDE)` 兜底，现在只对 `tba ui` 生效。
+不带参数敲 `tba` 是 CLI 自举（要 stdout），不再隐藏控制台；双击 `tba.exe` 会打印自举卡后关闭。
+要开窗口用 `tba ui` 或双击 `tbagui.exe`。
 
 ## MCP 接入
+
+挂上 MCP 后，agent 的工具列表里直接有 tba 能力。不用敲命令、不用找 exe、不用读约定文件。
+每台设备、每个 agent 产品配一次。
+
+本机 WorkBuddy 一键写入：`tba mcp --install`（合并写 `~/.workbuddy-ai/mcp.json`，不覆盖别的 server）。
+其他 agent 跑 `tba mcp` 打印同一段配置片段。
 
 在 agent 的 MCP 配置里加：
 

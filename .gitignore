@@ -16,9 +16,9 @@ testh.s
 # 安装包产物
 /dist/
 
-# tba 自动生成的入口（含本机绝对路径，换机器就失效，不入库）
-/AGENTS.md
-/tba.cmd
+# tba 生成的约定文件要入库：另一台设备 clone 后陌生 agent 才有入口。
+# 内容只用裸命令 tba / tba.exe，不含本机绝对路径，跨设备有效。
+# AGENTS.md / CLAUDE.md / .cursorrules / .github/copilot-instructions.md / tba.cmd
 
 # 验证用截图（生成物，不进仓库）
 tools/*.png

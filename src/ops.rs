@@ -4019,16 +4019,11 @@ fn entry_cmd(store: &Store) -> String {
     }
 }
 
-// 真实可执行路径。config 里的 tool_path 往往只是 `tba`，而 agent 的 shell
-// 不一定继承了 PATH——没有路径它就会全盘搜 exe，实测白烧一分多钟。
-// 所以凡是给 agent 看的文案，都写死绝对路径，不指望 PATH。
-pub(crate) fn exe_path_or(cmd: &str) -> String {
-    std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| cmd.to_string())
-}
-
-/// 开工文案里 exe 的写法：配了 `tool_path` 就用它，否则用真实绝对路径。
+/// 开工文案里 exe 的写法：配了 `tool_path` 就用它，否则用裸 `tba`。
+///
+/// 不写本机绝对路径。那个路径换台设备就失效，agent 会为了验证它去全盘搜 exe。
+/// 裸命令靠 PATH：装包时已把安装目录写进用户 PATH，跑不通就直接报错，
+/// agent 把错误原样报给用户即可，不需要预先确认文件在哪。
 ///
 /// 「查看文案」这类预览必须走这里——另算一份就会和 agent 实际收到的对不上。
 pub(crate) fn prompt_exe(store: &Store) -> String {
@@ -4037,7 +4032,7 @@ pub(crate) fn prompt_exe(store: &Store) -> String {
 
 fn prompt_exe_of(cfg: &crate::config::Config) -> String {
     if cfg.tool_path.trim().is_empty() {
-        exe_path_or("tba")
+        "tba".to_string()
     } else {
         cfg.tool_path.trim().to_string()
     }
@@ -4072,19 +4067,51 @@ fn strip_tba_block(s: &str, mark: &str) -> String {
     format!("{}{}", &s[..start], &s[end..])
 }
 
+// 零上下文短块。不同 agent 读不同的约定文件：只写 AGENTS.md 会有漏网的，
+// 它们看不到入口就自己去搜 exe。四个文件都写同一块，各自独立检测标记，
+// 缺哪个补哪个，绝不覆盖用户原有内容。
+const BOOTSTRAP_MARK: &str = "<!-- tba:bootstrap";
+const BOOTSTRAP_FILES: [&str; 4] = [
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".cursorrules",
+    ".github/copilot-instructions.md",
+];
+const BOOTSTRAP_BLOCK: &str = "<!-- tba:bootstrap 由 tba 自动生成，删掉不影响功能 -->\n\
+    tba 是本机已安装的命令行工具，在 PATH 里。当前项目用它管任务队列。\n\
+    **直接执行 `tba`。不要搜索 exe、不要验证路径、不要读源码、不要 `where tba`。**\n\
+    跑不通就把错误原样报给用户。只有用户明确要求排查时才 `tba doctor`。\n\
+    `tba --help` 看全部命令。\n";
+
+fn ensure_bootstrap_files(dir: &std::path::Path) {
+    for f in BOOTSTRAP_FILES {
+        let p = dir.join(f);
+        let old = std::fs::read_to_string(&p).unwrap_or_default();
+        if old.contains(BOOTSTRAP_MARK) {
+            continue;
+        }
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // 放最前面：约定文件里越靠前越不容易被后面的长文档挤到看不见。
+        let _ = std::fs::write(&p, format!("{BOOTSTRAP_BLOCK}\n{old}"));
+    }
+}
+
 fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBuf> {
+    ensure_bootstrap_files(dir);
     let path = dir.join("AGENTS.md");
 
-    // 真实可执行路径。config 里的 tool_path 往往只是 `tba`，而 agent 的 shell
-    // 不一定继承了 PATH——没有路径它就会全盘搜 exe，实测白烧一分多钟。
-    // 所以入口文件里写死绝对路径，不指望 PATH。
-    let exe = exe_path_or(cmd);
+    // 裸命令，不写本机绝对路径。那个路径换台设备就失效，会逼 agent 全盘搜 exe。
+    let exe = cmd.to_string();
 
     let entry = format!(
         "{ENTRY_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
          ## 任务队列入口\n\n\
-         **工具**：`{exe}`（项目根的 `tba.cmd` 等价）。别搜 exe，别读 `.tba/`。\n\n\
-         **开工**：用户说「开工」→ 跑 `{exe} g`。退出码：\
+         **工具**：`{exe}`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。\
+         直接执行，别搜 exe、别验证路径、别读 `.tba/`。\n\n\
+         **开工**：用户说「开工」→ 跑 `{exe}`（不带参数）。有 `.tba/project` 就领任务；\
+         没有就列候选项目名，交给用户拍板。退出码：\
          0+claim_id=干活；0+EMPTY=队列空；3=没绑定项目；4=项目查不到，问用户。\
          别自建任务。\n\n\
          **流转**：进行中·列2 → `ask` 后 待回复·列3 → 用户收尾 已解决·列4。\n\n\
@@ -4128,23 +4155,24 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
 
     let mut old = std::fs::read_to_string(&path).unwrap_or_default();
 
-    // 已经是新版就不用动：入口段只有一份、带绝对路径、带「交回」「流转」「通用能力」。
-    // 这几句当版本号用——老入口缺哪句，就整段替换成新版（不会重复追加）。
-    // `git create` 也算版本号：v0.2.20 通用能力名单里加了它，老 AGENTS.md 缺这句
-    // 的话 agent 进项目仍读不到「别装 gh」，得整段重写一次。
+    // 已经是新版就不用动：入口段只有一份、带裸命令、带「交回」「流转」「通用能力」。
+    // 「**工具**：`tba`」同时当版本号用——老入口里是本机绝对路径，缺这句就整段
+    // 替换成新版（不会重复追加）。`git create` 也是版本号（v0.2.20 加的）。
     let entry_ok = old.matches(ENTRY_MARK).count() == 1
-        && old.contains(&exe)
+        && old.contains(&format!("**工具**：`{exe}`"))
         && old.contains("**交回**")
         && old.contains("**流转**")
         && old.contains("**通用能力**")
         && old.contains("git create");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
 
-    // 转发脚本：PATH 没生效时 agent 也能直接跑 `tba.cmd g`，不用找 exe。
-    // 已存在就不动——用户可能自己改过指向。
+    // 转发脚本只写 `tba.exe`，不带本机绝对路径，换设备一样能用。
+    // 带 .exe 后缀是必须的：只写 `tba` 的话 cmd 会先匹配到当前目录的 tba.cmd，
+    // 自己调自己死循环。老脚本里的绝对路径要顺手修掉。
     let shim = dir.join("tba.cmd");
-    if !shim.exists() {
-        let _ = std::fs::write(&shim, format!("@echo off\r\n\"{exe}\" %*\r\n"));
+    let shim_text = "@echo off\r\ntba.exe %*\r\n";
+    if std::fs::read_to_string(&shim).unwrap_or_default() != shim_text {
+        let _ = std::fs::write(&shim, shim_text);
     }
 
     if entry_ok && rules_ok {
@@ -4303,7 +4331,7 @@ pub fn go(
     let skills = list_skills(store, &proj.id).unwrap_or_default();
     let rules = prompt_body(store, &proj.id, &proj.name, &skills, None, Some(&c), lang);
 
-    let mut text = claim_header(&c, &exe_path_or(&entry_cmd(store)));
+    let mut text = claim_header(&c, &entry_cmd(store));
     if !body.trim().is_empty() {
         text.push_str("\n---- 任务正文 ----\n");
         text.push_str(body.trim());

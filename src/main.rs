@@ -414,6 +414,12 @@ pub enum Cmd {
     },
     /// 以 MCP server (stdio) 运行。给 agent 挂载用
     Serve,
+    /// 打印 MCP 配置片段；--install 合并写进 WorkBuddy 的 mcp.json
+    Mcp {
+        /// 把 tba 写进本机 WorkBuddy 的 MCP 配置（不覆盖别的 server）
+        #[arg(long)]
+        install: bool,
+    },
     /// 打开 egui 窗口
     Ui,
     /// 截图存 png。BitBlt 抓屏，后台窗口也能截，不用把窗口提到前台
@@ -595,11 +601,8 @@ pub enum Cmd {
 }
 
 fn main() {
-    // 双击 exe（不带子命令）或显式 `tba ui` = 窗口模式，控制台黑窗要立刻消失。
-    //
-    // 为什么放在最前面：以前这一步在 ui::run 里才做，前面还有 ensure_dirs、beat_agent、
-    // clap 解析——冷启动碰上杀软扫盘时能拖到几百毫秒，黑窗就那么挂着，看着就是
-    // 「双击 tba 弹出命令行」。现在进程一进 main 就关，能省多少是多少。
+    // 只有显式 `tba ui` 是窗口模式。不带子命令是 CLI 自举（陌生 agent 敲 `tba`
+    // 就要能跑），不能在这里把控制台藏掉——stdout 得留给调用方。
     if gui_intent() {
         crate::ui::hide_console();
     }
@@ -609,11 +612,9 @@ fn main() {
     }
 }
 
-/// 这次启动是不是「开窗口」：没有子命令，或者只有 `ui` 一个子命令。
+/// 这次启动是不是「开窗口」：只有显式 `ui` 一个子命令。
+/// 双击入口已由 tbagui.exe 承担（安装包快捷方式指向它）。
 fn gui_intent() -> bool {
     let mut args = std::env::args_os().skip(1);
-    match args.next() {
-        None => true,
-        Some(a) => a == "ui" && args.next().is_none(),
-    }
+    matches!((args.next(), args.next()), (Some(a), None) if a == "ui")
 }

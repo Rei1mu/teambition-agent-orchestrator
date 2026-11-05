@@ -498,6 +498,76 @@ fn pick_name_interactive(rows: &[crate::create::Row]) -> Result<String, String> 
     Ok(t.to_string())
 }
 
+const MCP_SNIPPET: &str = r#"{
+  "mcpServers": {
+    "tba": {
+      "command": "tba.exe",
+      "args": ["serve"]
+    }
+  }
+}"#;
+
+/// 把 tba 合并进 WorkBuddy 的 mcp.json。只动 mcpServers.tba，别的不碰。
+fn mcp_install() -> Result<String, String> {
+    let home = std::env::var("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .map_err(|e| format!("拿不到 USERPROFILE: {e}"))?;
+    let path = home.join(".workbuddy-ai").join("mcp.json");
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut root: serde_json::Value = if old.trim().is_empty() {
+        serde_json::json!({ "mcpServers": {} })
+    } else {
+        serde_json::from_str(&old).map_err(|e| format!("{} 不是合法 JSON: {e}", path.display()))?
+    };
+    if !root.is_object() {
+        return Err(format!("{} 顶层不是对象", path.display()));
+    }
+    let servers = root
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        return Err(format!("{} 的 mcpServers 不是对象", path.display()));
+    }
+    servers.as_object_mut().unwrap().insert(
+        "tba".to_string(),
+        serde_json::json!({ "command": "tba.exe", "args": ["serve"] }),
+    );
+    std::fs::create_dir_all(path.parent().unwrap())
+        .map_err(|e| format!("建目录失败: {e}"))?;
+    let text = serde_json::to_string_pretty(&root).unwrap_or_default();
+    std::fs::write(&path, text).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+    Ok(format!(
+        "已写入 {}\n下一步：在 WorkBuddy 连接器管理页找到 tba，点「信任」启用。\n\
+         其他 agent 的配置片段：跑 `tba mcp` 查看。",
+        path.display()
+    ))
+}
+
+/// 无参数 + 没有 .tba/project 时的一次性自举卡。
+/// 不建项目、不写文件、不自己起名：候选原样交给用户拍板。
+fn auto_bootstrap(store: &Store) -> Result<(), String> {
+    println!(
+        "tba 是本机已安装的命令行工具（在 PATH 里）。直接执行它。\n\
+         不要搜 exe、不要验证路径、不要读源码。跑不通就把错误原样报给用户。\n"
+    );
+    let dir = std::env::current_dir().unwrap_or_default();
+    println!("当前目录 {} 还没接入 Teambition 项目。\n", dir.display());
+    let rows = crate::create::scan(store, &dir, None);
+    if rows.is_empty() {
+        println!("没扫到候选项目名。问用户要一个名字，再跑：tba create --name \"<名字>\"");
+    } else {
+        println!("候选项目名（把这份原样交给用户拍板，不要自己挑）：");
+        for (i, r) in rows.iter().enumerate() {
+            println!("  {}. {}\t来源: {}\t{}", i + 1, r.name, r.source, r.mark);
+        }
+        println!("\n用户选定后：tba create --name \"<选定的名字>\"");
+        println!("建好后再敲 `tba` 就能领任务。");
+    }
+    Ok(())
+}
+
 pub fn run() -> Result<(), String> {
     let store = Store::new();
     store.ensure_dirs()?;
@@ -509,8 +579,26 @@ pub fn run() -> Result<(), String> {
     if !matches!(&cli.cmd, Some(Cmd::Sweep { .. }) | Some(Cmd::Hello { .. })) {
         store.beat_agent(&current_agent());
     }
-    // 不带子命令（双击 tb / 直接 tb）→ 打开 GUI 窗口。agent 调用一律走显式子命令(CLI)。
-    let cmd = cli.cmd.unwrap_or(Cmd::Ui);
+    // 不带子命令 = 零参数自举。陌生 agent 只要会敲 `tba` 这一个词就能开工：
+    //   - 当前目录有 .tba/project -> 直接当 go 领任务
+    //   - 没有 -> 列候选项目名，停下等用户拍板（不自己建、不自己起名）
+    // 双击窗口由 tbagui.exe 承担，tba.exe 无参数不再开 GUI。
+    let cmd = match cli.cmd {
+        Some(c) => c,
+        None => {
+            if crate::ops::read_project_binding().is_some() {
+                Cmd::Go {
+                    project: None,
+                    lang: "zh".to_string(),
+                    no_entry: false,
+                    off: false,
+                    task: Vec::new(),
+                }
+            } else {
+                return auto_bootstrap(&store);
+            }
+        }
+    };
 
     // GitButler 优先于 Teambition：每次启动先过这一关。
     // agent 靠 GitButler CLI 管分支/提交，缺它后面全白跑；git 是它的系统级依赖。
@@ -539,6 +627,9 @@ pub fn run() -> Result<(), String> {
             | Cmd::Create { .. }
             | Cmd::EnsureProject { .. }
             | Cmd::Prompt { init: true, .. }
+            // MCP server / 配置打印：挂给陌生 agent 用的入口，缺 but 也必须能起。
+            | Cmd::Serve
+            | Cmd::Mcp { .. }
             | Cmd::Ui
     );
     if !gb_exempt && std::env::var("TBA_SKIP_GITBUTLER").is_err() {
@@ -1175,8 +1266,8 @@ pub fn run() -> Result<(), String> {
                     println!("NO_BINDING {cwd}");
                     eprintln!("当前目录没有绑定 Teambition 项目（缺 .tba/project）。停，不领任务。");
                     eprintln!(
-                        "要接入：先 `tba ensure-project --dry-run` 扫候选项目名，\
-                         把候选列给用户挑，再 `tba ensure-project --name \"<选定的名字>\"`"
+                        "要接入：跑 `tba`（不带参数）扫候选项目名，把候选交给用户挑，\
+                         再 `tba create --name \"<选定的名字>\"`"
                     );
                     let _ = std::io::stdout().flush();
                     std::process::exit(3);
@@ -1867,6 +1958,17 @@ pub fn run() -> Result<(), String> {
         }
         Cmd::Serve => {
             crate::mcp_server::serve(&store)?;
+        }
+        Cmd::Mcp { install } => {
+            if install {
+                println!("{}", mcp_install()?);
+            } else {
+                println!(
+                    "把下面这段加进 agent 的 MCP 配置（每台设备配一次）：\n\n{MCP_SNIPPET}\n\n\
+                     本机一键写入 WorkBuddy：`tba mcp --install`\n\
+                     工具列表由 MCP 协议自动下发，不用手记名字。"
+                );
+            }
         }
         Cmd::Ui => {
             crate::ui::run(&store)?;
