@@ -5,7 +5,7 @@
 #
 # 做三件事：下载最新 Release 的 setup.exe -> 静默安装 -> 合并写 WorkBuddy 的 mcp.json。
 # 不删 data/，不覆盖 mcp.json 里别的 server。
-# 固定版本：先设 $env:TBA_VERSION = 'v0.2.24' 再跑上面那行。
+# 固定版本：先设 $env:TBA_VERSION = 'v0.2.25' 再跑上面那行。
 
 $ErrorActionPreference = 'Stop'
 $repo = 'Rei1mu/teambition-agent-orchestrator'

@@ -38,9 +38,22 @@
    `CLAUDE.md` 用 `@AGENTS.md` 导入，不重复写第二份。红线只管「定位 tba」，不限制读项目源码。
 3. 入口只写裸 `tba`，不写本机绝对路径。换设备不会因为路径失效而逼 agent 全盘搜文件。
 
-**给 agent 的全局一句话**（贴进 agent 产品的自定义指令，跟账号走，跨设备）：
+**给 agent 的全局指令**（贴进 agent 产品的自定义指令，跟账号走，跨设备）。设备接入和干活**分两次会话**，别一次做完：
 
-> `tba` 是本机已装好的全局命令，在 PATH 里。要用就直接敲 `tba`。不要为了找它去搜文件、不要验证路径、不要 `where tba`。跑不通就把错误原样报给用户，不要自己排查。
+> `tba` 是本机全局命令（在 PATH 里）。要用就直接敲，不要为了找它搜文件、不要验证路径、不要 `where tba`；跑不通把错误原样报给用户，不要自己排查。红线只管「定位 tba」，不限制读项目源码。
+>
+> **用户说「接入tba cli」= 设备接入（第一次会话）**，按顺序做：
+> 1. 直接跑 `tba --version`。成功 = 已装，跳到第 3 步；报「找不到命令」= 没装，走第 2 步。
+> 2. 在 PowerShell 跑 `irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/install.ps1 | iex`。它下载安装 `tba.exe` 并写一份 WorkBuddy AI 的 MCP 配置。返回 404/权限错误就把错误原样报给用户（仓库需要是 public），不要改脚本、不要自己找 exe。
+> 3. 跑 `tba onboard`，读状态行 `TOKEN` / `GUI` / `BINDING` 和打印出来的 MCP 片段。
+> 4. `TOKEN MISSING` 时窗口已自动打开：**停下来等用户自己填 Teambition token**。不要代填、不要改 `data/config.toml`，本次会话到此为止。
+> 5. 把 `mcpServers.tba` 合并进**你自己客户端**的 MCP 配置：先备份 → 找你自己产品的配置文件位置（不要假设是哪一家）→ 只加/改 `tba` 这一项、别覆盖别的 server → 读回校验 → 回报改动位置。
+> 6. 回报用户：MCP 只对**下一次会话**生效；新会话里在连接器管理页对 `tba` 点「信任」/重载。
+> 7. **第一次会话不建项目、不领任务、不跑 `tba go`、不跑 `tba create`。**
+>
+> **用户说「开工」或 `tba go` = 第二次会话**：直接跑**不带参数**的 `tba`，由它按工作区自己分支——有项目空间就领任务（输出 `claim_id` 就照流程干活，`EMPTY` 是队列空）；没有就列候选项目名，**原样交用户拍板、不许自己起名**，用户点头后只跑一条 `tba create --name "<选定的>" --go`。报错把 stdout 原样报给用户。
+
+`tba onboard` 只查本地、不联网、不碰任务队列：打印 exe / 版本 / token / 工作区绑定状态，`TOKEN MISSING` 时自动起 `tbagui.exe` 让人自己填，幂等写 WorkBuddy AI 一家 MCP，并打印 `tba mcp` 的绝对路径片段给其他客户端自己合并。MCP 协议通用，但各客户端登记配置的位置不通用，所以 tba 不枚举私有格式（方案 C）。
 
 ## 安装包要求（GitHub Actions 打包用）
 
@@ -489,6 +502,9 @@ tba wait <claim_id>               :: 单独等（ask 超时后重跑它，或只
 - **同名幂等**：本项目里已有同名任务的活动 claim 时直接复用，不会因为点了两次复制就建出两条。
 
 ### 零上下文开工：`tba`
+
+**这是第二次会话**：装 exe / 配 MCP / 填 token 属于第一次会话的「接入tba cli」（见「陌生 agent：一个词就够」），
+两件事不在一轮里做完。本节默认设备已就绪，只管按工作区开工。
 
 不复制文案、不记子命令。在项目目录里跑 `tba`（不带参数）：
 
@@ -1056,7 +1072,7 @@ irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/
 `install.ps1` 下载最新 Release 的安装包、静默安装、合并写 `~/.workbuddy-ai/mcp.json`。
 不删 `data/`，不覆盖配置里别的 MCP server。装完去连接器管理页点「信任」。
 
-- 装最新 tag。固定版本：先设 `$env:TBA_VERSION = 'v0.2.24'` 再跑。
+- 装最新 tag。固定版本：先设 `$env:TBA_VERSION = 'v0.2.25'` 再跑。
 - 脚本写 exe 绝对路径。不依赖 PATH 刷新，宿主进程还活着也能起 MCP。
 - 安装目录改过的话，脚本会停下来提示改路径。
 - 设备已经装好 tba 时不用跑它，直接 `tba mcp --install`。命令写 exe 绝对路径，

@@ -423,6 +423,10 @@ pub enum Cmd {
         #[arg(long)]
         install: bool,
     },
+    /// 设备接入：查 tba / token / MCP / 工作区状态。没 token 就开窗口让人自己填。
+    /// 不建项目、不领任务、不联网。第一次会话专用。
+    #[command(visible_alias = "setup")]
+    Onboard,
     /// 打开 egui 窗口
     Ui,
     /// 截图存 png。BitBlt 抓屏，后台窗口也能截，不用把窗口提到前台

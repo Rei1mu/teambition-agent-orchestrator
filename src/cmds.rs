@@ -575,6 +575,78 @@ fn mcp_install() -> Result<String, String> {
     ))
 }
 
+/// 起双击用的窗口（GUI 子系统，不会带出控制台黑框）。
+fn launch_gui(exe: &str) -> Result<String, String> {
+    let gui = std::path::Path::new(exe)
+        .parent()
+        .ok_or_else(|| "取不到 exe 所在目录".to_string())?
+        .join("tbagui.exe");
+    if !gui.exists() {
+        return Err(format!("找不到 {}（安装包不完整，重装 tba）", gui.display()));
+    }
+    std::process::Command::new(&gui)
+        .spawn()
+        .map_err(|e| format!("起窗口失败: {e}"))?;
+    Ok(gui.display().to_string())
+}
+
+/// 第一次会话的设备接入：只装/查，不碰项目和任务队列。
+/// 状态行前缀固定，agent 照着读就行，不用猜哪句是人话哪句是结论。
+/// 刻意不联网：token 还没填的时候联网只会报一堆无关错误。
+fn onboard(store: &Store) -> Result<(), String> {
+    let cfg = store.load_config();
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let bound = cwd.join(".tba").join("project").exists();
+
+    println!("[tba onboard] 设备接入（第一次会话）");
+    println!("EXE       {exe}");
+    println!("VERSION   {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "TOKEN     {}",
+        if cfg.token().is_some() { "OK" } else { "MISSING" }
+    );
+
+    if cfg.token().is_none() {
+        match launch_gui(&exe) {
+            Ok(p) => {
+                println!("GUI       LAUNCHED {p}");
+                println!("\n请在打开的 TBA 窗口里自己填 Teambition token 并保存。\n\
+                         不要代填、不要去改 data/config.toml。填完本次会话就停。");
+            }
+            Err(e) => {
+                println!("GUI       FAILED {e}");
+                println!("\n窗口没起来：把上面的错误原样报给用户，让他重装 tba 或手动打开 tbagui.exe。\n\
+                         不要代填 token、不要改 data/config.toml。本次会话到此为止。");
+            }
+        }
+    } else {
+        println!("GUI       NOT_NEEDED");
+    }
+
+    println!("WORKSPACE {}", cwd.display());
+    println!("BINDING   {}", if bound { "OK" } else { "NONE" });
+
+    // 沿用 C 决策：tba 只自动写 WorkBuddy AI 一家，别家由当前客户端的 agent 自己合并片段。
+    match mcp_install() {
+        Ok(msg) => println!("\nMCP_AUTO  WorkBuddy AI 已就绪\n{msg}"),
+        Err(e) => println!("\nMCP_AUTO  SKIP（{e}）"),
+    }
+    println!("\n===== MCP 片段（其他客户端合并 mcpServers.tba 这一项） =====");
+    println!("{}", mcp_snippet());
+
+    println!("\n===== 第一次会话到此为止 =====");
+    println!("不建项目、不领任务、不读 .tba/。");
+    println!("把上面的 tba 项合并进你自己客户端的 MCP 配置：先备份、只改这一项、读回校验。");
+    println!("然后回报：改动位置 + 需要用户在连接器管理页点「信任」。");
+    println!("MCP 只对【下一次会话】生效，本次会话用命令行即可。");
+    println!("第二次会话用户说「开工 / tba go」时，直接跑不带参数的 `tba`：");
+    println!("  有项目空间就领任务；没有就列候选名交用户拍板，再 `tba create --name \"<选定的>\" --go`。");
+    Ok(())
+}
+
 /// 「去队列领一条任务 + 打开工文案」。
 /// Cmd::Go 和自举一条龙共用，避免两边行为漂移。
 fn claim_and_print(
@@ -603,7 +675,20 @@ fn claim_and_print(
                 println!("NO_PROJECT {id}");
                 eprintln!("本地绑定指向的项目「{id}」在 Teambition 里查不到（可能被删了）。");
             }
-            eprintln!("要初始化：`tba ensure-project --name {name}`（有同名就复用，没有就新建）");
+            // 「绑定还在、线上项目没了」也算没有对应空间：别把 agent 卡在
+            // ensure-project 上，按工作区重新列候选，交用户拍板后走 create --go。
+            eprintln!("本地绑定/目录名对应的项目在 Teambition 里查不到，按工作区重新接一次：");
+            let dir = std::env::current_dir().unwrap_or_default();
+            let rows = crate::create::scan(store, &dir, None);
+            if rows.is_empty() {
+                eprintln!("没扫到候选名：直接问用户要一个项目名。");
+            } else {
+                eprintln!("候选项目名（原样交给用户拍板，不要自己挑）：");
+                print_name_rows(&rows);
+            }
+            eprintln!(
+                "用户点头后只跑 `tba create --name \"<选定的>\" --go`：复用/新建项目并重写本地绑定。"
+            );
             let _ = std::io::stdout().flush();
             std::process::exit(4);
         }
@@ -710,7 +795,11 @@ pub fn run() -> Result<(), String> {
     // 任何命令启动都顺带给「本会话占着的 running 任务」刷一次心跳：
     // 会话还活着（还在跑 tb）就不该被当成僵尸回收，长构建期间尤其需要。
     // sweep / hello 除外——sweep 是来回收的，先续命就回收不掉了。
-    if !matches!(&cli.cmd, Some(Cmd::Sweep { .. }) | Some(Cmd::Hello { .. })) {
+    // onboard 也除外：第一次会话只做设备接入，不该碰任务队列的任何状态。
+    if !matches!(
+        &cli.cmd,
+        Some(Cmd::Sweep { .. }) | Some(Cmd::Hello { .. }) | Some(Cmd::Onboard)
+    ) {
         store.beat_agent(&current_agent());
     }
     // 不带子命令 = 零参数自举。陌生 agent 只要会敲 `tba` 这一个词就能开工：
@@ -765,6 +854,8 @@ pub fn run() -> Result<(), String> {
             // MCP server / 配置打印：挂给陌生 agent 用的入口，缺 but 也必须能起。
             | Cmd::Serve
             | Cmd::Mcp { .. }
+            // 设备接入是「什么都没装」时跑的第一条命令，缺 but.exe 更不能被拦。
+            | Cmd::Onboard
             | Cmd::Ui
     );
     if !gb_exempt && std::env::var("TBA_SKIP_GITBUTLER").is_err() {
@@ -2071,6 +2162,9 @@ pub fn run() -> Result<(), String> {
                     mcp_snippet()
                 );
             }
+        }
+        Cmd::Onboard => {
+            onboard(&store)?;
         }
         Cmd::Ui => {
             crate::ui::run(&store)?;
