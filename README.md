@@ -1030,8 +1030,23 @@ Terminal，那一下还得等 WT 起窗，看着就是黑框闪一下。
 挂上 MCP 后，agent 的工具列表里直接有 tba 能力。不用敲命令、不用找 exe、不用读约定文件。
 每台设备、每个 agent 产品配一次。
 
-本机 WorkBuddy 一键写入：`tba mcp --install`（合并写 `~/.workbuddy-ai/mcp.json`，不覆盖别的 server）。
-其他 agent 跑 `tba mcp` 打印同一段配置片段。
+### 新设备：一句话装好
+
+仓库公开后，在 PowerShell 里贴这一行：
+
+```powershell
+irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/install.ps1 | iex
+```
+
+`install.ps1` 下载最新 Release 的安装包、静默安装、合并写 `~/.workbuddy-ai/mcp.json`。
+不删 `data/`，不覆盖配置里别的 MCP server。装完去连接器管理页点「信任」。
+
+- 装最新 tag。固定版本：先设 `$env:TBA_VERSION = 'v0.2.23'` 再跑。
+- 脚本写 exe 绝对路径。不依赖 PATH 刷新，宿主进程还活着也能起 MCP。
+- 安装目录改过的话，脚本会停下来提示改路径。
+- 设备已经装好 tba 时不用跑它，直接 `tba mcp --install`。该命令写裸 `tba.exe`，
+  依赖 PATH；宿主进程没重启时用一键脚本更稳。
+- 其他 agent 跑 `tba mcp` 打印可粘贴的配置片段。
 
 在 agent 的 MCP 配置里加：
 
