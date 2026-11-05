@@ -16,7 +16,10 @@ import sys
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8791
+_ports = [a for a in sys.argv[1:] if a.isdigit()]
+PORT = int(_ports[0]) if _ports else 8791
+# `--no-create`：模拟老服务端没有 task-list-create，用来验证自动补列失败后的兜底引导。
+NO_CREATE = "--no-create" in sys.argv
 
 # ---------------- 模拟数据 ----------------
 
@@ -43,8 +46,11 @@ STAGES = {
     ],
 }
 
-# projectId -> 任务列表(看板列)。真实 API 只能查，不能建、不能改名。
-# 列名用中文，和 config 的默认值一致（1 未完成 / 2 进行中 / 3 待回复 / 4 已解决 / 5 已完成）
+# projectId -> 任务列表(看板列)。2026-11 新版 MCP 已可建列/改名，见下面两个 handler。
+# 两个项目故意给两种场景，用来端到端验证自动补列：
+#   p-alpha = 中文列名，1~5 全缺 -> ensure_tasklists 应自动新建 5 个数字列；
+#   p-beta  = 数字列名，1~5 齐全 -> ensure_tasklists 应一个都不建、go 不刷屏。
+# id 保持不变：TASKS 里的 stageId 引用的是 id，改 name 不影响已有任务。
 TASKLISTS = {
     "p-alpha": [
         {"id": "lst-alpha-1", "name": "未完成"},
@@ -54,12 +60,19 @@ TASKLISTS = {
         {"id": "lst-alpha-5", "name": "已完成"},
     ],
     "p-beta": [
-        {"id": "lst-beta-1", "name": "未完成"},
-        {"id": "lst-beta-2", "name": "进行中"},
-        {"id": "lst-beta-3", "name": "待回复"},
-        {"id": "lst-beta-4", "name": "已解决"},
-        {"id": "lst-beta-5", "name": "已完成"},
+        {"id": "lst-beta-1", "name": "1"},
+        {"id": "lst-beta-2", "name": "2"},
+        {"id": "lst-beta-3", "name": "3"},
+        {"id": "lst-beta-4", "name": "4"},
+        {"id": "lst-beta-5", "name": "5"},
     ],
+}
+
+# projectId -> 任务分组（真实接口字段 tasklistId / taskGroupId）。
+# 新建看板列必须挂在某个分组下；真实项目自带「默认分组」。
+TASKGROUPS = {
+    "p-alpha": [{"id": "grp-alpha-default", "title": "默认分组"}],
+    "p-beta": [{"id": "grp-beta-default", "title": "默认分组"}],
 }
 
 # 任务对象的两个维度别混：
@@ -464,6 +477,33 @@ def handle_tool(name, args):
         pid = a.get("projectId")
         return text_result({"result": TASKLISTS.get(pid, [])})
 
+    if name == "teambition.project.task-group-query":
+        pid = a.get("projectId")
+        return text_result({"result": TASKGROUPS.get(pid, [])})
+
+    if name == "teambition.project.task-list-create":
+        pid = a.get("projectId")
+        gid = a.get("taskGroupId")
+        cname = a.get("name")
+        if not (pid and gid and cname):
+            return {
+                "isError": True,
+                "content": [{"type": "text", "text": "缺 projectId / taskGroupId / name"}],
+            }
+        if not any(g["id"] == gid for g in TASKGROUPS.get(pid, [])):
+            return {
+                "isError": True,
+                "content": [{"type": "text", "text": "任务分组不存在: %s" % gid}],
+            }
+        lists = TASKLISTS.setdefault(pid, [])
+        for lst in lists:
+            if lst["name"] == cname:
+                # 幂等：同名列已存在就直接返回它，不重复建。
+                return text_result({"result": lst})
+        new = {"id": "lst-%s-%s" % (pid, uuid.uuid4().hex[:8]), "name": cname}
+        lists.append(new)
+        return text_result({"result": new})
+
     if name == "teambition.task.update-stage":
         tid = a.get("taskId") or a.get("id")
         if tid not in TASKS:
@@ -728,6 +768,31 @@ TOOLS = [
         },
     },
     {
+        "name": "teambition.project.task-group-query",
+        "description": "查询项目下的任务分组（新建看板列要先拿到分组 id）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "projectId": {"type": "string", "description": "项目 ID"},
+            },
+            "required": ["projectId"],
+        },
+    },
+    {
+        "name": "teambition.project.task-list-create",
+        "description": "在指定任务分组下新建看板列(任务列表)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "projectId": {"type": "string", "description": "项目 ID"},
+                "taskGroupId": {"type": "string", "description": "任务分组 ID"},
+                "name": {"type": "string", "description": "列名"},
+                "prevTaskListId": {"type": "string", "description": "插在哪一列之后"},
+            },
+            "required": ["projectId", "taskGroupId", "name"],
+        },
+    },
+    {
         "name": "teambition.task.update-stage",
         "description": "按名称或 ID 将任务调整到项目内指定任务列表",
         "inputSchema": {
@@ -845,7 +910,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if method == "tools/list":
-            self._send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
+            tools = TOOLS
+            if NO_CREATE:
+                tools = [
+                    t for t in tools
+                    if t["name"] != "teambition.project.task-list-create"
+                ]
+            self._send({"jsonrpc": "2.0", "id": rid, "result": {"tools": tools}})
             return
 
         if method == "tools/call":

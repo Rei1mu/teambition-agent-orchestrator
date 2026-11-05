@@ -66,8 +66,8 @@ pub struct Created {
     pub binding: PathBuf,
     pub entry: Option<PathBuf>,
     pub prompt: String,
-    /// 查到的看板列名。None = 没查到（工具缺失 / 接口失败），别当成「一列都没有」误报。
-    pub tasklists: Option<Vec<String>>,
+    /// 自动补齐 1~5 看板列的结果（含新建了哪些、失败原因）。
+    pub tasklists: ops::TasklistResult,
 }
 
 impl Created {
@@ -84,11 +84,9 @@ impl Created {
             Some(p) => s.push_str(&format!("AGENTS.md 入口: {}\n", p.display())),
             None => s.push_str("AGENTS.md 入口: 已是最新，未改动\n"),
         }
-        // 项目链接 + 1~5 五列引导：CLI 和窗口都从这一份出，别让人建完项目找不到入口。
-        s.push_str(&ops::tasklist_guidance(
-            &self.project_id,
-            self.tasklists.as_deref(),
-        ));
+        // 项目链接 + 看板列结果：CLI 和窗口都从这一份出，别让人建完项目找不到入口。
+        // create 是「建完项目」的动作，verbose=true：无论有没有补列都把链接给人。
+        s.push_str(&ops::tasklist_guidance(&self.project_id, &self.tasklists, true));
         s.push_str("\n===== 开工文案（发给 agent，或直接照着跑） =====\n\n");
         s.push_str(&self.prompt);
         s
@@ -121,12 +119,9 @@ pub fn create(
                 .collect::<Vec<_>>(),
         );
     }
-    // 看板列网页 API 只能查不能建：复用上面这个 ctx 顺手查一次（不额外握手），
-    // 把「现在有哪些列 / 还缺哪几列」带进 report()，好让人去网页手动补 1~5。
-    let tasklists = ctx
-        .task_lists(&p.id)
-        .ok()
-        .map(|v| v.into_iter().map(|l| l.name).collect::<Vec<_>>());
+    // 新版 MCP 有 task-list-create：复用上面这个 ctx 自动补齐 1~5，不额外握手。
+    // 补不动（老服务端 / 没分组 / 接口拒）时 report() 会降级成项目链接 + 手动兜底步骤。
+    let tasklists = ctx.ensure_tasklists(&p.id);
     let binding = ops::write_project_binding_at(dir, &p.id)?;
     let entry = ops::ensure_entry_in(store, dir);
     // 开工文案是附赠：新项目可能还没有 skill 缓存，生成失败不该把「已建好」变成报错。

@@ -954,9 +954,9 @@ impl Ctx {
     //
     // 四个维度别混：
     //   taskflowstatusId(tfs) = 工作流状态 = TBHub 的阶段（能建能改）
-    //   stageId / taskListId  = 任务列表 = 看板列（只能查 + 把任务挪进去）
+    //   stageId / taskListId  = 任务列表 = 看板列（新版 MCP 能查、能建、能改名）
     //   sfcId                 = 任务类型
-    //   tasklistId(分组)      = 任务的容器分组，跟列不是一回事
+    //   tasklistId / taskGroupId = 任务的容器分组，跟列不是一回事；建列必须挂在分组下
 
     fn find_tool_suffix(&self, suf: &str) -> Option<String> {
         self.tb
@@ -966,7 +966,8 @@ impl Ctx {
             .find(|n| n.to_lowercase().ends_with(suf))
     }
 
-    // 拉项目的看板列（id + 列名）。API 没有建列接口，列只能网页手动建。
+    // 拉项目的看板列（id + 列名）。
+    // 新版 MCP 也有 task-list-create / update-name / order-update，见 ensure_tasklists。
     pub fn task_lists(&mut self, project_id: &str) -> Result<Vec<ListInfo>, String> {
         let tool = self
             .find_tool_suffix("task-list-query")
@@ -985,6 +986,95 @@ impl Ctx {
             }
         }
         Ok(out)
+    }
+
+    /// 项目里第一个任务分组（API 字段 tasklistId）的 id。
+    /// 新建看板列必须挂在某个分组下；真实项目自带「默认分组」，不擅自新建分组。
+    fn default_task_group(&mut self, project_id: &str) -> Result<String, String> {
+        let tool = self
+            .find_tool_suffix("task-group-query")
+            .ok_or("工具集里没有 task-group-query，取不到任务分组")?;
+        let res = self
+            .tb
+            .call_smart(&tool, &[("projectId", json!(project_id))])?;
+        for item in extract_list(&res, 3) {
+            if let Some(id) = get_str(&item, &["id", "_id", "taskGroupId", "tasklistId"]) {
+                return Ok(id);
+            }
+        }
+        Err(format!(
+            "项目 {project_id} 里没有任务分组；tba 不擅自新建分组，请到网页建一个"
+        ))
+    }
+
+    /// 自动补齐 1~5 五个数字看板列。
+    ///
+    /// 2026-11 实测：新版 MCP 有 `teambition.project.task-list-create`
+    /// （projectId + taskGroupId + name，不传 prevTaskListId 即追加到末尾），
+    /// 旧版「列只能网页手动建」的结论已作废。
+    ///
+    /// 幂等：先查再补，只建缺的那几个，绝不动已有列（也不删多余的列，比如用户自己的「6」）。
+    /// 任何一步失败都只记进 errors，不抛错、不阻断领任务 —— 让调用方打兜底引导。
+    pub fn ensure_tasklists(&mut self, project_id: &str) -> TasklistResult {
+        let mut out = TasklistResult::default();
+        let lists = match self.task_lists(project_id) {
+            Ok(v) => v,
+            Err(e) => {
+                out.errors.push(format!("查不到看板列: {e}"));
+                return out;
+            }
+        };
+        out.names = lists.iter().map(|l| l.name.clone()).collect();
+        let missing: Vec<&str> = TASKLIST_WANT
+            .iter()
+            .copied()
+            .filter(|w| !out.names.iter().any(|n| n == w))
+            .collect();
+        if missing.is_empty() {
+            return out;
+        }
+
+        let create_tool = match self.find_tool_suffix("task-list-create") {
+            Some(t) => t,
+            None => {
+                out.errors.push(
+                    "这个 MCP 工具集没有 task-list-create（老版本服务端），只能网页手动建列"
+                        .to_string(),
+                );
+                return out;
+            }
+        };
+        let group = match self.default_task_group(project_id) {
+            Ok(id) => id,
+            Err(e) => {
+                out.errors.push(e);
+                return out;
+            }
+        };
+        // 按 1→5 顺序建：不传 prevTaskListId 时服务端追加到末尾。
+        for name in missing {
+            match self.tb.call_smart(
+                &create_tool,
+                &[
+                    ("projectId", json!(project_id)),
+                    ("taskGroupId", json!(&group)),
+                    ("name", json!(name)),
+                ],
+            ) {
+                Ok(_) => {
+                    out.created.push(name.to_string());
+                    out.names.push(name.to_string());
+                }
+                Err(e) => out.errors.push(format!("建列「{name}」失败: {e}")),
+            }
+        }
+        // 回读一次，以服务端为准（顺序/名字可能被服务端改过）。
+        if !out.created.is_empty() {
+            if let Ok(v) = self.task_lists(project_id) {
+                out.names = v.into_iter().map(|l| l.name).collect();
+            }
+        }
+        out
     }
 
     // 把任务挪到指定列名的看板列。
@@ -2008,13 +2098,42 @@ pub fn project_url(project_id: &str) -> String {
     format!("{PROJECT_URL_PREFIX}{project_id}")
 }
 
-/// 「去项目里手动新建 5 个数字看板列」的引导。`create` / `go` / `init` 共用这一份，
-/// 免得三处说法漂移、或漏给项目链接。
+/// `ensure_tasklists` 的结果。调用方据此决定「报功」还是「让用户手动兜底」。
+#[derive(Debug, Default, Clone)]
+pub struct TasklistResult {
+    /// 补完之后服务端实际有的列名；查询失败时为空。
+    pub names: Vec<String>,
+    /// 这次真正新建出来的列名。
+    pub created: Vec<String>,
+    /// 失败原因。空 = 全部搞定。
+    pub errors: Vec<String>,
+}
+
+impl TasklistResult {
+    pub fn ready(&self) -> bool {
+        let refs: Vec<&str> = self.names.iter().map(String::as_str).collect();
+        tasklists_ready(&refs)
+    }
+    pub fn ok(&self) -> bool {
+        self.errors.is_empty() && self.ready()
+    }
+    /// 查询完全没结果（连列清单都没拿到），跟「列不齐」要分开说。
+    pub fn unknown(&self) -> bool {
+        self.names.is_empty() && !self.errors.is_empty()
+    }
+}
+
+/// 项目链接 + 看板列状态，create / go / init 共用这一份，免得说法漂移、漏给链接。
 ///
-/// 网页 API 只能查列、不能建列/改列名，所以这段只能打印给人看。
-/// `names = None` = 这次没查到列信息（刚建的项目 / 接口没回）：照样给链接和步骤，
-/// 但不谎报「缺哪几列」。`Some` 且 1/2/3/4/5 齐全时只回一段短确认，不刷屏。
-pub fn tasklist_guidance<S: AsRef<str>>(project_id: &str, names: Option<&[S]>) -> String {
+/// 新版 MCP 有 `task-list-create`，正常路径是 tba 自动补齐 1~5；
+/// 这段只在「自动补列没成功」时才给手动步骤，不再是唯一出路。
+///
+/// `verbose=false`（每次 `tba go`）：全齐且没动过就返回空串，不刷屏。
+/// `verbose=true`（create / init）：总给项目链接和状态，建完项目人需要这条链接。
+pub fn tasklist_guidance(project_id: &str, r: &TasklistResult, verbose: bool) -> String {
+    if !verbose && r.ok() && r.created.is_empty() {
+        return String::new();
+    }
     let mut s = format!(
         "\n===== Teambition 项目 =====\n项目链接: {}\n",
         project_url(project_id)
@@ -2022,42 +2141,54 @@ pub fn tasklist_guidance<S: AsRef<str>>(project_id: &str, names: Option<&[S]>) -
     s.push_str(&format!(
         "（链接打不开就从 Teambition 首页进项目；项目 id: {project_id}）\n"
     ));
-    match names {
-        Some(v) => {
-            let owned: Vec<&str> = v.iter().map(|x| x.as_ref()).collect();
-            if tasklists_ready(&owned) {
-                s.push_str("✓ 看板列 1/2/3/4/5 已齐全，不用手动建。\n");
-                return s;
-            }
-            s.push_str(&format!(
-                "当前看板列: {}\n",
-                if owned.is_empty() {
-                    "(无)".to_string()
-                } else {
-                    owned.join(", ")
-                }
-            ));
-            let missing: Vec<&str> = TASKLIST_WANT
-                .iter()
-                .copied()
-                .filter(|w| !owned.contains(w))
-                .collect();
-            if !missing.is_empty() {
-                s.push_str(&format!("还缺: {}\n", missing.join(", ")));
-            }
+
+    if !r.created.is_empty() {
+        s.push_str(&format!(
+            "✓ 已自动补齐看板列: {}（新建 {} 个）\n",
+            r.created.join(", "),
+            r.created.len()
+        ));
+    }
+    if r.ok() {
+        s.push_str("✓ 看板列 1/2/3/4/5 已齐全，不用手动建。\n");
+        return s;
+    }
+
+    if !r.errors.is_empty() {
+        s.push_str("✗ 自动补列没完全成功:\n");
+        for e in &r.errors {
+            s.push_str(&format!("  - {e}\n"));
         }
-        None => s.push_str("看板列这次没查到（新建项目 / 接口没回），按下面手动建齐即可。\n"),
+    }
+    if !r.unknown() {
+        let refs: Vec<&str> = r.names.iter().map(String::as_str).collect();
+        s.push_str(&format!(
+            "当前看板列: {}\n",
+            if refs.is_empty() {
+                "(无)".to_string()
+            } else {
+                refs.join(", ")
+            }
+        ));
+        let missing: Vec<&str> = TASKLIST_WANT
+            .iter()
+            .copied()
+            .filter(|w| !refs.contains(w))
+            .collect();
+        if !missing.is_empty() {
+            s.push_str(&format!("还缺: {}\n", missing.join(", ")));
+        }
     }
     s.push_str(
-        "\n===== 请手动新建 5 个看板列 =====\n\
-         Teambition 网页 API 建不了任务列表（列），只能你在网页里手动建。\n\
+        "\n===== 兜底：手动补这 5 个看板列 =====\n\
          打开上面的项目链接 → 看板 → 新建 5 个任务列表，名字就用数字 1、2、3、4、5：\n\
            列 1 = 未完成  （队列：还没人接的任务）\n\
            列 2 = 进行中  （agent 正在干）\n\
            列 3 = 待回复  （等你在 Teambition 评论回复）\n\
            列 4 = 已解决  （已完成，待确认）\n\
            列 5 = 已完成  （关闭 / 作废）\n\
-         建齐之前 tba 不会自动移列；建好后重跑 `tba go` 或 `tba init --project <id>` 校验。\n",
+         补不齐时 tba 只改状态、移列会静默跳过，请按上面步骤手动补。\n\
+         补好后重跑 `tba go` 或 `tba init --project <id>`，tba 会自动再试一次。\n",
     );
     s
 }
@@ -3937,10 +4068,11 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
              建项目 + 写 MCP 配置 + 当场领任务一次做完。\n"
         ));
         s.push_str(&format!(
-            "\n**建完项目要给用户两样东西**：输出里的「项目链接」（`https://www.teambition.com/project/<id>`），\n\
-             以及「请手动新建 5 个看板列」那段 —— 让用户去链接里手动建 5 个任务列表，\
-             名字就叫 1、2、3、4、5。网页 API 建不了列，别自己编接口去建。\n\
-             以后每次 `{exe} go` 若发现 5 列不齐，也会打印同一段链接和提示，照着转给用户即可。\n"
+            "\n**建完项目要给用户的东西**：输出里的「项目链接」（`https://www.teambition.com/project/<id>`）。\n\
+             看板列 1~5 由 tba 用新版 MCP 自动补齐，正常不用人管；只有输出里出现\n\
+             「✗ 自动补列没完全成功」和「兜底：手动补这 5 个看板列」时，才把链接和那段\n\
+             兜底步骤原样转给用户，让他在链接里手动建缺的那几个数字列。不要自己拼接口建列。\n\
+             以后每次 `{exe} go` 都会自动再查再补一次。\n"
         ));
     } else {
         s.push_str(
@@ -3989,12 +4121,13 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
              and claim one task in a single shot.\n"
         ));
         s.push_str(&format!(
-            "\n**Always hand the user two things after creating a project**: the project link \
-             (`https://www.teambition.com/project/<id>`) from the output, and the \
-             \"create 5 board columns\" block - they must manually create 5 task lists named \
-             1, 2, 3, 4, 5 in that project. The web API cannot create columns; do not invent one.\n\
-             Every later `{exe} go` prints the same link + reminder whenever the 5 columns are missing; \
-             just forward it to the user.\n"
+            "\n**After creating a project, always hand the user the project link** \
+             (`https://www.teambition.com/project/<id>`) from the output. Board columns 1-5 are \
+             now created automatically by tba via the newer MCP `task-list-create`; no manual work \
+             is normally needed. Only when the output contains \"auto create failed\" plus the \
+             manual fallback block should you forward that block to the user so they can add the \
+             missing numeric columns in the web UI. Never call Teambition APIs by hand.\n\
+             Every later `{exe} go` re-checks and tops the columns up automatically.\n"
         ));
     }
     s
@@ -4284,9 +4417,9 @@ fn claim_header(c: &Claim, exe: &str) -> String {
     )
 }
 
-/// `guide_tasklists`：是否在领任务前校验看板列 1~5 并打印「项目链接 + 手动补列」引导。
-/// 正常 `tba go` 传 true；自举 `create --go` 传 false —— 那一路 create 已经查过并打印过，
-/// 不重复打一整块，也不重复发一次列查询。
+/// `guide_tasklists`：是否在领任务前自动补齐看板列 1~5 并打印结果。
+/// 正常 `tba go` 传 true；自举 `create --go` 传 false —— 那一路 create 已经补过并打印过，
+/// 不重复打一整块，也不重复发一次列查询/建列。
 pub fn go(
     store: &Store,
     project: Option<&str>,
@@ -4361,21 +4494,12 @@ pub fn go(
         let _ = write_project_binding(&proj.id);
     }
 
-    // 看板列 1~5 只能在网页手动建，API 建不了；缺列时「移列」会静默失效。
-    // 每次 tba go 都用**现有 ctx** 查一次（复用已完成的握手，不额外再连一遍），
-    // 缺了就把项目链接和补列步骤直接打出来，别让人疑惑任务怎么没挪列。
+    // 看板列 1~5 缺了会让「移列」静默失效。每次 tba go 都用**现有 ctx** 查一次并
+    // 自动补齐（复用已完成的握手，不额外再连一遍）。全齐且没动过就不打印，不刷屏；
+    // 补不动才给项目链接 + 手动兜底步骤。
     if guide_tasklists {
-        match ctx.task_lists(&proj.id) {
-            Ok(lists) => {
-                let names: Vec<String> = lists.into_iter().map(|l| l.name).collect();
-                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                if !tasklists_ready(&refs) {
-                    print!("{}", tasklist_guidance(&proj.id, Some(&names)));
-                }
-            }
-            // 查不到 ≠ 缺列：一次接口失败不该误导人去重建 5 列，只留一行诊断。
-            Err(e) => eprintln!("看板列查询失败（{e}），本次跳过 1~5 列校验。"),
-        }
+        let r = ctx.ensure_tasklists(&proj.id);
+        print!("{}", tasklist_guidance(&proj.id, &r, false));
     }
 
     // 3) 领活。队列空是正常结果，不是错误。
@@ -4464,7 +4588,7 @@ pub fn agent_prompt_from(
 mod tests {
     use super::*;
 
-    // 项目链接 + 1~5 五列引导：create / go / init 共用这一份，缺一样都算回归。
+    // 项目链接 + 看板列结果：create / go / init 共用这一份，缺一样都算回归。
     #[test]
     fn project_url_uses_project_path_and_id() {
         assert_eq!(
@@ -4474,35 +4598,87 @@ mod tests {
         assert_ne!(project_url("abc123"), task_url("abc123"));
     }
 
-    #[test]
-    fn tasklist_guidance_always_gives_link_and_five_columns() {
-        let s = tasklist_guidance("p1", None::<&[&str]>);
-        assert!(s.contains("https://www.teambition.com/project/p1"));
-        assert!(s.contains("请手动新建 5 个看板列"));
-        for w in ["列 1", "列 2", "列 3", "列 4", "列 5"] {
-            assert!(s.contains(w), "引导里少了 {w}");
+    fn ready_result(names: &[&str]) -> TasklistResult {
+        TasklistResult {
+            names: names.iter().map(|s| s.to_string()).collect(),
+            created: Vec::new(),
+            errors: Vec::new(),
         }
-        assert!(s.contains("没查到"), "查不到列时要说明，别谎报缺哪几列");
-        assert!(!s.contains("还缺:"));
     }
 
     #[test]
-    fn tasklist_guidance_lists_only_missing_columns() {
-        let have: Vec<String> = vec!["1".into(), "2".into()];
-        let s = tasklist_guidance("p1", Some(&have));
-        assert!(s.contains("https://www.teambition.com/project/p1"));
-        assert!(s.contains("还缺: 3, 4, 5"));
-        assert!(s.contains("当前看板列: 1, 2"));
-        assert!(!s.contains("已齐全"));
+    fn tasklist_result_ok_requires_no_errors_and_all_five() {
+        // 顺序不强制、允许多余列（真实 TBA 项目里还有测试列「6」和「未分类」）。
+        let mut r = ready_result(&["6", "5", "4", "3", "2", "1", "未分类"]);
+        assert!(r.ready());
+        assert!(r.ok());
+        r.errors.push("建列「5」失败: 权限不足".into());
+        assert!(!r.ok(), "有失败就不算全部搞定，得给兜底引导");
+        assert!(!ready_result(&["1", "2", "3", "4"]).ready());
+        assert!(!ready_result(&["未完成", "进行中", "待回复", "已解决", "已完成"]).ready());
     }
 
     #[test]
-    fn tasklist_guidance_is_quiet_when_all_five_exist() {
-        let have: Vec<&str> = vec!["5", "3", "1", "4", "2"]; // 顺序不强制
-        let s = tasklist_guidance("p1", Some(&have));
+    fn tasklist_guidance_is_quiet_in_go_when_all_five_exist() {
+        let r = ready_result(&["5", "3", "1", "4", "2"]);
+        assert_eq!(tasklist_guidance("p1", &r, false), "", "每次 go 别刷屏");
+        // create / init 是「建完项目」的动作，仍要给链接。
+        let s = tasklist_guidance("p1", &r, true);
         assert!(s.contains("https://www.teambition.com/project/p1"));
         assert!(s.contains("已齐全"));
-        assert!(!s.contains("请手动新建"), "列齐了就别再刷补列步骤");
+        assert!(!s.contains("兜底"));
+    }
+
+    #[test]
+    fn tasklist_guidance_reports_auto_created_columns() {
+        let r = TasklistResult {
+            names: vec!["1", "2", "3", "4", "5"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            created: vec!["3".into(), "4".into(), "5".into()],
+            errors: Vec::new(),
+        };
+        assert!(r.ok());
+        let s = tasklist_guidance("p1", &r, false);
+        assert!(s.contains("https://www.teambition.com/project/p1"));
+        assert!(s.contains("已自动补齐看板列: 3, 4, 5"));
+        assert!(s.contains("新建 3 个"));
+        assert!(!s.contains("兜底"), "补齐成功就别再给手动步骤");
+    }
+
+    #[test]
+    fn tasklist_guidance_falls_back_to_manual_when_auto_create_failed() {
+        let r = TasklistResult {
+            names: vec!["1".into(), "2".into()],
+            created: Vec::new(),
+            errors: vec!["这个 MCP 工具集没有 task-list-create（老版本服务端）".into()],
+        };
+        assert!(!r.ok());
+        let s = tasklist_guidance("p1", &r, false);
+        assert!(s.contains("https://www.teambition.com/project/p1"));
+        assert!(s.contains("✗ 自动补列没完全成功"));
+        assert!(s.contains("task-list-create"));
+        assert!(s.contains("当前看板列: 1, 2"));
+        assert!(s.contains("还缺: 3, 4, 5"));
+        for w in ["列 1", "列 2", "列 3", "列 4", "列 5"] {
+            assert!(s.contains(w), "兜底引导里少了 {w}");
+        }
+    }
+
+    #[test]
+    fn tasklist_guidance_does_not_claim_missing_columns_when_query_failed() {
+        let r = TasklistResult {
+            names: Vec::new(),
+            created: Vec::new(),
+            errors: vec!["查不到看板列: 超时".into()],
+        };
+        assert!(r.unknown());
+        let s = tasklist_guidance("p1", &r, false);
+        assert!(s.contains("查不到看板列"));
+        assert!(!s.contains("还缺:"), "没拿到列清单就别谎报缺哪几列");
+        assert!(!s.contains("当前看板列"));
+        assert!(s.contains("列 5"), "查不到也要给完整兜底步骤");
     }
 
     // 外部收尾判定：用户网页手动改状态、或拖到列4/列5，都算「已完成」。

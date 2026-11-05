@@ -701,7 +701,7 @@ fn claim_and_print(
                 "用户点头后只跑 `tba create --name \"<选定的>\" --go`：复用/新建项目并重写本地绑定。"
             );
             eprintln!(
-                "建完会打印项目链接，并提示你在该链接里手动新建 1、2、3、4、5 五个看板列。"
+                "建完会打印项目链接，并自动补齐 1、2、3、4、5 五个看板列；补不动才提示手动建。"
             );
             let _ = std::io::stdout().flush();
             std::process::exit(4);
@@ -748,11 +748,11 @@ fn finish_bootstrap(
     if let Some(p) = &r.entry {
         println!("AGENTS.md 入口: {}", p.display());
     }
-    // 建/复用完就把项目链接和 1~5 五列引导给人：网页 API 建不了列，只能手动建。
-    // 用 create() 查到的列信息，不再让 go() 查第二遍（guide_tasklists=false）。
+    // 建/复用完就把项目链接和看板列结果给人。create() 已经自动补过 1~5，
+    // 这里用它的结果，不再让 go() 查第二遍（guide_tasklists=false）。
     print!(
         "{}",
-        crate::ops::tasklist_guidance(&r.project_id, r.tasklists.as_deref())
+        crate::ops::tasklist_guidance(&r.project_id, &r.tasklists, true)
     );
 
     // MCP 只是给「下一次会话」准备：写失败不能挡住接入和领任务。
@@ -1135,31 +1135,12 @@ pub fn run() -> Result<(), String> {
                 println!("  {}\t{}{}", s.id, s.name, tag);
             }
 
-            // 看板列：网页 API 不能建/改名列，只能手动建。补齐状态后共用一份
-            // 「项目链接 + 1~5 五列」引导（和 create / go 同一段，说法不会漂移）。
+            // 看板列：新版 MCP 有 task-list-create，复用同一个 ctx 自动补齐 1~5，
+            // 不再让人去网页手动建。补不动（老服务端 / 没分组 / 接口拒）才降级成
+            // 「项目链接 + 手动补列」引导。和 create / go 共用一份，说法不漂移。
             // 查询失败不算「一列都没有」，别拿一次接口失败误导人去重建 5 列。
-            match ctx.task_lists(&project) {
-                Ok(lists) => {
-                    let names: Vec<String> = lists.into_iter().map(|l| l.name).collect();
-                    println!(
-                        "\n看板列（任务列表，网页维护）: 找到 {} 个 -> {}",
-                        names.len(),
-                        if names.is_empty() { "(无)".to_string() } else { names.join(", ") }
-                    );
-                    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                    if tasklists_ready(&refs) {
-                        println!("  本地列配置已设为 1/2/3/4/5。");
-                    }
-                    print!("{}", crate::ops::tasklist_guidance(&project, Some(&names)));
-                }
-                Err(e) => {
-                    eprintln!("\n看板列查询失败（{e}），本次不判断 1~5 是否齐全。");
-                    print!(
-                        "{}",
-                        crate::ops::tasklist_guidance(&project, None::<&[&str]>)
-                    );
-                }
-            }
+            let r = ctx.ensure_tasklists(&project);
+            print!("{}", crate::ops::tasklist_guidance(&project, &r, true));
         }
         Cmd::EnsureProject {
             name,

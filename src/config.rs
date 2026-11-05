@@ -75,12 +75,14 @@ pub const MEMORY_SECTION_LIMIT: usize = 50;
 pub const MEMORY_HARD_LIMIT_CHARS: usize = 8000;
 pub const MEMORY_SOFT_LIMIT_CHARS: usize = 6000;
 
-// 五个固定看板列（任务列表 / task list）。API 不能建、不能改名，只能在网页手动建，
-// 所以这里按「列名」引用，列名对不上就跳过移列（只改状态），不阻断流程。
+// 五个固定看板列（任务列表 / task list）。按「列名」引用：列名对不上就跳过移列
+// （只改状态），不阻断流程。
 // 语义：列1=队列(没人接) / 列2=agent 正在干 / 列3=球在用户那 / 列4=已解决 / 列5=关闭。
 //
-// 列名统一用数字 1..5（用户拍板：不折腾中文列名）。tb init 会校验项目里有这 5 个
-// 数字列，缺列就引导用户去 Teambition 网页手动建（网页 API 建不了列）。
+// 列名统一用数字 1..5（用户拍板：不折腾中文列名）。
+// 2026-11 复查：新版 MCP 有 `task-list-create` / `task-list-update-name` /
+// `task-list-order-update`，`ops::ensure_tasklists()` 会自动补齐缺的数字列；
+// 老服务端补不动时才降级成项目链接 + 网页手动补列引导。
 pub const DEFAULT_TASKLIST_QUEUE: &str = "1";
 pub const DEFAULT_TASKLIST_CLAIM: &str = "2";
 pub const DEFAULT_TASKLIST_WAIT: &str = "3";
@@ -97,14 +99,14 @@ pub const TASKLIST_WANT: [&str; 5] = [
 ];
 
 /// 项目现有列名是否覆盖了 5 个数字列。顺序不强制，只要有这 5 个名字即可。
-/// tb init 用它判断要不要引导用户去网页手动补列。
+/// `ensure_tasklists()` 用它判断这次要不要补列。
 pub fn tasklists_ready(names: &[&str]) -> bool {
     TASKLIST_WANT.iter().all(|w| names.contains(w))
 }
 
 /// Teambition 网页里的项目页前缀。任务链接是 `https://www.teambition.com/task/<id>`，
-/// 项目按同一站点约定拼 `/project/<id>`。看板列网页 API 建不了，得把这条链接给人，
-/// 让他自己进去手动新建 1~5。链接规则变了只改这一个常量。
+/// 项目按同一站点约定拼 `/project/<id>`。建完项目、或自动补列失败要人手动兜底时，
+/// 把这条链接打给用户。链接规则变了只改这一个常量。
 pub const PROJECT_URL_PREFIX: &str = "https://www.teambition.com/project/";
 
 // 会话心跳阈值（秒）。running 状态的 claim 超过这个时间没续命，
