@@ -447,7 +447,7 @@ fn print_name_candidates(store: &Store, given: Option<&str>, project: Option<&st
     let rows = crate::create::scan(store, &dir, given);
     if rows.is_empty() {
         println!("没找到可用的名字线索：没有 git remote，也没有 Cargo.toml / package.json 这类清单。");
-        println!("直接问用户要一个项目名，再跑 `tba create --name \"<名字>\"`。");
+        println!("直接问用户要一个项目名，再跑 `tba create --name \"<名字>\" --go`。");
         return;
     }
     if let Some(p) = project.map(str::trim).filter(|s| !s.is_empty()) {
@@ -455,7 +455,8 @@ fn print_name_candidates(store: &Store, given: Option<&str>, project: Option<&st
     }
     println!("\n候选项目名（把这份原样交给用户拍板，不要自己挑）：");
     print_name_rows(&rows);
-    println!("\n用户选定后：tba create --name \"<选定的名字>\"");
+    println!("\n用户选定后：tba create --name \"<选定的名字>\" --go");
+    println!("（--go 会顺手写 MCP 配置并当场领一条任务；不加就只建项目）");
     println!("以上只是列候选：没有创建项目，也没有改本地绑定。");
 }
 
@@ -472,7 +473,7 @@ fn pick_name_interactive(rows: &[crate::create::Row]) -> Result<String, String> 
     if !std::io::stdin().is_terminal() {
         return Err(
             "没有终端可以选号。把上面的候选原样交给用户拍板，再跑 \
-             `tba create --name \"<选定的名字>\"`。没有创建项目。"
+             `tba create --name \"<选定的名字>\" --go`。没有创建项目。"
                 .to_string(),
         );
     }
@@ -498,14 +499,42 @@ fn pick_name_interactive(rows: &[crate::create::Row]) -> Result<String, String> 
     Ok(t.to_string())
 }
 
-const MCP_SNIPPET: &str = r#"{
-  "mcpServers": {
-    "tba": {
-      "command": "tba.exe",
-      "args": ["serve"]
+/// 给别的 agent 客户端手贴用的片段。command 同样用 exe 绝对路径：
+/// 宿主进程常常没刷新 PATH，裸 `tba.exe` 会起不来。
+/// 走 serde_json 生成，Windows 路径里的反斜杠才会正确转义。
+fn mcp_snippet() -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "mcpServers": {
+            "tba": { "command": mcp_command(), "args": ["serve"] }
+        }
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+/// MCP 配置里的 command 用装在正式位置的 exe 绝对路径。
+/// 从 cargo target 跑开发版时别把调试 exe 写进宿主配置。
+fn mcp_command() -> String {
+    match std::env::current_exe() {
+        Ok(p) => {
+            let in_target = p
+                .parent()
+                .and_then(|d| d.file_name())
+                .map(|n| n == "debug" || n == "release")
+                .unwrap_or(false);
+            if !in_target {
+                return p.display().to_string();
+            }
+            if let Ok(home) = std::env::var("USERPROFILE") {
+                let installed = std::path::Path::new(&home).join("tba").join("tba.exe");
+                if installed.exists() {
+                    return installed.display().to_string();
+                }
+            }
+            p.display().to_string()
+        }
+        Err(_) => "tba.exe".to_string(),
     }
-  }
-}"#;
+}
 
 /// 把 tba 合并进 WorkBuddy 的 mcp.json。只动 mcpServers.tba，别的不碰。
 fn mcp_install() -> Result<String, String> {
@@ -532,22 +561,116 @@ fn mcp_install() -> Result<String, String> {
     }
     servers.as_object_mut().unwrap().insert(
         "tba".to_string(),
-        serde_json::json!({ "command": "tba.exe", "args": ["serve"] }),
+        serde_json::json!({ "command": mcp_command(), "args": ["serve"] }),
     );
     std::fs::create_dir_all(path.parent().unwrap())
         .map_err(|e| format!("建目录失败: {e}"))?;
     let text = serde_json::to_string_pretty(&root).unwrap_or_default();
     std::fs::write(&path, text).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
     Ok(format!(
-        "已写入 {}\n下一步：在 WorkBuddy 连接器管理页找到 tba，点「信任」启用。\n\
+        "已写入 {}（command 是 exe 绝对路径，不依赖 PATH 刷新）\n\
+         MCP 对【当前会话】不生效：下次会话或重载后，在连接器管理页找到 tba 点「信任」启用。\n\
          其他 agent 的配置片段：跑 `tba mcp` 查看。",
         path.display()
     ))
 }
 
+/// 「去队列领一条任务 + 打开工文案」。
+/// Cmd::Go 和自举一条龙共用，避免两边行为漂移。
+fn claim_and_print(
+    store: &Store,
+    project: Option<&str>,
+    lang: Lang,
+    write_entry: bool,
+) -> Result<(), String> {
+    use std::io::Write;
+    match go(store, project, lang, write_entry)? {
+        GoOutcome::NoBinding { cwd } => {
+            println!("NO_BINDING {cwd}");
+            eprintln!("当前目录没有绑定 Teambition 项目（缺 .tba/project）。停，不领任务。");
+            eprintln!(
+                "要接入：跑 `tba`（不带参数）扫候选项目名，把候选交给用户挑，\
+                 再 `tba create --name \"<选定的名字>\" --go`"
+            );
+            let _ = std::io::stdout().flush();
+            std::process::exit(3);
+        }
+        GoOutcome::NoProject { id, name } => {
+            if id.is_empty() {
+                println!("NO_PROJECT {name}");
+                eprintln!("当前目录按名字「{name}」在 Teambition 上没找到项目（或撞了多个同名）。");
+            } else {
+                println!("NO_PROJECT {id}");
+                eprintln!("本地绑定指向的项目「{id}」在 Teambition 里查不到（可能被删了）。");
+            }
+            eprintln!("要初始化：`tba ensure-project --name {name}`（有同名就复用，没有就新建）");
+            let _ = std::io::stdout().flush();
+            std::process::exit(4);
+        }
+        GoOutcome::Empty { project_name } => {
+            println!("EMPTY {project_name}");
+            eprintln!("队列空：列「{STAGE_TODO}」没有可领任务。停。");
+        }
+        GoOutcome::Claimed { text, entry, .. } => {
+            print!("{text}");
+            if let Some(p) = entry {
+                eprintln!("已补工作空间入口: {}", p.display());
+            }
+        }
+        GoOutcome::Blocked { msg } => {
+            println!("BLOCKED");
+            eprintln!("{msg}");
+            let _ = std::io::stdout().flush();
+            // 退出码 5 = 手上有没人接的「待回复」，先处理掉再来领。
+            std::process::exit(5);
+        }
+    }
+    Ok(())
+}
+
+/// 自举下半段：名字已经由用户拍板，一条命令做完 create + MCP + 领任务。
+/// 顺序上先写 MCP 再领任务：领任务可能 process::exit，得先把提示打出来。
+fn finish_bootstrap(
+    store: &Store,
+    dir: &std::path::Path,
+    name: &str,
+    project: Option<&str>,
+    lang: Lang,
+) -> Result<(), String> {
+    let r = crate::create::create(store, dir, name, project, lang)?;
+    println!(
+        "\n项目就绪: {}\t{}{}",
+        r.project_id,
+        r.project_name,
+        if r.created { "（新建）" } else { "（复用）" }
+    );
+    println!("工作流状态: 7 个已补齐");
+    println!("本地绑定: {}", r.binding.display());
+    if let Some(p) = &r.entry {
+        println!("AGENTS.md 入口: {}", p.display());
+    }
+
+    // MCP 只是给「下一次会话」准备：写失败不能挡住接入和领任务。
+    match mcp_install() {
+        Ok(msg) => println!("\n[MCP] {msg}"),
+        Err(e) => eprintln!(
+            "[MCP] 写配置失败（不影响接入和领任务）：{e}\n\
+             下次跑 `tba mcp --install` 可重试；其他客户端用 `tba mcp` 看片段。"
+        ),
+    }
+
+    println!("\n===== 领任务 =====");
+    // 用刚建/复用出来的项目 id，别让 go() 去读 cwd 的 .tba/project：
+    // `--dir <别的目录>` 时绑定写在 dir，进程 cwd 里根本没有。
+    // create() 已经在 dir 写过入口文件，这里 write_entry=false，别再往 cwd 补一份。
+    claim_and_print(store, Some(r.project_id.as_str()), lang, false)
+}
+
 /// 无参数 + 没有 .tba/project 时的一次性自举卡。
-/// 不建项目、不写文件、不自己起名：候选原样交给用户拍板。
+/// 交互终端：就地选号，一次做完 create + MCP + 领任务。
+/// agent（stdin 不是终端）：候选原样交给用户拍板，给一条收尾命令，绝不自己起名。
 fn auto_bootstrap(store: &Store) -> Result<(), String> {
+    use std::io::IsTerminal;
     println!(
         "tba 是本机已安装的命令行工具（在 PATH 里）。直接执行它。\n\
          不要为了找它去搜 exe、不要验证路径。跑不通就把错误原样报给用户。\n"
@@ -556,15 +679,26 @@ fn auto_bootstrap(store: &Store) -> Result<(), String> {
     println!("当前目录 {} 还没接入 Teambition 项目。\n", dir.display());
     let rows = crate::create::scan(store, &dir, None);
     if rows.is_empty() {
-        println!("没扫到候选项目名。问用户要一个名字，再跑：tba create --name \"<名字>\"");
-    } else {
-        println!("候选项目名（把这份原样交给用户拍板，不要自己挑）：");
-        for (i, r) in rows.iter().enumerate() {
-            println!("  {}. {}\t来源: {}\t{}", i + 1, r.name, r.source, r.mark);
-        }
-        println!("\n用户选定后：tba create --name \"<选定的名字>\"");
-        println!("建好后再敲 `tba` 就能领任务。");
+        println!("没扫到候选项目名。把情况交给用户，问一个名字，再只跑这一条：");
+        println!("  tba create --name \"<用户给的名字>\" --go");
+        println!("（--go = 建项目 + 写 MCP 配置 + 当场领一条任务）");
+        return Ok(());
     }
+    println!("候选项目名（把这份原样交给用户拍板，不要自己挑）：");
+    print_name_rows(&rows);
+
+    // 人自己在终端敲：就地选号，一次做完，不用再记第二条命令。
+    if std::io::stdin().is_terminal() {
+        let picked = pick_name_interactive(&rows)?;
+        println!("\n已选项目名: {picked}");
+        return finish_bootstrap(store, &dir, &picked, None, Lang::Zh);
+    }
+
+    // agent 场景：不能替用户拍板，给一条收尾命令把剩下的全做完。
+    println!("\n用户选定后只跑这一条，剩下的全部做完：");
+    println!("  tba create --name \"<选定的名字>\" --go");
+    println!("--go = 建/复用项目 + 补 7 状态 + 写绑定 + 写 MCP 配置 + 当场领一条任务。");
+    println!("MCP 只对下一次会话生效；本次会话照样能用命令行干活。");
     Ok(())
 }
 
@@ -581,7 +715,8 @@ pub fn run() -> Result<(), String> {
     }
     // 不带子命令 = 零参数自举。陌生 agent 只要会敲 `tba` 这一个词就能开工：
     //   - 当前目录有 .tba/project -> 直接当 go 领任务
-    //   - 没有 -> 列候选项目名，停下等用户拍板（不自己建、不自己起名）
+    //   - 没有 -> 列候选交用户拍板；交互终端就地选号后一次做完，
+    //            agent（非终端）拿到一条 `tba create --name X --go` 收尾
     // 双击窗口由 tbagui.exe 承担，tba.exe 无参数不再开 GUI。
     let cmd = match cli.cmd {
         Some(c) => c,
@@ -970,6 +1105,7 @@ pub fn run() -> Result<(), String> {
             dir,
             project,
             dry,
+            go,
             lang,
         } => {
             let lang = Lang::parse(&lang)
@@ -986,7 +1122,7 @@ pub fn run() -> Result<(), String> {
             if rows.is_empty() {
                 return Err(
                     "没找到可用的名字线索：没有 git remote，也没有 Cargo.toml / package.json 这类清单。\n\
-                     直接问用户要一个项目名，再跑 `tba create --name \"<名字>\"`。"
+                     直接问用户要一个项目名，再跑 `tba create --name \"<名字>\" --go`。"
                         .to_string(),
                 );
             }
@@ -996,6 +1132,7 @@ pub fn run() -> Result<(), String> {
             if dry {
                 println!("\n--dry：只列候选。没有创建项目，也没有写任何文件。");
                 println!("拍板后跑：tba create --name \"<选定的名字>\" --dir \"{}\"", target.display());
+                println!("要顺手写 MCP 配置并当场领任务，加 --go。");
                 return Ok(());
             }
 
@@ -1005,6 +1142,12 @@ pub fn run() -> Result<(), String> {
                 None => pick_name_interactive(&rows)?,
             };
             println!("\n已选项目名: {picked}");
+            if go {
+                // 自举一条龙：建项目 + 写 MCP + 当场领任务。
+                // 留在 Create 分支内部调用，天然走 Create 的 GitButler 豁免，
+                // 全新设备缺 but.exe 也不会被「领任务」这一环拦住。
+                return finish_bootstrap(&store, &target, &picked, project.as_deref(), lang);
+            }
             let r = crate::create::create(&store, &target, &picked, project.as_deref(), lang)?;
             print!("{}", r.report());
         }
@@ -1261,49 +1404,7 @@ pub fn run() -> Result<(), String> {
                 let _ = std::io::stdout().flush();
                 return Ok(());
             }
-            match go(&store, project.as_deref(), lang, !no_entry)? {
-                GoOutcome::NoBinding { cwd } => {
-                    println!("NO_BINDING {cwd}");
-                    eprintln!("当前目录没有绑定 Teambition 项目（缺 .tba/project）。停，不领任务。");
-                    eprintln!(
-                        "要接入：跑 `tba`（不带参数）扫候选项目名，把候选交给用户挑，\
-                         再 `tba create --name \"<选定的名字>\"`"
-                    );
-                    let _ = std::io::stdout().flush();
-                    std::process::exit(3);
-                }
-                GoOutcome::NoProject { id, name } => {
-                    if id.is_empty() {
-                        println!("NO_PROJECT {name}");
-                        eprintln!(
-                            "当前目录按名字「{name}」在 Teambition 上没找到项目（或撞了多个同名）。"
-                        );
-                    } else {
-                        println!("NO_PROJECT {id}");
-                        eprintln!("本地绑定指向的项目「{id}」在 Teambition 里查不到（可能被删了）。");
-                    }
-                    eprintln!("要初始化：`tba ensure-project --name {name}`（有同名就复用，没有就新建）");
-                    let _ = std::io::stdout().flush();
-                    std::process::exit(4);
-                }
-                GoOutcome::Empty { project_name } => {
-                    println!("EMPTY {project_name}");
-                    eprintln!("队列空：列「{STAGE_TODO}」没有可领任务。停。");
-                }
-                GoOutcome::Claimed { text, entry, .. } => {
-                    print!("{text}");
-                    if let Some(p) = entry {
-                        eprintln!("已补工作空间入口: {}", p.display());
-                    }
-                }
-                GoOutcome::Blocked { msg } => {
-                    println!("BLOCKED");
-                    eprintln!("{msg}");
-                    let _ = std::io::stdout().flush();
-                    // 退出码 5 = 手上有没人接的「待回复」，先处理掉再来领。
-                    std::process::exit(5);
-                }
-            }
+            claim_and_print(&store, project.as_deref(), lang, !no_entry)?;
         }
         Cmd::Claim { project, name } => {
             let project = resolve_project(project.as_deref())?;
@@ -1964,9 +2065,10 @@ pub fn run() -> Result<(), String> {
                 println!("{}", mcp_install()?);
             } else {
                 println!(
-                    "把下面这段加进 agent 的 MCP 配置（每台设备配一次）：\n\n{MCP_SNIPPET}\n\n\
+                    "把下面这段加进 agent 的 MCP 配置（每台设备配一次）：\n\n{}\n\n\
                      本机一键写入 WorkBuddy：`tba mcp --install`\n\
-                     工具列表由 MCP 协议自动下发，不用手记名字。"
+                     工具列表由 MCP 协议自动下发，不用手记名字。",
+                    mcp_snippet()
                 );
             }
         }
@@ -2279,4 +2381,27 @@ pub fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mcp_command, mcp_snippet};
+
+    /// Windows 路径含反斜杠，片段必须是能被客户端直接解析的合法 JSON。
+    #[test]
+    fn mcp_snippet_is_valid_json_with_abs_command() {
+        let v: serde_json::Value =
+            serde_json::from_str(&mcp_snippet()).expect("tba mcp 片段必须是合法 JSON");
+        let tba = &v["mcpServers"]["tba"];
+        assert_eq!(tba["args"][0], "serve");
+        assert_eq!(tba["command"], mcp_command());
+        assert_ne!(tba["command"], "tba.exe", "别把裸命令写进宿主配置");
+        assert!(
+            tba["command"]
+                .as_str()
+                .unwrap()
+                .contains(std::path::MAIN_SEPARATOR),
+            "command 应该是 exe 绝对路径"
+        );
+    }
 }

@@ -3873,7 +3873,9 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
              出错就把 stdout 原样报给用户：不要改 data/config.toml，不要自己拼 Teambition 接口。\n"
         ));
         s.push_str(&format!(
-            "\n**更省事**：用户本人跑 `{exe} create` 即可一条命令走完全流程（列候选 -> 他选号 -> 建项目 -> 开工文案）。\n"
+            "\n**更省事（陌生 agent）**：项目目录跑 `{exe}`（不带参数）扫候选，把候选交用户拍板；\
+             之后只跑一条 `{exe} create --name \"<选定的>\" --go`，\
+             建项目 + 写 MCP 配置 + 当场领任务一次做完。\n"
         ));
     } else {
         s.push_str(
@@ -3917,7 +3919,9 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
              On error report stdout as-is: do not edit data/config.toml, do not call Teambition APIs by hand.\n"
         ));
         s.push_str(&format!(
-            "\n**Shorter**: the user can run `{exe} create` to do all of the above in one command.\n"
+            "\n**Shorter**: after the user picks a name, run just one command \
+             `{exe} create --name \"<picked>\" --go` to link the repo, write the MCP config \
+             and claim one task in a single shot.\n"
         ));
     }
     s
@@ -4098,7 +4102,8 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **工具**：`{exe}`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。\
          直接执行，别搜 exe、别验证路径、别读 `.tba/`。\n\n\
          **开工**：用户说「开工」→ 跑 `{exe}`（不带参数）。有 `.tba/project` 就领任务；\
-         没有就列候选项目名，交给用户拍板。退出码：\
+         没有就列候选项目名交给用户拍板，用户点头后只跑 `{exe} create --name \"<选定的>\" --go`\
+         （建项目 + 写 MCP 配置 + 当场领任务，一条命令做完）。退出码：\
          0+claim_id=干活；0+EMPTY=队列空；3=没绑定项目；4=项目查不到，问用户。\
          别自建任务。\n\n\
          **流转**：进行中·列2 → `ask` 后 待回复·列3 → 用户收尾 已解决·列4。\n\n\

@@ -493,8 +493,14 @@ tba wait <claim_id>               :: 单独等（ask 超时后重跑它，或只
 不复制文案、不记子命令。在项目目录里跑 `tba`（不带参数）：
 
 1. 有 `.tba/project` → 等于 `tba g`：按绑定认项目、从列「未完成」领最早一条、打印任务正文 + 完整流程规则。
-2. 没有 → 打印候选项目名，停下等用户拍板。不建项目、不自己起名。用户点头后 `tba create --name "<选定的>"`。
-3. 两种情况都先打印一句「tba 是什么」。陌生 agent 跑一次就够，不需要预先搜索 exe。
+2. 没有 → 打印候选项目名，停下等用户拍板。不建项目、不自己起名。
+   - 人在终端里敲：直接输编号，`tba` 就地做完 create + 写 MCP 配置 + 领任务。
+   - agent（非终端）：把候选原样给用户，用户点头后**只跑一条**
+     `tba create --name "<选定的>" --go` —— 建/复用项目、补 7 状态、写 `.tba/project` 和入口、
+     幂等写 `~/.workbuddy-ai/mcp.json`（exe 绝对路径）、当场领一条任务。
+3. `--go` 写的 MCP 只对**下一次会话**生效（还要在连接器管理页点「信任」）；
+   本次会话本来就是命令行调用，不受影响。MCP 写失败也不阻断接入和领任务。
+4. 两种情况都先打印一句「tba 是什么」。陌生 agent 不需要预先搜索 exe。
 
 `tba g` / `go` / `r` / `run` 仍是别名，行为不变。窗口用 `tba ui` 或双击 `tbagui.exe`。
 
@@ -925,6 +931,7 @@ tba prompt --project <id> --task-file .\todo.md        :: 任务正文从文件�
 ```bat
 tba create                          :: 扫目录列候选 -> 输编号拍板 -> 建/复用 -> 出开工文案
 tba create --name "MarinIME"        :: 已拍板，直接用这个名字，跳过交互
+tba create --name "MarinIME" --go    :: 拍板后一条命令做完：建项目 + 写 MCP + 当场领任务
 tba create --dir "D:\code\repo"     :: 给别的目录接入（窗口里用「选目录…」）
 tba create --dry                    :: 只列候选，不建项目、不写文件
 tba create --lang en                :: 开工文案用英文
@@ -933,6 +940,11 @@ tba create --lang en                :: 开工文案用英文
 `tba create` 会做完全部六步：列候选（编号 + 名字 + 来源 + Teambition 同名情况）、等用户拍板、
 建或复用项目、补齐 7 个工作流状态、写 `.tba/project` 和 `AGENTS.md` 入口、打印开工文案。
 非交互环境（agent 管道调用）不阻塞：打印候选后要求改用 `--name` 重跑。
+
+加 `--go` 时收尾换成「写 MCP 配置 + 当场领一条任务」，不再打印重复的开工文案。
+MCP 配置只写 WorkBuddy 一家（`~/.workbuddy-ai/mcp.json`），`command` 用 exe 绝对路径、
+只动 `mcpServers.tba`、可重复跑；其他客户端仍用 `tba mcp` 看片段自己贴。
+领任务留在 Create 分支内部调用，所以全新设备缺 GitButler CLI 也不会被这一环拦住。
 
 `init` 是另一条命令：给**已有**项目 id 补齐工作流状态，不是接入新项目。
 
@@ -1030,6 +1042,9 @@ Terminal，那一下还得等 WT 起窗，看着就是黑框闪一下。
 挂上 MCP 后，agent 的工具列表里直接有 tba 能力。不用敲命令、不用找 exe、不用读约定文件。
 每台设备、每个 agent 产品配一次。
 
+接新项目时跑 `tba create --name "<选定的>" --go` 会顺手把 WorkBuddy 这一家写好
+（幂等、exe 绝对路径）；其他客户端仍按下面的通用片段自己贴。
+
 ### 新设备：一句话装好
 
 仓库公开后，在 PowerShell 里贴这一行：
@@ -1041,20 +1056,21 @@ irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/
 `install.ps1` 下载最新 Release 的安装包、静默安装、合并写 `~/.workbuddy-ai/mcp.json`。
 不删 `data/`，不覆盖配置里别的 MCP server。装完去连接器管理页点「信任」。
 
-- 装最新 tag。固定版本：先设 `$env:TBA_VERSION = 'v0.2.23'` 再跑。
+- 装最新 tag。固定版本：先设 `$env:TBA_VERSION = 'v0.2.24'` 再跑。
 - 脚本写 exe 绝对路径。不依赖 PATH 刷新，宿主进程还活着也能起 MCP。
 - 安装目录改过的话，脚本会停下来提示改路径。
-- 设备已经装好 tba 时不用跑它，直接 `tba mcp --install`。该命令写裸 `tba.exe`，
-  依赖 PATH；宿主进程没重启时用一键脚本更稳。
-- 其他 agent 跑 `tba mcp` 打印可粘贴的配置片段。
+- 设备已经装好 tba 时不用跑它，直接 `tba mcp --install`。命令写 exe 绝对路径，
+  不依赖 PATH 刷新；和一键脚本效果一致，只是不重新下载安装包。
+- 其他 agent 跑 `tba mcp` 打印可粘贴的配置片段，command 同样是本机 exe 绝对路径，
+  整段贴过去就行，不用手改路径。
 
-在 agent 的 MCP 配置里加：
+在 agent 的 MCP 配置里加（示意，实际路径以 `tba mcp` 输出为准）：
 
 ```json
 {
   "mcpServers": {
     "tba": {
-      "command": "tba.exe",
+      "command": "C:\\Users\\<用户>\\tba\\tba.exe",
       "args": ["serve"]
     }
   }

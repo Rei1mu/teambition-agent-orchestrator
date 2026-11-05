@@ -45,7 +45,8 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
    有疑问直接在对话里问用户，干完直接说结论。
 
 0. **接入项目时不许自己起名字。** 跑 `tba`（不带参数）扫候选，
-   把候选（名字 + 来源）原样列给用户挑，用户点头后才 `tba create --name "<选定的>"`。
+   把候选（名字 + 来源）原样列给用户挑，用户点头后只跑 `tba create --name "<选定的>" --go`
+   （建项目 + 写 MCP 配置 + 当场领任务，一条命令做完）。
    目录名和工具名（TBHub / tba）都不是项目名。`tba create` 不带 `--name` 会停下来等拍板。
 
 1. **agent 只写任务备注，不写评论。** 评论是用户的回复通道，写进去会污染 `ask` 的读取。
@@ -76,7 +77,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 **工具**：`tba`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。直接执行，别搜 exe、别验证路径、别读 `.tba/`。
 
-**开工**：用户说「开工」→ 跑 `tba`（不带参数）。有 `.tba/project` 就领任务；没有就列候选项目名，交给用户拍板。退出码：0+claim_id=干活；0+EMPTY=队列空；3=没绑定项目；4=项目查不到，问用户。别自建任务。
+**开工**：用户说「开工」→ 跑 `tba`（不带参数）。有 `.tba/project` 就领任务；没有就列候选项目名交给用户拍板，用户点头后只跑 `tba create --name "<选定的>" --go`（建项目 + 写 MCP 配置 + 当场领任务，一条命令做完）。退出码：0+claim_id=干活；0+EMPTY=队列空；3=没绑定项目；4=项目查不到，问用户。别自建任务。
 
 **流转**：进行中·列2 → `ask` 后 待回复·列3 → 用户收尾 已解决·列4。
 

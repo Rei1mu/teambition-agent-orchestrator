@@ -125,6 +125,9 @@ pub enum Cmd {
         /// 只列候选，不建项目、不写文件
         #[arg(long)]
         dry: bool,
+        /// 建完顺手：写 MCP 配置 + 当场领一条任务（陌生 agent 自举用）
+        #[arg(long)]
+        go: bool,
         /// 开工文案语言：zh / en
         #[arg(long, default_value = "zh")]
         lang: String,
