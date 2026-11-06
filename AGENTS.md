@@ -56,7 +56,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 1. **agent 只写任务备注，不写评论。** 评论是用户的回复通道，写进去会污染 `ask` 的读取。
 2. **不许自己跑 `tba done` / `tba close`。** 只有用户回 `0` 才收尾。
-3. **做完必须 `tba ask --done`，然后等它返回。** 调用姿势：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 600000`。Sandbox 模式约 78s 会 SIGTERM 强杀阻塞的 `ask`，回复接不上。前台超时会自动转后台继续等（不是自己 `run_in_background`）；用户邮件/Teambition 回数字后 `ask` 退出，task-notification 唤醒 agent 续接。**不许主动 `run_in_background`、不许 `--no-wait`、不许结束会话**。退出码 2 就改用 `tba wait <claim>` 接着等（别重跑 `ask`，会重发信），别断。
+3. **做完必须 `tba ask --done`，然后让它转后台常驻监听。** 调用姿势：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点工具自动把命令转后台（**不杀进程**），不用在前台干等 10 分钟，agent 本轮回复可以正常结束。用户邮件/Teambition 回复后 `ask` 退出，task-notification 唤醒 agent 续接。**不许 `--no-wait`**。常驻模式不超时，退出码 2 只在 `--once` 出现（那时用 `tba wait <claim>` 接着等，别重跑 `ask`，会重发信）。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
 
@@ -90,9 +90,10 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 ① `tba note <claim_id> --text "改了什么/怎么验"`
 ② `tba ask <claim_id> --done`
 
-`ask` 发邮件后**就地阻塞**等你回数字（0=收尾 1=写记忆 2=有问题）。退出码：0=收到回复；2=超时，改用 `tba wait <claim_id>`（别重跑 ask，会重发信）；3=已收尾。
-**调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 600000`。Sandbox 模式约 78s 会 SIGTERM 强杀阻塞的 `ask`，回复接不上。前台超时会自动转后台继续等（不是自己 `run_in_background`）；用户回数字后 `ask` 退出，task-notification 唤醒 agent 续接。
-**禁止主动 run_in_background、禁止 `--no-wait`、绝不结束会话**——断了没人接你回复。只有用户能 `done`/`close`，放弃用 `tba release`。
+`ask` 发邮件后**后台常驻监听**评论和邮件（0=收尾 1=写记忆 2=有问题）。退出码：0=收到回复 / 3=已收尾；常驻模式不会因超时退出。
+**调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点自动转后台（不杀进程），不用干等 10 分钟；收到回复后监听退出，task-notification 唤醒 agent 续接。
+**会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。
+禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `tba release`。
 
 **通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git create` 建或连接 GitHub 仓库（别装 gh）/ `git main -m` 提交推送 / `publish` 发版 / `shot` 截图。先 `tba --help`。
 

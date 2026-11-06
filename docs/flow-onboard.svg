@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="470" viewBox="0 0 1400 470" font-family="Microsoft YaHei, PingFang SC, Segoe UI, sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b6bd9"/>
+    </marker>
+    <style>
+      .bg { fill: #ffffff; }
+      .title { fill: #241a3d; font-size: 27px; font-weight: 700; }
+      .sub { fill: #6b5c8a; font-size: 15px; }
+      .tag { fill: #7a5bc0; font-size: 13px; font-weight: 600; }
+      .box { fill: #f3edff; stroke: #8b6bd9; stroke-width: 1.6; rx: 10; }
+      .dia { fill: #e9dfff; stroke: #8b6bd9; stroke-width: 1.6; }
+      .end { fill: #e5d5ff; stroke: #6f48c4; stroke-width: 2; }
+      .t { fill: #2f2545; font-size: 15px; text-anchor: middle; }
+      .tb { fill: #2f2545; font-size: 15px; font-weight: 700; text-anchor: middle; }
+      .ts { fill: #5f537a; font-size: 13px; text-anchor: middle; }
+      .ln { stroke: #8b6bd9; stroke-width: 1.8; fill: none; marker-end: url(#ar); }
+      .lbl { fill: #7a5bc0; font-size: 13px; font-weight: 600; }
+      .foot { fill: #6b5c8a; font-size: 13px; text-anchor: start; }
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1400" height="470"/>
+  <text class="title" x="40" y="48">① 设备接入 · 每台设备一次</text>
+  <text class="sub" x="40" y="78">第一次会话只做三件事：装好 tba、挂上 MCP、token 由用户本人填。本次会话不建项目、不领任务、不跑 go。</text>
+  <text class="tag" x="40" y="106">入口指令：接入tba cli</text>
+
+  <!-- 未安装分支 -->
+  <rect class="box" x="200" y="112" width="220" height="62"/>
+  <text class="t" x="310" y="137">PowerShell 一句话安装</text>
+  <text class="ts" x="310" y="158">irm .../install.ps1 | iex</text>
+  <path class="ln" d="M 290 195 L 290 178"/>
+  <text class="lbl" x="300" y="192">没装</text>
+  <path class="ln" d="M 420 143 L 492 143 L 492 204"/>
+
+  <!-- 主干 -->
+  <rect class="box" x="40" y="208" width="170" height="84"/>
+  <text class="tb" x="125" y="238">tba --version</text>
+  <text class="ts" x="125" y="260">先看装没装</text>
+  <text class="ts" x="125" y="279">别去搜 exe 路径</text>
+
+  <polygon class="dia" points="215,250 290,192 365,250 290,308"/>
+  <text class="t" x="290" y="246">装好了？</text>
+  <text class="ts" x="290" y="266">读本地状态</text>
+  <path class="ln" d="M 210 250 L 213 250"/>
+  <path class="ln" d="M 365 250 L 393 250"/>
+
+  <rect class="box" x="395" y="208" width="195" height="84"/>
+  <text class="tb" x="492" y="236">tba onboard</text>
+  <text class="ts" x="492" y="258">只查本地 · 不联网</text>
+  <text class="ts" x="492" y="278">TOKEN / GUI / BINDING</text>
+  <path class="ln" d="M 590 250 L 593 250"/>
+
+  <polygon class="dia" points="595,250 670,192 745,250 670,308"/>
+  <text class="t" x="670" y="240">TOKEN</text>
+  <text class="t" x="670" y="260">MISSING?</text>
+  <path class="ln" d="M 745 250 L 773 250"/>
+
+  <!-- TOKEN MISSING 分支 -->
+  <path class="ln" d="M 670 308 L 670 344"/>
+  <text class="lbl" x="680" y="330">是</text>
+  <rect class="box" x="540" y="346" width="370" height="76"/>
+  <text class="tb" x="725" y="374">起 tbagui.exe，用户本人填 token</text>
+  <text class="ts" x="725" y="398">agent 不代填、不碰 data/config.toml · 本次会话到此为止 → 另开会话进 ②</text>
+
+  <rect class="box" x="775" y="208" width="190" height="84"/>
+  <text class="tb" x="870" y="236">幂等写 MCP</text>
+  <text class="ts" x="870" y="258">打印 tba mcp 片段</text>
+  <text class="ts" x="870" y="278">agent 合并进自己配置</text>
+  <path class="ln" d="M 965 250 L 993 250"/>
+
+  <rect class="box" x="995" y="208" width="190" height="84"/>
+  <text class="tb" x="1090" y="236">用户点「信任」</text>
+  <text class="ts" x="1090" y="258">连接器管理页</text>
+  <text class="ts" x="1090" y="278">下一次会话才生效</text>
+  <path class="ln" d="M 1185 250 L 1218 250"/>
+
+  <rect class="end" x="1220" y="220" width="140" height="60" rx="30"/>
+  <text class="tb" x="1290" y="257">② 开工</text>
+
+  <text class="foot" x="40" y="446">要点：install.ps1 只自动写 WorkBuddy 一家 MCP；其他客户端用 tba mcp 的通用片段自己合并（协议通用，配置路径不通用）。</text>
+</svg>

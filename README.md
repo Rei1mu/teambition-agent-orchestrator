@@ -1,14 +1,124 @@
 # TBA
 
-> 开源协议：[Apache License 2.0](LICENSE) · 仓库已公开，一句话安装可直接用。
+![version](https://img.shields.io/badge/version-0.2.30-blue) ![platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20arm64-lightgrey) ![license](https://img.shields.io/badge/license-Apache--2.0-green) ![rust](https://img.shields.io/badge/rust-2021-orange)
 
-## 流程图：两次会话
+**Teambition Agent Orchestrator** —— 让 AI agent 在 Teambition 上排队领任务、把过程写进任务备注，交回后由**后台常驻监听**等你在邮件 / 评论 / 会话窗回复，回复一到自动唤起会话继续，不用前台干等 10 分钟。
 
-**设备接入和干活分两次会话**：第一次装好 tba 与 MCP、token 由用户自己填；第二次不带参数跑 `tba`，由它按工作区决定领任务还是列候选。
+一个 Rust 二进制，三种用法：CLI（`tba`）、MCP server（`tba serve`）、桌面窗口（`tba ui`）。数据放在 exe 同目录的 `data/`，同一台设备上所有 agent 共享。
 
-> 这两张图是仓库里的静态 PNG（`docs/`），不依赖 GitHub 的 Mermaid 前端渲染，任何 Markdown 阅读器都能显示。图片加载不到时，展开每节下面的「纯文字版」。
+- 仓库：<https://github.com/Rei1mu/teambition-agent-orchestrator>
+- 最新安装包：[Releases](https://github.com/Rei1mu/teambition-agent-orchestrator/releases)
+- 完整流程文字版：[docs/流程图.md](docs/流程图.md) · 图片源文件：[docs/*.svg](docs/flow-loop.svg)
 
-### ① 第一次会话：「接入tba cli」（每台设备一次）
+---
+
+## 目录
+
+| | |
+|---|---|
+| [为什么需要它](#为什么需要它) · [核心特性](#核心特性) | [快速开始](#快速开始) · [安装](#安装) |
+| [工作流程（图片 + 文字版）](#工作流程图片--文字版) | [回复协议](#回复协议) · [命令速查](#命令速查) |
+| [状态模型](#状态模型) · [配置](#配置) | [邮件通道为什么快](#邮件通道为什么快) |
+| [开发与发版](#开发与发版) · [排查](#排查) | [文档索引](#文档索引) · [许可](#许可) |
+
+---
+
+## 为什么需要它
+
+1. **多设备、不同 agent 无缝续作**：项目背景（skill）和进展（记忆）放在 Teambition 与本地 `data/`，不绑死在某台机器或某个 agent 上。换设备挂上同一个项目就能接着干。
+2. **把 token 花在干活上**：`tba prompt` 只打包该项目启用的 skill、共享记忆和领到的任务，agent 不必每次通读仓库、翻聊天记录重建背景。
+3. **关键流程不靠 agent 自觉**：易错、依赖环境、有严格顺序的动作（重载 exe、补看板列、交回并挂监听）收进命令里，而不是留在文字约定里。agent 只负责调用。
+4. **状态可度量**：五个固定阶段 + 五个看板列，谁在做什么、积压多少、完成多少，看板上一眼可查。
+
+## 核心特性
+
+- **两次会话分工**：第一次做设备接入（装 tba / 挂 MCP / 用户自己填 token），第二次才开工领任务；接入会话不碰任务队列。
+- **零上下文开工**：在项目目录里敲 `tba`，它按当前工作区自己决定领任务还是列候选项目名。
+- **后台常驻监听**：`tba ask` 交回后挂后台，agent 本轮回复可以正常结束；评论 / 邮件轮询都是 5 秒，收到回复由任务通知唤起会话。
+- **三路入站**：邮件回复、Teambition 评论、会话窗直接输入，任意一路都能继续；执行中收到的回复也会落盘留痕，不丢。
+- **只抓新信**：按提问时刻的 IMAP `UIDNEXT` 水位过滤，历史未读信一封都不下载，实测端到端从 31~41 秒降到秒级。
+- **离线直连 / 共享记忆 / skill 库 / MCP / 打包发版**：不需要 Teambition 时也能用 `tba go -off` 只在本机跑。
+
+---
+
+## 快速开始
+
+**设备接入和干活分两次会话。** 第一次每台设备做一次，之后每次开工直接进第二次。
+
+| 会话 | 触发语 | 做什么 | 不做什么 |
+|---|---|---|---|
+| ① 设备接入 | 「接入tba cli」 | 装包 → `tba onboard` → 用户填 token → 挂 MCP → 点信任 | 不建项目、不领任务、不跑 `tba go` |
+| ② 开工 | 「开工」或 `tba go` | 不带参数跑 `tba`，由它领任务或列候选项目名 | 不自己起项目名 |
+
+**① 装好并接上（PowerShell）：**
+
+```powershell
+irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/install.ps1 | iex
+tba onboard
+```
+
+`onboard` 只查本地、不联网、不碰任务队列，打印 `TOKEN / GUI / BINDING` 状态。出现 `TOKEN MISSING` 时窗口会自动打开，**token 由你本人填**（<https://open.teambition.com/user-mcp> 创建），agent 不代填、不改 `data/config.toml`，本次会话到此为止。
+
+**② 挂 MCP：** `tba onboard` 幂等写 WorkBuddy 一家配置；其他 agent 客户端用 `tba mcp` 打印的片段自己合并。装完在连接器管理页对 `tba` 点「信任」，**下一次会话**生效。
+
+**③ 开工：** 新开一个会话，在项目目录里：
+
+```bat
+tba
+```
+
+有绑定就领任务并输出 `claim_id`（`EMPTY` 表示队列空）；没绑定只列候选项目名，原样交你拍板，选定后跑 `tba create --name "<选定的>" --go`。看板列 1~5 由 tba 自动补齐，补不动才给你项目链接和手动兜底步骤。
+
+---
+
+## 安装
+
+### 安装包（推荐）
+
+从 [Releases](https://github.com/Rei1mu/teambition-agent-orchestrator/releases) 下载 `tba-<版本>-<arch>-setup.exe`：
+
+| 文件 | target | 适用 |
+|---|---|---|
+| `tba-<版本>-x64-setup.exe` | `x86_64-pc-windows-msvc` | 普通 Windows 10/11 |
+| `tba-<版本>-arm64-setup.exe` | `aarch64-pc-windows-msvc` | Windows on ARM（骁龙本） |
+
+### 一句话安装
+
+```powershell
+irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/install.ps1 | iex
+```
+
+脚本下载最新 Release → 静默安装 → 合并写 `~/.workbuddy-ai/mcp.json`（只动 `mcpServers.tba`，不删 `data/`、不覆盖别的 server）。固定版本：先设 `$env:TBA_VERSION = 'v0.2.30'`。脚本写 exe 绝对路径，不依赖 PATH 刷新。
+
+### 从源码构建
+
+```powershell
+cargo build --release --locked
+```
+
+MSVC 工具链要求与本机构建约定见 [docs/REFERENCE.md](docs/REFERENCE.md)「构建工具链」一节。
+
+### 数据目录
+
+```
+<安装目录>/
+├─ tba.exe            CLI + MCP server + 窗口
+├─ tbagui.exe         窗口启动器（token 缺失时自动打开）
+└─ data/
+   ├─ config.toml     令牌 / SMTP / IMAP / 轮询参数（不要提交）
+   ├─ waits/          常驻监听心跳
+   ├─ mail/           提问水位 <claim_id>.uid
+   ├─ events.jsonl    监听期间收到的用户回复（只追加）
+   └─ projects/       skill / mem 本地缓存
+```
+
+---
+
+## 工作流程（图片 + 文字版）
+
+三张图都是仓库里的静态 PNG，任何 Markdown 阅读器都能显示，不依赖 Mermaid 前端。**每张图下面都有纯文字版**；可编辑的矢量源文件是同名的 `.svg`。
+
+### ① 设备接入（每台设备一次）
 
 ![第一次会话：设备接入流程](docs/flow-onboard.png)
 
@@ -20,16 +130,16 @@
   ├─ tba --version
   │    └─ 找不到命令 → PowerShell 跑一句话安装脚本
   ├─ tba onboard   （只查本地 / 不联网 / 不碰任务队列）
-  ├─ TOKEN MISSING → 自动起 tbagui.exe，用户自己填 token
+  ├─ TOKEN MISSING → 起 tbagui.exe，用户本人填 token
   │                  → 本次会话到此为止，另开会话进 ②
-  └─ TOKEN OK     → 幂等写 WorkBuddy AI MCP + 打印 tba mcp 片段
+  └─ TOKEN OK      → 幂等写 WorkBuddy MCP + 打印 tba mcp 片段
                      → agent 把片段合并进自己客户端配置
                      → 用户点「信任」→ 下一次会话生效 → ②
 ```
 
 </details>
 
-### ② 第二次会话：「开工」或 `tba go`
+### ② 开工自举（第二次会话）
 
 ![第二次会话：开工自举流程](docs/flow-go.png)
 
@@ -37,1242 +147,242 @@
 <summary>纯文字版（不依赖图片）</summary>
 
 ```text
-② 开工 / tba go（第二次会话）
+② 开工 / tba go
   ├─ 不带参数执行 tba
   ├─ 有 .tba/project 且线上项目还在？
   │    ├─ 否 → 本地列候选项目名 → 原样交用户拍板
   │    │        → tba create --name "<选定的>" --go
   │    └─ 是 → 直接往下
-  ├─ ensure_tasklists：查列 → 只建缺的 1~5（不改不删）
+  ├─ ensure_tasklists：只建缺的 1~5 数字列，已有列绝不删改
   │    └─ 补齐失败 → 打印项目链接 + 手动补列兜底，不阻断领任务
-  └─ 领任务 claim_id / EMPTY → 按 skill 干活
-       未完成 → 进行中 → 待回复 → 已解决
+  └─ claim：领最早「未完成」→ 状态「进行中」+ 列 2
+           输出 claim_id / EMPTY → 进入 ③
 ```
 
 </details>
 
-**读图要点**
+### ③ 任务闭环：交回 → 后台常驻 → 回复唤醒
 
-| 环节 | 谁做 | 要点 |
+![任务闭环：交回、后台常驻监听与回复唤醒](docs/flow-loop.png)
+
+<details>
+<summary>纯文字版（不依赖图片）</summary>
+
+```text
+③ 任务闭环
+  A. agent 本轮（可以正常结束）
+     ├─ 干活：tba note（写本次处理内容）、tba beat（长任务续命）
+     ├─ 交回：tba ask <claim> --done
+     │        写备注 · 状态「待回复」· 列 3
+     │        ask 前记 IMAP 水位（UIDNEXT）· 发通知邮件（只带本次处理内容）
+     └─ 自动挂上后台常驻监听 → 本轮回复可以正常结束
+        （别重跑 ask，会重复发信；不许 --no-wait）
+
+  B. 后台常驻监听（tba wait · forever，不超时）
+     ├─ 评论轮询 5 秒 / 邮件轮询 5 秒
+     ├─ 邮件只 FETCH 提问水位之后的新未读信，历史未读一封都不下载
+     ├─ UID 去重、单封失败下轮重试、UIDVALIDITY 变化作废旧水位
+     ├─ 执行中收到回复 → WaitOutcome::Noted：只记 events.jsonl，不改任务状态
+     └─ 待回复时收到回复 → events + 评论留痕 → parse_reply + resume
+                           状态回「进行中」· 列 2 → 后台进程退出
+
+  C. 唤醒与继续
+     ├─ 三路入站：邮件 / Teambition 评论 / 会话窗直接输入
+     ├─ 后台 shell 退出 → task-notification 唤起会话
+     │   （会话窗输入由平台直接唤醒，先跑 tba reply <claim> 推回「进行中」）
+     ├─ 回复解析：0 收尾 / 1 写记忆后收尾 / 2 还有问题 / 自由文本 = 新需求
+     └─ 回到 A 继续；只有用户回 0 / 1 才允许收尾
+```
+
+</details>
+
+<details>
+<summary>Mermaid 源码（可复制到支持 Mermaid 的渲染器）</summary>
+
+```mermaid
+flowchart TD
+    A["干活<br/>tba note / beat"] --> B["tba ask &lt;claim&gt; --done<br/>待回复 · 列 3 · 记水位 · 发信"]
+    B --> C["后台常驻监听<br/>agent 本轮回复可结束"]
+    C --> D{"评论 5s / 邮件 5s<br/>只抓水位之后的新信"}
+    D -->|邮件| E["用户回信"]
+    D -->|评论| F["用户评论"]
+    G["会话窗直接输入<br/>先 tba reply"] --> H["平台直接唤醒"]
+    E --> I["events + 评论留痕<br/>parse_reply + resume"]
+    F --> I
+    H --> I
+    I --> J{"回复内容"}
+    J -->|0 / 1| K["收尾"]
+    J -->|2 / 自由文本| A
+```
+
+</details>
+
+> 完整文字版（含状态机、命令、配置项、兜底规则）见 [docs/流程图.md](docs/流程图.md)。
+> 图片源文件：[flow-onboard.svg](docs/flow-onboard.svg) · [flow-go.svg](docs/flow-go.svg) · [flow-loop.svg](docs/flow-loop.svg)。
+
+---
+
+## 回复协议
+
+交回时 `tba ask <claim_id> --done` 给出标准三选项，回复会写回 Teambition 评论并触发状态流转：
+
+| 你回 | 含义 | tba 的动作 |
 |---|---|---|
-| 设备接入（第一次会话） | agent，每台设备一次 | `install.ps1` 只自动写 WorkBuddy AI 一家 MCP；其他客户端把 `tba mcp` 的通用片段合并进**自己**的配置（MCP 协议通用，配置路径不通用，方案 C） |
-| token | 只有用户 | `TOKEN MISSING` 时 `tbagui.exe` 自动打开；agent 不代填、不改 `data/config.toml`；本次会话停在这里 |
-| 开工（第二次会话） | 不带参数的 `tba` | 有绑定就领任务；没绑定只列候选项目名，**项目名必须用户拍板**，然后 `tba create --name "<选定的>" --go` |
-| 看板列 1~5 | tba 自动 | 用 `task-group-query` + `task-list-create` 只建缺的数字列，全齐时静默；老服务端 / 接口失败才打印项目链接与手动兜底步骤 |
-| 直连 `tba go -off <任务>` | agent 本地 | 不领任务、不写任务、不发邮件、不等待 Teambition 回复，只在对话框里交互 |
+| `0` | 可以收尾 | 「已解决」+ 列 4，任务终结 |
+| `1` | 先写项目记忆再收尾 | 回「进行中」+ 列 2，写完记忆再 `ask` |
+| `2` | 还有问题 | 回「进行中」+ 列 2，agent 自查后再给选项 |
+| `3`+ | 自定义选项 | 回「进行中」+ 列 2，按你写的做 |
+| 一句话 | 新需求 | 按原文继续，不必非得回数字 |
 
-常驻能力：`tba serve` 是 stdio MCP server，挂到任何支持 MCP 的客户端；`tba ui` 是窗口；exe 同目录的 `data/` 放台账、skill 缓存和记忆，所有 agent 共享。
+**三路入站都能继续：**
 
-## 项目目标
-
-**让同一个项目在任何设备、任何 agent 上都能无缝继续开发，同时把 token 开销压到极致，并保证 agent 不会跑错关键流程。**
-
-要解决的是四件事：
-
-1. **多设备、不同 agent 无缝续作**
-   项目背景（skill）和进展（记忆）放在 Teambition 和本地 `data/`，不绑定任何一台机器、任何一个 agent。换设备、换 agent，挂上同一个项目就能从上次的进度接着干，上下文跟着项目走，而不是跟着工具走。
-
-2. **极致减少 token 开销**
-   agent 不必每次通读仓库、翻聊天记录来重建背景。`tba prompt` 只把该项目的启用 skill、共享记忆和要领的任务打包成一段文案，token 全花在真正干活的地方。
-
-3. **不让 agent 跑错关键流程**
-   关键流程不能只写成文字。文字 skill 只告诉 agent「做什么」，管不住它「怎么做」。比如「重载 _new.exe 做测试」这件事：仅靠文字描述，agent 可能因为权限、沙盒、文件占用，杀不掉也覆盖不了 _new.exe，甚至自作主张开了个 _new_text01.exe；skill 没读完整，它就不重启；脚本和 bash 环境有差异，它每次还换着花样执行。
-   所以易错的、依赖环境的、有严格顺序的关键流程，要收进命令里，而不是留在文字里。agent 只负责调用；先做什么、后做什么、失败怎么处理、做完怎么校验，由命令保证——同样的输入，同样的结果，不靠 agent 的自觉。
-
-4. **流程化、指标化**
-   每个项目固定五个阶段（工作流状态）：`未完成` → `进行中` → `待回复` → `已解决` → `已完成`。需求进来进「未完成」，agent 领了进「进行中」，需要你拍板时进「待回复」，做完进「已解决」，不做进「已完成」。另有两个用途标记状态 `skill` / `mem`，不占阶段；`tba claim` 只查「未完成」，领不到它们。agent 用 `tba claim` 领取创建时间最早的未完成任务，同一任务重复领返回原 claim_id，先记本地台账再移动状态——不重复、不跳步、不撞车。状态集中、口径统一，谁在做什么、积压多少、完成多少，看板上一眼可查：项目管理不靠嘴说，看数字。
-
-## 它是什么
-
-一个 Rust 二进制，三种用法：
-
-- `tba` CLI：命令行。
-- `tba serve`：MCP server（stdio）。任何支持 MCP 的 agent 挂载。
-- `tba ui`：egui 窗口。卡片列项目，展开看 skill 和开关，复制 agent 文案。
-
-数据放在 exe 同目录的 `data/`。所有 agent 共享这一个目录。
-
-## 陌生 agent：一个词就够
-
-`tba` 是装包时写进用户 PATH 的全局命令。agent 不需要知道 exe 在哪，也不需要记子命令。
-
-1. 在项目目录里敲 `tba`。有绑定就领任务；没绑定就列候选项目名，停下等用户拍板。
-2. `AGENTS.md` 提交进仓库。开头一段红线：直接执行 `tba`，不要为了找它去搜 exe、不要验证路径。
-   `CLAUDE.md` 用 `@AGENTS.md` 导入，不重复写第二份。红线只管「定位 tba」，不限制读项目源码。
-3. 入口只写裸 `tba`，不写本机绝对路径。换设备不会因为路径失效而逼 agent 全盘搜文件。
-
-**给 agent 的全局指令**（贴进 agent 产品的自定义指令，跟账号走，跨设备）。设备接入和干活**分两次会话**，别一次做完：
-
-> `tba` 是本机全局命令（在 PATH 里）。要用就直接敲，不要为了找它搜文件、不要验证路径、不要 `where tba`；跑不通把错误原样报给用户，不要自己排查。红线只管「定位 tba」，不限制读项目源码。
->
-> **用户说「接入tba cli」= 设备接入（第一次会话）**，按顺序做：
-> 1. 直接跑 `tba --version`。成功 = 已装，跳到第 3 步；报「找不到命令」= 没装，走第 2 步。
-> 2. 在 PowerShell 跑 `irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/install.ps1 | iex`。它下载安装 `tba.exe` 并写一份 WorkBuddy AI 的 MCP 配置。仓库已公开，脚本匿名可读；真返回 404/权限错误就把错误原样报给用户，不要改脚本、不要自己找 exe。
-> 3. 跑 `tba onboard`，读状态行 `TOKEN` / `GUI` / `BINDING` 和打印出来的 MCP 片段。
-> 4. `TOKEN MISSING` 时窗口已自动打开：**停下来等用户自己填 Teambition token**。不要代填、不要改 `data/config.toml`，本次会话到此为止。
-> 5. 把 `mcpServers.tba` 合并进**你自己客户端**的 MCP 配置：先备份 → 找你自己产品的配置文件位置（不要假设是哪一家）→ 只加/改 `tba` 这一项、别覆盖别的 server → 读回校验 → 回报改动位置。
-> 6. 回报用户：MCP 只对**下一次会话**生效；新会话里在连接器管理页对 `tba` 点「信任」/重载。
-> 7. **第一次会话不建项目、不领任务、不跑 `tba go`、不跑 `tba create`。**
->
-> **用户说「开工」或 `tba go` = 第二次会话**：直接跑**不带参数**的 `tba`，由它按工作区自己分支——有项目空间就领任务（输出 `claim_id` 就照流程干活，`EMPTY` 是队列空）；没有就列候选项目名，**原样交用户拍板、不许自己起名**，用户点头后只跑一条 `tba create --name "<选定的>" --go`。`tba go` 也不会自己建项目：没对应空间同样列候选并给收尾命令。建完项目输出里有「项目链接」，**把链接原样转给用户**；看板列 1~5 由 tba 自动补齐，正常不用人管。只有输出里出现「✗ 自动补列没完全成功」和「兜底：手动补这 5 个看板列」时，才把链接和那段兜底步骤一起转给用户，让他手动建缺的数字列。以后每次 `tba go` 都会自动再查再补。报错把 stdout 原样报给用户。
-
-`tba onboard` 只查本地、不联网、不碰任务队列：打印 exe / 版本 / token / 工作区绑定状态，`TOKEN MISSING` 时自动起 `tbagui.exe` 让人自己填，幂等写 WorkBuddy AI 一家 MCP，并打印 `tba mcp` 的绝对路径片段给其他客户端自己合并。MCP 协议通用，但各客户端登记配置的位置不通用，所以 tba 不枚举私有格式（方案 C）。
-
-## 安装包要求（GitHub Actions 打包用）
-
-**产物**：推 `v*` tag 触发 `.github/workflows/release.yml`，两个包挂到 Release：
-
-| 文件 | target | 适用 |
+| 通道 | 怎么走 | 注意 |
 |---|---|---|
-| `tba-<版本>-x64-setup.exe` | `x86_64-pc-windows-msvc` | 普通 Windows 10/11 |
-| `tba-<版本>-arm64-setup.exe` | `aarch64-pc-windows-msvc` | 骁龙本等 Windows on ARM |
+| 邮件回复 | SMTP 发信 / IMAP 收信，由后台监听 | 保留标题里的 `[TB <claim_id>]`；纯文字也收 |
+| Teambition 评论 | 由后台监听 5 秒轮询 | 评论专属用户，agent 只写任务备注 |
+| 会话窗直接输入 | 平台直接唤醒会话，不经过 tba | 先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活 |
 
-两个都在 `windows-latest` 上用 MSVC 工具链构建（arm64 走交叉编译，VS 自带 ARM64 工具），
-Inno Setup 打包，脚本在 `installer/tba.iss`。手动触发 workflow 只出 artifact，不发 Release。
+**红线（给 agent）**
 
-**界面语言**：中英双语，默认中文。中文用 `installer/ChineseSimplified.isl`（跟着仓库走，不依赖 CI 环境），
-英文用 Inno 自带的 `Default.isl`。任务描述走 `{cm:...}` 自定消息，两种语言各自正确。
-`.iss` 带 UTF-8 BOM，否则中文会按 ANSI 解析成乱码。
+- 做完必须 `tba ask --done`，然后让它转后台常驻监听；**不许 `--no-wait`**。
+- 不许 agent 自己 `done` / `close`；只有用户回 `0` / `1` 才收尾。
+- 别在前台干等 10 分钟；本轮回复可以正常结束，任务通知会唤起会话。
+- `task-notification` 是自动化通知，不是用户确认，不能当收尾授权。
+- `--once` 只用于老路径单轮等待；常驻模式不因 540 秒超时退出。
 
-安装时做三件事，缺一个 agent 就找不到命令：
+---
 
-1. 把 `tba.exe`（CLI + GUI）和 `tbagui.exe`（双击入口，GUI 子系统）放到安装目录（**可自定义**，安装页第二屏能改）。
-2. 把安装目录写进**用户 PATH**（安装页「附加选项」里的可勾选项，默认勾上；取消就不写）。
-3. `data/` 不预置，首次运行自动生成（exe 同目录）。
+## 命令速查
 
-**默认安装目录：`C:\Users\<用户名>\tba`**（Inno Setup 里写 `{%USERPROFILE}\tba`；没有 `{userprofile}` 这个常量）。
-默认值只是「最省事」的选择：路径短、不需要管理员权限、`tba` 这个名字和目录名一致。
-
-想装到别的盘就改，注意三点：
-
-- **升级会沿用上次选的目录**（`UsePreviousAppDir`），不会又跳回默认值。
-- 两个位置都装、都进 PATH，就会出现两个 `tba.exe`，`where tba` 返回两条。换位置前先卸旧的。
-- `data/` 默认在 exe 同级的 `data\`；换目录后同级没有 `data\` 时会**回落到**
-  `%USERPROFILE%\tba\data`，所以换位置不会丢 token、项目绑定和台账。
-
-**附加选项**：安装页有「附加选项」一组，三项默认都勾选，可以取消：
-
-| 项 | 效果 | 可取消 |
+| 分组 | 命令 | 作用 |
 |---|---|---|
-| 把 tba 加到 PATH | 写进用户 PATH，新终端能直接敲 `tba` | 是（取消时会把已有条目摘掉） |
-| 开始菜单快捷方式 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\TBA\TBA.lnk`（指向 `tbagui.exe`，双击不闪黑框） | 是 |
-| 桌面快捷方式 | `%USERPROFILE%\Desktop\TBA.lnk`（同上，指向 `tbagui.exe`） | 是 |
-| 卸载入口 | 同上开始菜单目录 `Uninstall TBA.lnk` | 否，始终创建 |
+| 接入 | `tba onboard` · `tba mcp` · `tba login --token <...>` | 本地自检 / 打印 MCP 片段 / 登录 |
+| 项目 | `tba projects` · `tba create --name <名字> --go` · `tba ensure-project --project <id>` | 列项目 / 接入 / 复用已有项目 |
+| 开工 | `tba` · `tba go` · `tba claim` · `tba take <链接>` · `tba start --file <md>` | 领任务 / 接单 / 新建任务 |
+| 干活 | `tba note <claim> --file <md>` · `tba beat <claim>` · `tba skill <名字> --project <id>` | 写本次处理内容 / 续命 / 读 skill |
+| 交回 | `tba ask <claim> --done` · `tba ask <claim> -q "..."` | 转「待回复」+ 发信 + 挂后台常驻监听 |
+| 继续 | `tba reply <claim>` · `tba wait <claim>` · `tba events` | 会话窗直回先 reply / 单独常驻监听 / 看落盘回复 |
+| 查看 | `tba status` · `tba inbox` · `tba show <链接>` · `tba doctor` | 台账 / 待回复 / 单任务 / 自检 |
+| 邮件 | `tba mail status` · `tba mail test` · `tba mail check` · `tba mail resend <claim>` | 配置 / 发测试信 / 收一次 / 重发通知 |
+| 收尾 | `tba done <claim>` · `tba close <claim>` · `tba release <claim> --reason "..."` | 已解决 / 作废 / 退回队列（**仅用户授权后**） |
+| 发版 | `tba publish --tag v0.2.30 --watch` | 打 tag → 推 → 等 CI → 列产物 |
 
-卸载入口不跟着快捷方式走：取消了开始菜单图标，也得留一条卸载的路。
+> `tba mail check` 是诊断命令：会全量扫未读并把命中的信标记为已读，平时别拿它当常驻链路用。
 
-**PATH 写入（Inno Setup 示例）**
+---
 
-别用 `[Registry]` + `ValueData: "{olddata};{app}"` 那一套。看着对，实测**重复安装会写两遍**：
-`Check:` 收到的参数里 `{app}` 没展开，`Pos` 永远匹配不上，于是每次都追加。
+## 状态模型
 
-正确做法是在 `[Code]` 里读出来、按 `;` 拆开、去掉重复项、整体写回：
+两个维度：**工作流状态表示「是否在执行」，看板列表示「归属」**。
 
-```pascal
-procedure AddToPath(Dir: string);
-// 已经有了 -> 只保留第一份（顺手清掉历史重复项）；没有 -> 追加到末尾
-// 实现见 installer/tba.iss 的 [Code] 段
-```
-
-配套的 `RemoveFromPath` 在卸载时把**所有**匹配项摘掉（老版本只删第一个，
-所以重装过的机器 PATH 里会残留一条），其余项顺序不变。
-
-实测（装到临时目录，连装三次再卸载）：
-
-| 步骤 | PATH 里该目录出现次数 |
-|---|---|
-| 装第 1 次 | 1 |
-| 装第 2、3 次 | 1（不再累加） |
-| 人为塞两条重复后再装 | 1（自动收敛） |
-| 卸载后 | 0，其余 23 项逐字节不变 |
-
-**卸载时**从 PATH 移除同一路径，不删 `data/`（里面是 token、台账、项目绑定）。
-
-**打包后校验**
-
-```powershell
-$env:PATH -split ';' -contains "$env:USERPROFILE\tba"
-& "$env:USERPROFILE\tba\tba.exe" --version
-```
-
-**环境变量**（全部可选，都有默认值）
-
-| 变量 | 作用 |
-|---|---|
-| `TBA_AGENT` | 会话标识，覆盖 `.tba/session` |
-| `TBA_SKIP_GITBUTLER` | 跳过 GitButler 检查（排查用） |
-| `TBA_BUT` | 指定 `but` 路径（exe 或目录都行）；也认 `GITBUTLER_BIN` / `BUT_BIN` |
-| `TBA_MSVC_BIN` / `TBA_MSVC_LIB` / `TBA_SDK_LIB` | 构建工具链路径，覆盖 `tba toolchain` 的设置 |
-| `TBA_EXTRA_LIB` / `TBA_CARGO` | 同上，附加库目录 / cargo 路径 |
-
-安装包**不写 token**。token 由 `tba login` 写进 `data/config.toml`，属于用户数据，升级时不要覆盖。
-
-## 前置依赖：GitButler（优先级高于 Teambition）
-
-TBA 每次启动**先过 GitButler 这一关**，再连 Teambition——agent 靠 GitButler CLI（`but`）管分支和提交，缺它后面全白跑。
-
-```bat
-tba gitbutler status     :: 看 CLI 装没装、什么版本、当前目录配没配
-tba gitbutler install    :: 自动装到运行目录 data/bin（无需管理员）
-tba gitbutler path       :: 打印 CLI 路径（脚本用）
-tba gitbutler set --path "D:\gitbutler\but.exe"   :: 手选一次位置（目录也行），记住
-tba gitbutler clear      :: 清掉手选路径，回到自动检测
-```
-
-- **检测顺序**（前面的赢）：环境变量 `TBA_BUT` / `GITBUTLER_BIN` / `BUT_BIN` → `config.toml` 里手选的 `but_path` → 运行目录 `data/bin` → PATH → 已知安装目录（`Program Files`、`%LOCALAPPDATA%`、`%APPDATA%`、`%PROGRAMDATA%` 下的 `GitButler`）。装到运行目录不抢用户自己装的版本，删 `data/bin` 即卸载。
-- **不扫盘**：自动检测只覆盖上面这些常见位置，不会遍历 Program Files/盘符（又慢又可能挑到旧副本）。装在别处（比如 `D:\gitbutler`）就指定一次：窗口状态卡点「选择 but.exe 位置」，或 `tba gitbutler set --path D:\gitbutler\but.exe`（给目录也行）。会跑一次 `but --version` 验活，选错文件（比如桌面版主程序）当场提示；记住后来源显示「手动指定」，`tba gitbutler clear` 可回到自动检测。
-- **Windows 官方只发 MSI**（没有独立 CLI 二进制，官方 `curl -fsSL https://gitbutler.com/install.sh | sh` 也只支持 mac/linux）。自动安装走：下载 MSI zip → `Expand-Archive` 解压 → `msiexec /a /qn TARGETDIR=…` 管理抽取 → 拷贝 `but.exe` → `but --version` 验活。**不需要 UAC、不动注册表**，实测 10 秒左右装完。
-- **git 是系统级依赖**，TBA 不自动装（Git for Windows 装 Program Files 要提权），检测到缺失时引导去 <https://git-scm.com/download/win>。
-- 缺 GitButler/git 时，任何 `tba` 命令都会先打印引导再退出；排查问题可用 `TBA_SKIP_GITBUTLER=1` 强制跳过。
-- 窗口里 **设置页** 有一张 GitButler 状态卡（版本 + 来源 + 一键安装 + 指定位置），悬停版本号可看完整路径。它原来置顶在项目列表上方，一占就是小半屏，现在搬进设置；只有**缺件时**项目页顶部才留一行橙字提醒 + 「去设置」。窗口是全局的，「当前目录配没配」不在窗口里判断——真正用到 `but` 的是 `tba git`，它按你执行命令的那个项目目录自己判断（普通仓库走 git，GitButler 项目走 `but commit`）。
-
-## 离线模式（不用 Teambition）
-
-> 两个东西别混：
-> - **全局离线**（本节）：整台机器都不用 Teambition，窗口和所有命令都走本地缓存。
-> - **命令级直连 `tba go -off <任务>`**（见「一句话开工」一节）：只让**这一条命令**不走
->   Teambition 的任务/等待流程，直接在对话框里交互。日常更常用的是这个。
-
-`data/config.toml` 里 `offline = true`，或环境变量 `TBA_OFFLINE=1`（`=0` 强制关，优先级高于配置）。
-打开后**完全不连 Teambition**，也不需要 token：
-
-| 能力 | 离线时 |
-|---|---|
-| 项目列表 | 读上次同步的缓存（`data/projects_cache.json`） |
-| 项目能力（tb skill） | 读缓存 `data/projects/<id>/skills.json`；勾选照常生效 |
-| 通用能力（`data/caps.toml`） | 本来就在本地，完全可用 |
-| 开工文案 / 复制文案 | **照常生成**——拼装全在本地，不依赖云端 |
-| 编译 & 重载 | 照常可用（本地）；「保存」写本地缓存 `setting.toml` |
-| 领任务 / done / ask / wait / 刷新项目 | 不可用，命令直接说明原因 |
-| 编辑/新建/删除 skill | 不可用（要写云端），按钮在窗口里置灰 |
-
-**缓存是联网时自动写的**：`tba projects`、`tba skills`、窗口打开项目时都会顺手落一份。
-所以第一次用某个项目前，先联网打开过一次。
-
-窗口里切换：**设置页 → 离线模式**（勾上立刻生效，不用重启）。
-侧栏和标题旁会出现橙色「离线」标记。
-
-```bat
-set TBA_OFFLINE=1 && tba projects          :: 读缓存的项目列表
-set TBA_OFFLINE=1 && tba skills --project <id>
-set TBA_OFFLINE=1 && tba setting text      :: 开工文案里的编译段（纯本地）
-```
-
-> 离线时点需要联网的操作会直接报一句 `当前是离线模式…`，并列出本地还能用的命令，
-> 而不是让人对着「token 无效」猜。
-
-## 快速开始
-
-第一次使用要先拿 Teambition 访问令牌。
-
-**方式一：窗口（推荐）**
-
-```bat
-tba ui
-```
-
-没有令牌时窗口会显示引导面板：点「① 打开 Teambition 创建 Token」会自动打开浏览器，
-把「查看详情」里复制的 Token ID 粘贴进输入框，点「③ 保存并连接」。
-
-**方式二：命令行**
-
-```bat
-tba login                :: 自动打开 Token 页面并打印步骤
-tba login --token <令牌>  :: 已有令牌直接登录
-```
-
-**怎么拿令牌**
-
-令牌在 Teambition 的 User Token 页面创建：<https://open.teambition.com/user-mcp>
-
-1. 用钉钉扫码登录 Teambition
-2. 点「创建 Token」按钮
-3. 填 Token 名称、有效期（建议选 1 年）、选择使用企业
-4. 点确认，再点「查看详情」复制 Token ID
-
-拿到之后：
-
-```bat
-tba login --token <你的Teambition访问令牌>
-tba tools                :: 看 MCP 工具列表和角色识别结果
-tba projects             :: 列项目
-tba init --project <id>  :: 补齐 5 个阶段
-```
-
-token 存在 `data/config.toml`，登一次就行，重开、换 CLI/窗口/MCP 都不用再登。
-
-**查看/切换配置**
-
-```bat
-tba config               :: 看当前配置（token 打码显示）
-tba config --url <地址>   :: 切换 MCP 服务地址，token 不动
-```
-
-本地测试切到 mock 服务就用 `tba config --url http://127.0.0.1:8791/mcp`，不用手改文件，
-已登录的 token 不会被覆盖。切回去：`tba config --url https://open.teambition.com/api/mcp/v2`。
-
-每个项目必须有 7 个工作流状态：5 个阶段 + 2 个用途标记。
-
-阶段（按生命周期顺序）：
-
-`未完成` → `进行中` → `待回复` → `已解决` → `已完成`
-
-用途标记：`skill`、`mem`。两者都是 kind=unset，不参与生命周期，只用来区分任务性质。
-
-`tba init` 缺哪个建哪个。幂等。
-
-首尾两个名字刻意对齐 **Teambition 新建项目自带的默认状态**（未完成 / 已完成）：
-默认项目本来就有这两个，沿用就不用新建，也不会出现「未完成」和「待处理」两条并存的局面。
-
-旧项目如果还留着改名前的那两个（「待处理」「关闭」），tba 不检测、不迁移、不提示，自己去网页处理。
-
-### 看板列 1~5：tba 自动补齐，补不动才给你链接
-
-2026-11 复查：Teambition MCP 已有 `task-list-create` / `task-list-update-name` /
-`task-list-order-update`，旧结论「API 只能查、不能建列」**已作废**（真实项目里创建列 `6` 实测成功）。
-现在 tba 会自己把 1~5 五个数字列补齐，人不用去网页点：
-
-| 场景 | 行为 |
-|---|---|
-| `tba create` 建/复用完（含 `--go`、窗口「接入项目」页） | 用同一个已连上的会话查列 → 只建缺的那几个 → 打印 `项目链接: https://www.teambition.com/project/<id>` + 新建了哪些列 |
-| 每次 `tba go`（领任务前） | 同样自动补一次；全齐且没动过就完全不打印，不刷屏 |
-| `tba init --project <id>` | 补列 + 打印项目链接和结果，供建好后复查 |
-
-只建缺的列，**绝不删/改名已有列**（你自己加的「6」「未分类」都留着）；查列失败不算「一列都没有」，不会误报。
-补列失败（老服务端没有这些工具、项目没任务分组、接口拒绝）时自动降级：打印项目链接 + 错误原因 +
-「兜底：手动补这 5 个看板列」步骤，让你去网页补，绝不阻断领任务。
-列名语义：1=队列（没人接）/ 2=进行中 / 3=待回复 / 4=已解决 / 5=已完成（作废）。
-补不齐时 tba 只改状态、移列会静默跳过；补好后重跑 `tba go` 或 `tba init --project <id>` 会自动再试。
-任务链接是 `https://www.teambition.com/task/<任务id>`，跟项目链接不是一回事。
-
-## skill
-
-工作流状态是 `skill` 的任务就是一条 skill。标题 = skill 名，内容 = skill 正文。
-`tba claim` 只查「未完成」状态，skill / mem 根本不在查询范围内，不会被领走。
-
-```bat
-tba skill-push --project <id> --file SKILL.md   :: 新建或更新（同名覆盖）
-tba skills --project <id>                       :: 列出名字 + 开关 + 任务 id
-tba skill <名字> --project <id>                 :: 打印单个 skill 全文（agent 文案按需读它）
-tba skill-rm --project <id> --name <名>         :: 删除（归档那条任务）
-tba switch --project <id> --skill <名> --on
-tba switch --project <id> --skill <名> --off
-tba skill-tpl                                   :: 看内置模板有哪些（不联网）
-tba skill-init --project <id>                   :: 推全部内置模板
-tba skill-init --project <id> --name shot       :: 只推一个
-```
-
-开关只存本地 `data/switches.toml`。不回写 Teambition。
-
-**GUI 里能编辑**：项目卡片展开后有两栏，**默认都收起**：
-
-- **tb skill**：云端、按项目隔离。每条有开关勾选 + 「编辑」「删除」，底下「+ 新建 skill」。
-  编辑窗写名字 + markdown 正文，保存即推到 Teambition（同名覆盖）。删除 = 归档那条任务。
-- **通用 skill**：本机、跨项目的能力，**只给勾选**（要改正文去「通用能力 → 能力」）。
-  勾选 = 这个项目用；取消 = 这个项目不用，开工文案里不列、agent 搜不到。
-
-分两栏是因为两者语义不同：tb skill 关掉只影响这个项目，通用能力关掉分「整台机器」
-和「这个项目」两级——混在一个列表里分不清关的是哪一级。
-
-**内置模板不再往项目里推。** `shot` / `git-main` / `release` / `gui-notes` 这些是
-跟项目无关的通用能力，现在放在本地「能力」库里（见上一节 `tba cap`），所有项目共用，
-窗口里能直接改。`tba skill-init` 仍然保留，只在「确实要把某条流程钉在云端这个项目」
-时才用（比如团队里别人也要看）。
-
-**省 token 的用法**：开工文案里 skill 只列名字；能力列「名字 + 什么时候用」一行一条，
-agent 判断要用哪个才去 `tba skill <名字>` / `tba cap <名字>` 读全文。所以正文可以写长，
-但名字要短、能力的一句话说明要写「何时用」（比如「看界面/验收 UI」而不是「截图」）。
-
-## 截图
-
-```bat
-tba shot --out shot.png                        :: 全屏（默认 fast 压缩）
-tba shot --title "记事本" --out n.png          :: 按窗口标题（包含匹配）
-tba shot --hwnd 123456 --out n.png             :: 直接给句柄
-tba shot --level high --out n.png              :: 更小（更慢），仍然无损
-```
-
-- BitBlt 抓屏，带 `CAPTUREBLT`，**后台窗口也能截**，不用把窗口提到前台。
-- 指定窗口时先 `PrintWindow(PW_RENDERFULLCONTENT)`，失败回落窗口 DC。
-- 编码走 `png` crate + 自适应行滤波 + `fdeflate`；不透明截图自动丢 alpha 存 RGB。
-  实测 1920x1080 桌面：8 MB → **465 KB（fast，约 1.7 秒）** / **308 KB（high）**。
-  两个级别都是无损，`fast` 已经是「极致压缩 + 快」的甜点。
-- 目录不存在会自动建。
-
-## 接单 / 提问 / 等回复 / 收尾
-
-任务在两个维度上表示：**状态（工作流状态）表示"是否在执行"，看板列表示"归属"**。
-
-| 局面 | 状态 | 看板列 | 球在谁那 | 算完成 |
-|---|---|---|---|---|
-| 队列中，没人接 | 未完成 | 1 未完成 | — | 否 |
-| agent 正在干 | 进行中 | 2 进行中 | agent | 否 |
-| **agent 等你回复** | **待回复** | **3 待回复** | **你** | 否 |
-| 干完 | 已解决 | 4 已解决 | — | 是 |
-| 作废 | 已完成 | 5 已完成 | — | 是 |
-| **会话异常断** | 未完成 | 1 未完成 | 回到队列 | 否 |
-
-`kind`（状态类型）分配：未完成=`start`（全任务流唯一）、进行中/待回复=`unset`、已解决/已完成=`end`。
-**待回复是 `unset` 而不是 `end`**——球在你那不等于干完了，否则完成率会虚高。
-
-```bat
-tba start [--project <id>] --file <md> :: 开工：新建「进行中」任务并放进列「进行中」（文案里带了活时用）
-tba take <链接|task_id>             :: 接单：进行中 + 列「进行中」
-tba claim [--project <id>]         :: 从队列(列「未完成」)领最早的一条。省略 --project 走 .tba/project
-tba note <claim_id> --text "..."    :: 追加到任务备注（agent 的唯一输出通道，评论留给用户）
-tba ask <claim_id> -q "..."         :: 提问：问题写进备注 + 待回复 + 列「待回复」+ 发邮件 + 就地阻塞等回复
-tba ask <claim_id> --done           :: 同上，用标准三选项（0 收尾 / 1 先写记忆再收尾 / 2 还有问题）
-tba ask <claim_id> --done --no-wait :: 只问不等，立刻返回（一般不用，会话会断）
-tba wait <claim_id>                 :: 单独等回复：ask 超时后重跑它，或只等外部收尾。没 ask 过会自动补一次
-tba reply <claim_id>                :: 只看一眼：读回评论 → 进行中 + 列「进行中」（不阻塞）
-tba inbox                           :: 列出所有待回复：谁在等、等了多久、问了什么、任务链接
-tba hello [--name <tag>]            :: 登记会话标识（多会话并行时必须）
-tba beat <claim_id>                 :: 续命（长构建/长测试前后调）
-tba done <claim_id>                 :: 已解决 + 列「已解决」
-tba close <claim_id>                :: 关闭（→ 已完成）+ 列「已完成」
-tba release <claim_id> --reason "…"  :: 主动放弃：未完成 + 列「未完成」
-tba show <链接|task_id>              :: 查一条任务真实的状态 + 看板列 + 是否完成
-tba status                          :: 台账（含心跳年龄）
-tba sweep                           :: 手动回收心跳超时的会话
-```
-
-规则：
-
-1. `tba claim` 只领「**列「未完成」+ 状态未完成**」，并跳过台账里还被占着的任务。
-2. 领任务自动跳过 `skill` 任务类型。
-3. 先写本地台账，再改线上。改状态失败则台账标记 failed。领任务全程持文件锁，多会话并发不会抢到同一条。
-4. **做完必须 `ask --done`，不能停在进行中**——`ask` 自带阻塞等回复，会话不会断。终结于 `ask` / `done` / `close` 之一。
-5. 看板列名在 `data/config.toml` 里配（`tasklist_queue/claim/wait/done/closed`，默认**中文列名**）。
-   列名不存在时只跳过移列、不阻断流程——状态才是硬约束。
-   > 默认值从 `1/2/3/4` 改成了中文，是因为用数字在只有 4 列的旧项目上会把「已解决」错移进「已完成」列；
-   > 中文名对不上只会「跳过移列」，安全得多。旧项目要么把网页列改成中文名，要么在 config 里显式写数字。
-6. `take` / `start` 打印的「看板列: X -> Y」是**移完回读的真实列**，不是配置里的期望值。
-   `tba start` 新建的任务由服务端落在「未分类」，所以 X 可能是「未分类」。
-
-### 输出通道：备注给 agent，评论给你
-
-两个通道，各管一边，不混用：
-
-| 通道 | 谁写 | 内容 |
-|---|---|---|
-| **任务备注**（`note` 字段） | agent | 过程、结论、提问。`tba note` 往后追加，带时间戳分隔，不覆盖你写的原始需求 |
-| **任务评论** | 只有你 | 回复数字、补充说明。agent 一律不写评论 |
-
-为什么这么分：
-
-1. 一个 agent 一条任务，备注不存在多个 agent 并发覆盖的问题。
-2. 评论里只有你的话，`ask` 的等待不用再靠「内容是不是纯数字」去猜某条是谁发的。
-3. 备注在网页任务详情第一屏可见，结论不会被评论淹没。
-
-### 同步等回复：`tba ask` 自带阻塞
-
-用户可能在外面，只在 Teambition 上回复，不会回到会话里发一句「继续」。所以 `ask` **问完就地阻塞**，
-不返回——agent 只要跑了 `ask`，就卡在那里等，没有「问完忘了等」的中间态，会话也就不会断。
-
-```bat
-tba ask  <claim_id> -q "问题"     :: 问题写进备注 + 状态 → 待回复 + 列「待回复」+ 发邮件 + 阻塞等
-tba ask  <claim_id> --done        :: 同上，用标准三选项
-tba wait <claim_id>               :: 单独等（ask 超时后重跑它，或只等外部收尾）
-```
-
-- 单轮默认 **540 秒**主动返回（Bash 工具上限 600 秒，超了会被转后台、agent 拿不到结果）。
-- 退出码：`0` 读到回复（照回复继续干）/ `2` 本轮没等到（**重跑同一条**接着等，别结束会话）/ `3` 任务在别处被收尾了。
-- **为什么必须阻塞**：WorkBuddy 会话断了要手动点，或等一小时自动循环。所以 agent 不能自作主张结束会话。
-- **`wait` 自愈**：如果手动跑了 `wait` 而没 `ask` 过，tb 自动补一次（问题写备注 + 转「待回复」+ 发邮件）。
-  配置项 `wait_auto_ask`（默认开）可关；关掉后 `wait` 只等外部收尾，不读评论。
-- 「待回复」永不参与心跳超时回收，所以挂多久都安全。
-- 你回完之后**不需要在会话里再说任何话**，agent 自己会继续。
-- **连 `ask` 都没跑就断了** → 300 秒后静默退回「未完成」+ 列1。不发信、不进「待回复」、`tba inbox` 看不到。
-  这是故意的：没交付就不该占着任务，也不该拿假邮件打扰你。
-
-#### 禁止把 `ask` 丢后台
-
-`run_in_background` 是这个流程唯一能杀死它的操作：命令在后台跑着，会话却结束了，**没人接你的回复**。
-任务卡在「待回复」，邮件发了也没人处理。
-
-两道防线：
-
-1. **文案写死**：`tba prompt` 生成的规则里明确「`ask` 前台阻塞，禁止 `run_in_background`」。
-2. **孤儿检测 + 阻断**：`ask` / `wait` 阻塞期间每 15 秒写一次 `data/waits/<claim>.wait`。
-   进程被杀就停更，超过 60 秒没有刷新即判定「等待中断」。这时候：
-   - `tba inbox` 给这条任务标 `⚠ 等待中断（没人在等）`
-   - **`tba g` / `tba claim` 拒绝领新任务**，退出码 `5`，要求先处理掉
-
-第 2 条是「禁止」的真正含义——agent 挂后台不会立刻报错，但下次它想干活时会被拦住，必须先回去把等待接上。
-任务状态本身不改（它确实还在等你回复），只是加了个「没人接」的标记。
-
-#### 邮件配置
-
-`data/config.toml` 里配 SMTP（发）+ IMAP（收）：
-
-| 键 | 说明 |
-|---|---|
-| `smtp_host` / `smtp_port` | 发信。QQ 邮箱是 `smtp.qq.com` / `465` |
-| `smtp_user` / `smtp_pass` | 账号 + **授权码**（不是登录密码） |
-| `smtp_from` | 发件人。**留空 = 自动用 `smtp_user`**；也可写 `显示名 <邮箱>`。只写显示名会被服务端拒（QQ 返回 502） |
-| `mail_to` | 收件人，多个用逗号或分号分隔 |
-| `imap_host` / `imap_port` | 收信。不配就收不到回信 |
-| `mail_on_ask` | 到「待回复」是否发信，默认开 |
-
-发信失败会**写进任务备注**（`⚠ 邮件通知没发出去` + 具体错误），不再静默。
-以前只打一行 stderr，agent 把命令丢后台时那行字谁也看不见。
-
-**邮件正文带完整任务备注**——你在外面收信时，光看到一个「已完成，请确认」是判断不了的，
-得能看到 agent 到底改了什么、结论是什么。所以正文结构是：
-
-```
-任务「xxx」需要你回复。
-
-======== 任务备注（完整） ========
-
-#### 2026-10-31 15:20
-改了三处……
-（agent 写的全部过程和结论）
-
-================================
-
-链接：https://www.teambition.com/task/xxx
-
-直接回复本邮件即可（请保留标题里的 [TB clm-xxx]）。
-```
-
-| 命令 | 作用 |
-|---|---|
-| `tba mail status` | 看配置（能发/能收、发件人、收件人） |
-| `tba mail test` | 发一封测试信，验证 SMTP |
-| `tba mail check` | 查一次回信，顺便列出 INBOX 最近 5 封 |
-| `tba mail resend <claim_id>` | **重发某条任务的通知信**（带完整备注）。发信失败过、或想在邮箱里再要一份上下文时用 |
-
-#### 等待与轮询（agent 在「待回复」里等多久）
-
-`tba ask` 问完就地阻塞等回复。三个时间参数都能改，默认值：
-
-| 配置键 | 默认 | 管什么 |
-|---|---|---|
-| `wait_timeout_secs` | **540** | 单轮最长等多久。到点返回**退出码 2**，agent 重跑同一条接着等，会话不断 |
-| `wait_interval_secs` | **15** | 多久查一次评论。数字回复走这条通道，所以要快 |
-| `mail_poll_secs` | **20** | 多久查一次邮箱回信。IMAP 一次往返比读一条评论贵，所以比评论慢 |
-
-540 秒不是随便定的：Bash 工具上限 600 秒，留 60 秒余量让它主动返回，
-否则被 auto-background 后 agent 拿不到结果。
-
-改法三选一：
-
-1. **GUI**：`tba ui` → 左侧「⚙ 设置」→ 下拉到「等待与轮询」，三个输入框 +「保存等待参数」。
-2. **改文件**：`data/config.toml` 里直接写上面三个键。
-3. **临时覆盖**：`tba wait <claim_id> --timeout 300 --interval 10`（只影响这一次）。
-
-下限保护：`wait_timeout_secs` ≥ 30、`wait_interval_secs` ≥ 5、`mail_poll_secs` ≥ 5。
-填 0 或个位数会被夹到下限——轮询太快会变成忙等，把 Teambition 接口和邮箱服务器打到限流。
-
-`tba mail status` 最后一行会回显当前生效的三个值。
-
-### 两种开工方式（文案双分支）
-
-`tba prompt` 生成的 agent 文案分两条路，agent 只按文案走，不自己判断：
-
-| 文案里有没有派活 | agent 第一条命令 | 结果 |
-|---|---|---|
-| 没带任务（你只复制了卡片） | `tba claim --project <id>` | 从列「未完成」队列领最早的一条 |
-| 带了任务（`tba prompt --task "…"` / UI 里填了「本次任务」） | `tba start --project <id> --file <md>` | 在列「进行中」新建一条「进行中」任务，由 agent 干 |
-
-`tba start` 的两个细节：
-
-- 标题取 `--title` > 正文首个 `# 标题` 行 > 文件名；正文落盘到 `data/tasks/<标题>.md`，agent 用 `--file` 读。
-- **同名幂等**：本项目里已有同名任务的活动 claim 时直接复用，不会因为点了两次复制就建出两条。
-
-### 零上下文开工：`tba`
-
-**这是第二次会话**：装 exe / 配 MCP / 填 token 属于第一次会话的「接入tba cli」（见「陌生 agent：一个词就够」），
-两件事不在一轮里做完。本节默认设备已就绪，只管按工作区开工。
-
-不复制文案、不记子命令。在项目目录里跑 `tba`（不带参数）：
-
-1. 有 `.tba/project` → 等于 `tba g`：按绑定认项目、从列「未完成」领最早一条、打印任务正文 + 完整流程规则。
-2. 没有 → 打印候选项目名，停下等用户拍板。不建项目、不自己起名。
-   - 人在终端里敲：直接输编号，`tba` 就地做完 create + 写 MCP 配置 + 领任务。
-   - agent（非终端）：把候选原样给用户，用户点头后**只跑一条**
-     `tba create --name "<选定的>" --go` —— 建/复用项目、补 7 状态、写 `.tba/project` 和入口、
-     幂等写 `~/.workbuddy-ai/mcp.json`（exe 绝对路径）、当场领一条任务。
-3. `--go` 写的 MCP 只对**下一次会话**生效（还要在连接器管理页点「信任」）；
-   本次会话本来就是命令行调用，不受影响。MCP 写失败也不阻断接入和领任务。
-4. 两种情况都先打印一句「tba 是什么」。陌生 agent 不需要预先搜索 exe。
-5. `create` 完成会打印**项目链接**，并自动补齐 1~5 五个看板列（补了哪几个也会列出来）；以后每次 `tba go` 都会自动再查再补，全齐时不刷屏（详见「看板列 1~5」）。agent 把链接原样转给用户即可，不要自己拼接口建列；只有补列失败出现兜底引导时才连那段一起转。
-6. 「没找到对应项目」时 `tba go` 只列候选名 + 给 `create --go` 收尾命令，**不会自动创建**（项目名必须用户拍板）。这一步只做本地扫描，不会再联网查一次同名项目。
-
-`tba g` / `go` / `r` / `run` 仍是别名，行为不变。窗口用 `tba ui` 或双击 `tbagui.exe`。
-
-#### 直连模式：`tba go -off <这次要做的事>`
-
-不想让任务走 Teambition 那套（领任务 → 写备注 → 转「待回复」→ 等你回数字）时用它：
-
-```bat
-tba go -off 把侧栏改窄一点
-tba go -off --project <id> 修一下设置页的文案
-tba go -off                                  :: 不带任务也行，agent 会直接问你
-```
-
-这一条**完全不碰 Teambition**：不领任务、不写备注、不改状态、不发邮件、不阻塞等待。
-项目从 `.tba/project` 或 `--project` 认（认不到就用当前目录名），能力索引和编译 & 重载参数
-读本地缓存——所以它在没网、没 token 的机器上照样能跑。
-
-产出的文案和正常开工文案共用前半段（项目、skill 索引、通用能力、编译段），
-后半段换成「直连模式」规则：有疑问直接在对话里问、干完直接说结论、
-不要调用 `claim/take/start/ask/wait/beat/done/close/note`。
-
-配套的两个：
-
-```bat
-tba ask -off -q "旧缓存要一起删吗？"   :: 只把问题打到 stdout，不写任务、不发邮件、不阻塞
-tba wait -off                          :: 直接返回（直连下没有「等 Teambition 回复」这回事）
-```
-
-> `-off` 和 `--off` 等价（单横线会被自动改写成双横线）。
-
-#### 列1 是最高优先级：拖回去就能重接
-
-**任务被拖到列1，不管台账里是什么状态，一律重接。**
-
-这条是「会话断了怎么恢复」的答案。agent 断了、卡住了、换设备了，你把任务拖回列1，下次谁跑 `tba g` 谁就接上。
-
-实现上做了三件事：
-
-| 行为 | 为什么 |
-|---|---|
-| 列1 的任务不再按台账过滤 | 以前台账里有 `waiting` 就跳过，拖回列1 也领不到 |
-| 旧 claim 标 `reverted` 再新建 | 一条任务同时只有一条活动记录，留痕能看出「被拖回列1 重来过」 |
-| 等待中断检查跳过列1 的任务 | 拖回列1 = 用户已经放弃那次等待，不该再拦 |
-
-`tba take <任务链接>` 同理：指定的是列1 的任务就重接，否则沿用原 claim（幂等）。
-
-**退出码是分支依据**，agent 不用解析文本：
-
-| 输出 | 退出码 | 含义 | agent 该做什么 |
+| 局面 | 状态 | 列 | 球在谁那 |
 |---|---|---|---|
-| `NO_BINDING <目录>` | 3 | 当前目录没绑定项目，且不是 git 仓库 | 停。不领任务，不建项目 |
-| `NO_PROJECT <id 或 名字>` | 4 | 绑定失效，或目录名在 Teambition 上没匹配 | 问用户要不要初始化 |
-| `EMPTY <项目名>` | 0 | 队列空 | 停 |
-| `claim_id: …` | 0 | 领到了 | 照输出的流程干 |
-| `BLOCKED` | 5 | 手上有「在等回复但没人接」的任务 | 先 `tba wait <claim>` 接回来，或 `tba release <claim>` 退回队列 |
+| 队列中，没人接 | 未完成 | 1 | — |
+| agent 正在干 | 进行中 | 2 | agent |
+| agent 等你回复 | **待回复** | 3 | 你 |
+| 干完 | 已解决 | 4 | — |
+| 作废 | 已完成 | 5 | — |
 
-领到任务后自动往当前目录补 `AGENTS.md`，两块内容，各自用标记检测、缺哪块补哪块，**绝不覆盖你原有的内容**：
+- 五个阶段：`未完成 → 进行中 → 待回复 → 已解决 → 已完成`；另有两个用途标记 `skill` / `mem`，不占阶段、`claim` 不会领走。
+- `待回复` 的 kind 是 `unset` 而不是 `end`——球在你那不等于干完了，否则完成率会虚高。
+- 列名默认中文，可在 `data/config.toml` 覆盖；列不存在时只跳过移列、不阻断流程，状态才是硬约束。
+- `tba claim` 只领「列 1 + 状态未完成」，全程持文件锁，多会话并发不会抢到同一条。
 
-| 块 | 标记 | 内容 |
+---
+
+## 配置
+
+`data/config.toml`（装完自动生成，**含令牌和邮箱授权码，不要提交**）。
+
+| 键 | 默认 | 说明 |
 |---|---|---|
-| 任务队列入口 | `<!-- tba:entry` | 什么时候跑 `tba g`、四个退出码、看板列流转、做完怎么交回 |
-| 编码纪律 | `<!-- tba:rules` | Karpathy 那 4 条：先想再写 / 最简实现 / 只改必须改的 / 先定验证标准 |
+| `access_token` | — | Teambition User Token，由用户本人在窗口或 `tba login` 里填 |
+| `smtp_host` / `smtp_port` | `smtp.qq.com` / `465` | 发信 |
+| `smtp_user` / `smtp_pass` | — | 账号 + **授权码**（不是登录密码） |
+| `smtp_from` | 空 = 用 `smtp_user` | 也可写 `显示名 <邮箱>` |
+| `mail_to` | — | 收件人，多个用逗号 / 分号分隔 |
+| `imap_host` / `imap_port` | `imap.qq.com` / `993` | 不配就收不到回信 |
+| `mail_on_ask` | `true` | 交回时是否发信 |
+| `wait_interval_secs` | `5` | 评论轮询间隔（秒） |
+| `mail_poll_secs` | `5` | 邮件轮询间隔（秒） |
+| `wait_timeout_secs` | `540` | **仅 `--once` 单轮**最长等待；常驻模式不生效 |
+| `wait_auto_ask` | `true` | 仅 `--once` 老路径：没 ask 过就 `wait` 时自动补问 |
 
-领到任务时，`tba g` 的输出**第一段就是「交回」提示**，带着填好的 `claim_id`，然后才是任务正文。
-实测 agent 读完正文就直接开干、干完就结束回合，沉在后面的流程文案它不翻——所以提示必须放最前面。
+下限保护：`wait_timeout_secs ≥ 30`、`wait_interval_secs ≥ 5`、`mail_poll_secs ≥ 5`，填太小会被夹到下限，避免把 Teambition 接口和邮箱打到限流。
 
-两块分开检测的好处：**已经生成过入口的老项目，下次 `tba g` 也会自动补上后加的编码纪律**，不会被「已有入口」挡住。
+改法三选一：窗口 `tba ui` →「⚙ 设置」；直接改 `data/config.toml`；临时覆盖 `tba wait <claim> --interval 10`。`tba mail status` / `tba doctor` 会回显当前生效值。
 
-编码纪律为什么放 `AGENTS.md` 而不是塞进 prompt：这四条是通用编码习惯，跟任务流程无关，而且每条都要解释才管用。
-塞进 prompt 每次会话固定多 1500 字；`AGENTS.md` 是 agent 进项目就会读的约定文件，成本几乎为零。
+---
 
-补上之后用户说「开工」就够了；换项目、换设备没有入口文件时，`tba` 一个词照样能跑。
+## 邮件通道为什么快
 
-- `--no-entry` 不补入口文件。
-- `--lang en` 用英文规则（省 token）。
-- 项目来源优先级：`--project` > `.tba/project` 绑定 > 按目录名去线上找同名项目。
-- 换设备时没有 `.tba/project`：只要目录名和 Teambition 项目同名，自动认回来并补上绑定。
-- 旧目录 `.tbhub/` 第一次被读到时自动改名成 `.tba/`，内容不动。改名失败（权限 / 占用）就继续用旧的。
-- 既没绑定、又不在 git 仓库里：直接退 3。**不猜、不建**。
+旧实现每轮 `UID SEARCH UNSEEN` 后把信箱里所有历史未读信 FETCH 一遍（实测 73 封 / 约 4.7 秒），再绕「写评论 → 下一轮读评论 → resume」，端到端要 31~41 秒。现在：
 
-### 多会话并行（WorkBuddy 开两个 + dsh 再开一个）
+1. **提问水位**：`ask` 发信前从 `SELECT INBOX` 读 `UIDVALIDITY` / `UIDNEXT`，落盘到 `data/mail/<claim_id>.uid`；`wait` 跨进程读取，只 FETCH `UID ≥ 水位` 的新未读信。QQ 邮箱不认服务端 `UID SEARCH UNSEEN <n>:*` 范围过滤，所以过滤放在本地（`SEARCH` 只回一行数字，很便宜）。
+2. **去重与容错**：跨轮记住扫过的 UID；单封 FETCH 失败下轮重试；`UIDVALIDITY` 变化时作废旧水位。
+3. **降频**：外部状态查询 30 秒一次、心跳 60 秒一次，不再每轮串行拖住主循环。
+4. **直接流转**：待回复态收到邮件 → 写 `events.jsonl` + 评论留痕 → 直接 `parse_reply` + `resume`，不再等下一轮读评论。
 
-台账和 `data/` 是跟 exe 走的，所有会话天然共享，**不需要额外同步**。要做的只有一件事：
-给每个会话一个不同的标识，否则两件坏事会发生——A 会话活着会把 B 会话的僵尸任务一起续命（永远回收不掉），
-`sweep` 的「会话存活豁免」也会互相顶。
+邮件正文只带**本次** `tba note` 写入的处理内容（`Claim.last_note`），不再是累积的整条任务备注；主题带 `[TB <claim_id>]` 标记，QQ 邮箱主题折行插空格时也能容错匹配。
 
-```bat
-tba hello --name wb-a     :: 在 A 会话的工作目录里跑一次
-tba hello --name wb-b     :: B 会话换个名字
-tba hello                 :: 不介意共用就自动生成（s-3f2a1c）
-```
+---
 
-标识写入 `<当前目录>/.tba/session`，之后该目录下所有 `tba` 命令自动带上（也可用环境变量 `TBA_AGENT` 覆盖）。
-**同一目录开两个会话必须显式 `--name` 区分**，否则后一个会覆盖前一个。
-
-### 会话断开怎么自动退回队列
-
-四层防线：
-
-1. **正常收尾**：`ask` / `done` / `close`，skill 里强制。
-2. **同步等待中**：agent 在 `tba ask` 里挂着，会话没结束就一直在（「待回复」本来就不参与回收）。
-3. **进程退出清理**：`tba serve` 每 30 秒写会话心跳；会话结束（窗口关闭/进程退出）时自动把本会话 `running` 的任务退回 未完成 + 列「未完成」。`waiting` 的不动（那是在等你）。
-4. **心跳超时兜底**：`running` 且心跳超过 `heartbeat_timeout_secs`（默认 300 秒）→ 判定会话已死 → 退回 未完成 + 列「未完成」，并在任务上留一条评论说明。任何 `tba` 命令启动时顺带扫一次。
-
-另外：**任何 `tba` 命令启动时都会给本会话占着的 running 任务刷一次心跳**（`sweep` 除外），
-所以长构建期间只要中途跑过一次 tba 就不会被误判。
-
-强杀（进程被直接终止）时第 3 层不执行，靠第 4 层兜底；如果之后**再也没有任何 tba 命令被调用**，回滚会等到下次有人跑 `tba` 时才发生——这是没有常驻进程时的固有限制。
-
-## 通用能力
-
-「通用」= 跟 Teambition 无关，任何项目都能用。目的都是**别让 agent 现场摸索**：
-分支叫什么、远端是哪个、CI 跑没跑完、截图怎么截、环境缺什么。
-
-### 能力（本地文本库，可增删改查）
-
-**能力**是「这台机器上的 tba 能干什么」，存本地 `data/caps.toml`，**跨项目共享**。
-项目 skill 是另一套（存 Teambition 云端、按项目隔离），两者别混：项目 skill 写
-「这个项目怎么干活」，能力写「本机有哪些固化的流程」。
-
-```bat
-tba cap list                                   :: 目录：名字 + 一句话 + 开关
-tba cap shot                                   :: 读正文（等同 tba cap show shot）
-tba cap add deploy-web --summary "要部署：打包并上传" --body DEPLOY.md
-tba cap add deploy-web --summary "..." --body -  :: 正文从 stdin 读（可管道/重定向）
-tba cap edit shot --body new.md                :: 改正文（不给 --body 保留原文）
-tba cap on shot  /  tba cap off shot           :: 开关（关掉不进 agent 文案）
-tba cap add deploy-web --summary "..." --summary-en "to deploy: build and upload"
-tba cap add deploy-web --always --summary "..." :: 常驻：开工文案里标【常驻】，先被看见
-tba cap rm shot                                :: 删除
-tba cap restore                                :: 补齐缺失的内置能力
-tba cap path                                   :: 打印 caps.toml 路径
-```
-
-**开工文案里长什么样**（一行一条，标题说清「用到才读正文」）：
-
-```
-通用能力，用到才读正文（`tba cap <名字>`）
-- shot        看界面/验收 UI：一条命令出 png，后台窗口也能截
-- git-main    要提交推送：GitButler 项目自动走 but
-- git-create  要新建/连接 GitHub 仓库：一条命令建好并推送，别装 gh
-- release     要发版：生成 workflow / 打 tag / 等 CI
-- gui-notes   改 GUI 前先读：字体、黑体、别出豆腐块
-- no-console  【常驻】绝不弹黑框：所有命令都隐藏窗口调用
-```
-
-只列名字是不够的：`gui-notes` 光看名字 agent 猜不出干什么，等于这条能力不存在。
-但正文也不能全贴进去（6 条正文合计 3400 字符，全内联每次开工多付 3 倍 token），
-所以是「索引带触发条件 + 正文按需读」。
-
-**常驻（`always`）** 是给「动手前就得知道、等踩了坑再去读已经晚了」的约束型能力用的
-（典型是 `no-console`）：标【常驻】让 agent 先看见。其余能力别勾，勾了只是白花 token。
-
-窗口里在 **通用能力 → 能力（可编辑）**：列表带开关，每条能「编辑」「删除」，
-顶部「新增」「恢复内置」。改完立刻落盘，agent 下次 `tba cap <名字>` 读到的就是新正文。
-
-内置 6 条：`no-console`（禁止弹命令行，常驻）/ `shot`（截图）/ `git-main`（提交推送）/
-`git-create`（创建/连接 GitHub 仓库）/ `release`（发版）/ `gui-notes`（写 GUI 的注意事项）。
-内置条目正文可改、删了能恢复
-（`tba cap restore`）。内置清单升级时会自动补进老用户的 `caps.toml`，但**不会**把你删掉的
-条目重新灌回来。
-
-升级只刷新**索引层**（一句话说明 + 英文说明 + 常驻标记）——那是「目录」，跟着版本走才对；
-**正文和开关是你的，一律不动**。自定义条目（非内置）完全不经手。
-
-**每个项目还能单独关**：项目卡片里的「通用 skill」栏，取消勾选 = 这个项目不用，
-开工文案里不列、agent 也就搜不到。存在 `data/projects/<id>/caps-off.toml`，
-只记「不用的」，所以以后新增能力默认对所有项目可用。
-
-> 「重载」已经不是通用能力了：它跟具体项目绑定（编译指令、exe 名每个项目都不同），
-> 现在在项目卡片的「编译 & 重载」里，参数存 Teambition。见下面那节。
-
-### git / GitButler
-
-```bat
-tba git status                        :: 分支 / 脏文件 / 远端领先落后 / 是不是 GitButler 项目
-tba git main -m "feat: xxx"           :: 提交并推送（默认推到 origin/HEAD 指向的分支）
-tba git update -m "xxx"               :: 同 main（给「更新到 GitHub」一个对得上话的名字）
-tba git main -m "xxx" --land          :: GitButler 项目里再跑 but land，直接落到目标分支
-tba git main -m "xxx" --dry           :: 只打印会跑哪些命令
-tba git tag --tag v1.2.3              :: 打 tag 并推
-```
-
-### 创建 / 连接 GitHub 仓库（不用装 gh）
-
-被叫「建个 GitHub 仓库」「把这个项目传到 GitHub」时用这一条，**别让用户去装 `gh`，
-也别自己拼 `git remote add` + `git push`**：
-
-```bat
-tba git create                        :: 用当前目录名建公开仓库 + 加 origin + 推送
-tba git create --name my-app          :: 指定仓库名
-tba git create --private              :: 建私有仓库
-tba git create --dry                  :: 只打印会做什么，不真的建/推
-```
-
-一条命令做完：调 GitHub API 建仓库 → 加 `origin` 远端 →（没有提交就建初始提交）→ 推送。
-**幂等，可反复跑**：`origin` 已指向 GitHub 就不重复建、直接推送（等于「更新到 GitHub」）；
-指向别处会报错而不覆盖；目录还不在 git 仓库里会自动 `git init`。
-之后改代码仍用 `tba git main -m "..."`。
-
-前置只要一个 GitHub token，二选一：环境变量 `GH_TOKEN` / `GITHUB_TOKEN`，
-或者 `git push` 本来就能用（token 在 git 凭据里，tba 会读出来）。`tba doctor` 会显示是哪种。
-token 只在本次 push 的 HTTP header 里注入，**不会写进 `.git/config`**，避免 PAT 泄漏到远端 URL。
-
-> 这一条不依赖 GitButler CLI。`tba git` 整族只需要系统 git；即便没装 `but`，
-> `create` / `status` / `main` 都能正常跑（普通仓库路径）。
-> 反过来，如果 `tba git main` 发现没有 `origin`，会直接提示先跑 `tba git create`。
-
-自动判断走哪条路：
-
-| 仓库 | 执行的命令 |
-|---|---|
-| GitButler 项目（`but status` 能跑通） | `but commit -m` → `but push` →（`--land` 时）`but land` |
-| 普通仓库 | `git add -A` → `git commit -m` → `git push origin HEAD:<分支>` |
-
-为什么不统一走裸 git：GitButler 的改动挂在虚拟分支上，裸 `git commit` 会让工作区
-在 GUI 里显示成游离提交，用户下次打开会看到一堆怪东西。
-
-### 发版（GitHub Actions）
-
-```bat
-tba publish --init                    :: 生成 .github/workflows/release.yml
-tba publish --tag v0.2.0 --watch      :: 打 tag -> 推 -> 等 CI -> 列产物
-tba publish                           :: 不给 --tag 就读 Cargo.toml 的 version
-```
-
-`--init` 生成的 workflow 就是本仓库在用的那套：**windows x64 + windows arm64（MSVC 交叉编译）**
-两个 job，有 `installer/*.iss` 就出 `setup.exe`，没有就出 zip，tag 推上去自动发 Release。
-已有同名文件且内容不同时会拒绝覆盖，确认加 `--force`。
-
-`--watch` 会轮询 GitHub API（token 取 `GH_TOKEN` / `GITHUB_TOKEN`，再退回 git 凭据），
-默认最多等 300 秒，然后打印每个 job 的结论和 Release 产物清单。
-拿不到 token 或查不到时不报错退出——tag 已经推成功了，只提示「自己去 Actions 页看」。
-
-> 名字是 `publish` 不是 `release`：`tba release <claim_id>` 是「退回队列」，占着这个名字。
-
-### 自检
-
-```bat
-tba doctor
-```
-
-一次列出：exe 路径 / 版本 / PATH 里有没有它 / 令牌有没有 / MCP 地址 / 数据目录 /
-git 版本 / `but` 版本 / 当前是不是 GitButler 项目 / 有哪些中文字体 / 三个轮询参数。
-排查「为什么跑不通」时先跑这个，别一个个试。
-
-### 编译 & 重载（每个项目一份设置）
-
-关键流程不靠文字描述，固化成一个命令：**编译 → 杀旧 → 复制校验 → 启动**。
-参数不写在代码里、也不只存本机，而是存 **Teambition 状态为 `setting` 的任务**
-（标题固定「项目设置」，备注是 TOML）——换设备还在，网页上也能看能改。
-
-```bat
-tba setting                                  :: 看本项目的设置（缺省读 .tba/project 绑定）
-tba setting guess                            :: 按项目文件猜编译指令，只打印不保存
-tba setting set --compile "zig build -Doptimize=ReleaseFast"
-tba setting set --root D:\dev\zigapp --name zigapp --mode copy --args ""
-tba setting text                             :: 打印开工文案里「编译 & 重载」那一段
-tba setting text --lang en                   :: 英文版
-tba setting off                              :: 停用：agent 文案里不再出现编译 & 重载
-```
-
-`setting text` 和窗口里的「查看文案」读的是**同一份生成函数**，不是另写的说明——
-所以看到的就是 agent 开工时真收到的那三行：
-
-```
-编译 & 重载（本项目）：`tba reload build`
-  编译: cargo build --release · 目录: D:\dev\mcp · exe: tba · 启动: 直接跑产物
-  一条命令走完 编译 → 杀旧 → 启动，成功回 `OK <pid>`；失败看 `tba reload status`。
-```
-
-`setting` 任务的备注长这样（`tba setting set` 和窗口都写它，手改也认）：
-
-```toml
-on = true
-compile = "cargo build --release"
-root = "D:\\dev\\mcp"
-name = "tba"
-mode = "rename"          # rename=改名直跑 / copy=副本运行
-live = ""
-args = "ui"
-```
-
-**编译指令空着怎么办**：不猜死。开工文案会写「编译指令未填，先探测项目类型」，
-agent 跑 `tba setting guess`（认 `Cargo.toml` / `build.zig` / `CMakeLists.txt` /
-`package.json` / `Makefile` / `go.mod`），确认后 `tba setting set --compile "..."` 写回
-Teambition。下一次谁打开这个项目都直接能用。
-
-```bat
-tba reload build                             :: 编译 + 替换 + 启动（读项目设置）
-tba reload restart                           :: 只重启，不编译
-tba reload kill  /  tba reload status        :: 杀 / 看是否在跑
-tba reload build --compile "make"            :: 临时覆盖编译指令（不写回设置）
-```
-
-窗口里在项目卡片的 **编译 & 重载** 栏（默认收起）：**直接编辑那段 TOML 文本**（就是存进
-Teambition 任务备注的那一份），下面一行实时告诉你解析结果；按钮是「保存到 Teambition」
-「探测默认值」「从云端重读」「查看文案」和「编译 & 重载 / 只重启 / 杀掉 / 状态」，
-结果和 `target/reload.log` 末尾就在下面。
-
-```toml
-on = true                                  # 关掉 = agent 文案里不出现这段
-compile = "cargo build --release"          # 空着 = 还没定，可用「探测默认值」
-root = 'D:\dev\mcp'                        # 编译在这个目录跑
-name = "tba"                               # exe 基名，不带 .exe
-mode = "rename"                            # rename 改名直跑 / copy 副本运行
-live = ""                                  # copy 模式的副本路径，空 = 自动推算
-args = "ui"                                # 启动参数
-```
-
-为什么是文本而不是一排输入框：这几个参数本来就是**一条命令的几个片段**，拆成六个格子后
-改一个得挨个找，还看不全整体；而它最终就是 Teambition 任务备注里的那段文本——直接编辑它，
-「看到的」和「存下去的」是同一份，复制给别人、贴到 issue 里也能直接用。
-
-容错：路径写进双引号里 `root = "D:\dev\mcp"` 在 TOML 里是非法转义（`\d`），解析会失败，
-此时**退化成逐行扫 `key = value`**，字段照样读得出来，界面上给一条橙色提示建议改用单引号。
-所以「不是合法 TOML」只是提示，不会让设置失效。
-
-「查看文案」按**当前文本内容**生成，所以改完还没保存也能先看效果；保存到 Teambition 后
-agent 才会真收到。
-
-约定：
-
-| 项 | 说明 |
-|---|---|
-| 退出码 | 唯一真值。`0` 成功，`1` 失败 |
-| 成功输出 | `OK <pid>` / `OK` / `RUNNING <pid>` / `STOPPED` |
-| 失败输出 | stderr 一行 `ERR <step>:<msg>`（`compile` 就是编译指令非零退出） |
-| 编译输出 | 只进 `<root>\target\reload.log`，不占 agent 上下文 |
-| 运行副本 | 缺省 `<root>\target\release\<name>_test.exe`（跟产物同目录，`data/` 只有一份） |
-| 自己重载自己 | 自动转后台：脚本等本进程退出后再编译，绕开 exe 文件锁 |
-| 弹窗 | 编译/启动全程不弹控制台（`CREATE_NO_WINDOW`） |
-
-脚本随二进制内置，运行时释放到 `data/capabilities/reload.ps1`，不用单独维护。
-编译前会 `Set-Location` 到项目目录（参数来自设置，调用方的 cwd 靠不住）。
-工具链路径不在脚本里写死，由 `tba toolchain` 解析后传进去（见下一节）。
-
-> 杀软对 `*_test.exe` 这类名字比较敏感，若误报拦截启动，用 `--live` 换个名字即可：
-> `tba reload build --live D:\dev\mcp\target\release\tb_run.exe`
-
-### 构建工具链（MSVC + Windows SDK）
-
-`reload build` 走 `cargo +stable-x86_64-pc-windows-msvc`，要 `link.exe` 和 Windows SDK
-的库（`kernel32.lib` 等）。**只认 MSVC**：发布包就是它编的，GNU 工具链产出的 exe 依赖
-mingw 运行时，窗口和路径行为都不一样，所以不做兜底——找不到就明确报错，让用户指定一次。
-
-路径按三条来源解析，优先级从高到低：
-
-1. 环境变量 `TBA_MSVC_BIN` / `TBA_MSVC_LIB` / `TBA_SDK_LIB` / `TBA_EXTRA_LIB`（CI、临时覆盖）
-2. `data/toolchain.toml`（手选一次，之后一直用）
-3. 自动探测（`vswhere` 找 VS + `Windows Kits\10\Lib\<ver>`，另外查注册表 `KitsRoot10`，
-   所以 SDK 装在 D 盘也能找到）
-
-自动探测只覆盖标准位置，**不扫盘**：装了 VS 预览版或好几个 SDK 版本时，扫盘很容易
-挑错那一份，让用户点一次「选择」更准。
-
-`guess` 探不到 SDK 时**不会把已有的配置清掉**——它会沿用 `toolchain.toml` 里那份
-`sdk_lib`，并告诉你「找过哪些位置」。只有真的一份都没有时才报错，报错里带 SDK 下载地址。
-
-```bat
-tba toolchain                     :: 状态：可用/不可用、来源、还差什么
-tba toolchain guess               :: 标准位置探测一遍并保存
-tba toolchain set --sdk-lib "D:/d/winsdk_libs"
-tba toolchain set --msvc-bin "<VS>/VC/Tools/MSVC/<ver>/bin/Hostx64/x64" ^
-                  --msvc-lib "<VS>/VC/Tools/MSVC/<ver>/lib/x64" ^
-                  --sdk-lib  "<Windows Kits>/10/Lib/<ver>/um/x64"
-tba toolchain clear               :: 清掉手选，回到自动探测
-```
-
-只给一项也行，其余字段保留原值（探测到的或上次存的）。保存前会验活：三个目录里
-分别要能找到 `link.exe` / `libcmt.lib` / `kernel32.lib`，找不到就不写，错误直接说
-缺哪个文件——比「选错了一层目录」这种猜谜强。
-
-**本机没装 Windows SDK 怎么办**：`kernel32.lib` 不一定非要来自完整安装。只要有一个
-目录里放着 `kernel32.lib`（比如从别的机器拷来的 `winsdk_libs` 平铺目录），
-`tba toolchain set --sdk-lib <那个目录>` 就能用。想装完整 SDK：
-
-- VS Installer → 修改 → 单个组件 → 勾「Windows 11 SDK」
-- 或者单独装：https://developer.microsoft.com/windows/downloads/windows-sdk/
-
-窗口里在 **设置 → 构建工具链**：状态 + 来源 + 三个「选择…目录」按钮 + 自动探测 / 清除。
-「手动安装」那一行**常显**——装好了也可能要重装、升级、换盘或换机器，
-只在缺件时给按钮等于装过的人想看下载地址都看不到：
-
-| 装什么 | 按钮 | 打开的页面 |
-|---|---|---|
-| MSVC（`link.exe`） | 下载 VS 生成工具（含 MSVC） | https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
-| Windows SDK（`kernel32.lib`） | 下载 Windows SDK | https://developer.microsoft.com/windows/downloads/windows-sdk/ |
-
-点按钮用系统默认浏览器打开，不用自己搜。装 VS 生成工具时勾「使用 C++ 的桌面开发」，
-它自带 MSVC 和 Windows SDK；装完回来点「自动探测」就填好了。浏览器没弹出来，
-把鼠标停在按钮上能看到完整地址，手动打开也行。
-
-GitButler / git 同理：设置页那张卡里的「GitButler 下载页」「git 下载页」
-「安装到运行目录」也**常显**，已装好照样能重装或升级。
-
-## 共享记忆
-
-```bat
-tba memory --project <id> --write "进展：..."
-tba memory --project <id>                 :: 读
-```
-
-文件在 `data/projects/<id>/memory/`。
-
-## agent 文案
-
-```bat
-tba prompt --project <id>                              :: 不给任务 → 文案让 agent 去队列(列「未完成」)领
-tba prompt --project <id> --task "# 标题
-正文…"                                                 :: 给了任务 → 文案让 agent 用 tba start 新建
-tba prompt --project <id> --task-file .\todo.md        :: 任务正文从文件读
-```
-
-或窗口里点卡片 → 两个复制按钮：
-
-| 按钮 | 行为 | agent 拿到后 |
-|---|---|---|
-| `复制agent文案(本次任务)` | 带上卡片上「本次任务」输入框里填的内容 | 跑 `tba start --project … --file …`，在列「进行中」新建任务 |
-| `复制agent文案(领列1任务)` | **强制丢弃**输入框里的残留草稿 | 跑 `tba claim --project …`，去列「未完成」领队列任务 |
-
-两个按钮的差别是**刻意的**：点「领列1任务」时哪怕输入框里还留着上次写的草稿，文案里也不会出现——否则 agent 会自建任务而不是去领，行为就跑偏了。
-
-### 还没有项目时：一条命令接入
-
-用户本人跑 `tba create`（或窗口左侧「接入项目」页）即可走完整流程：
-
-```bat
-tba create                          :: 扫目录列候选 -> 输编号拍板 -> 建/复用 -> 出开工文案
-tba create --name "MarinIME"        :: 已拍板，直接用这个名字，跳过交互
-tba create --name "MarinIME" --go    :: 拍板后一条命令做完：建项目 + 写 MCP + 当场领任务
-tba create --dir "D:\code\repo"     :: 给别的目录接入（窗口里用「选目录…」）
-tba create --dry                    :: 只列候选，不建项目、不写文件
-tba create --lang en                :: 开工文案用英文
-```
-
-`tba create` 会做完全部六步：列候选（编号 + 名字 + 来源 + Teambition 同名情况）、等用户拍板、
-建或复用项目、补齐 7 个工作流状态、写 `.tba/project` 和 `AGENTS.md` 入口、打印开工文案。
-非交互环境（agent 管道调用）不阻塞：打印候选后要求改用 `--name` 重跑。
-
-加 `--go` 时收尾换成「写 MCP 配置 + 当场领一条任务」，不再打印重复的开工文案。
-MCP 配置只写 WorkBuddy 一家（`~/.workbuddy-ai/mcp.json`），`command` 用 exe 绝对路径、
-只动 `mcpServers.tba`、可重复跑；其他客户端仍用 `tba mcp` 看片段自己贴。
-领任务留在 Create 分支内部调用，所以全新设备缺 GitButler CLI 也不会被这一环拦住。
-
-`init` 是另一条命令：给**已有**项目 id 补齐工作流状态，不是接入新项目。
-
-### 候选名字从哪来
-
-顶栏的 `复制项目初始化文案` 是给 agent 的分步版；它要求 agent 先跑：
-
-```bat
-tba ensure-project --dry-run
-```
-
-这条命令扫当前目录，把候选项目名连**来源**一起列出来（数字越小越可信）：
-
-| 来源 | 例子 |
-|---|---|
-| git remote origin | `teambition-agent-orchestrator` |
-| 构建清单里的包名（Cargo.toml / package.json / pyproject.toml / go.mod / composer.json / pubspec.yaml） | `tba-cli` |
-| 子目录里的项目（会话目录常装着好几个仓库） | `web` → `acme-web` |
-| git 仓库根目录名 | `mcp` |
-| 当前目录名（最弱，经常是 `code` / `tmp` / 工具名） | `workspace` |
-
-同时标出 Teambition 里是否已有同名（新建 / 复用 / 有多个同名），离线则标「未核对」。
-agent 必须把这份**原样列给用户**，由用户挑一个，再跑 `tba ensure-project --name "<选定的名字>"`。
-只有一个候选也要问一次。
-
-`tba ensure-project` 不带 `--name` / `--project` 时会**拒绝创建**，只打候选并退出码 1——
-目录名不该在用户没点头的情况下变成项目名。确实要用目录名就显式加 `--yes`。
-
-`tba prompt --init` 打印的就是这份接入文案；`--name` 给了名字则跳过候选直接用它。
-窗口左侧「接入项目」页是同一流程的图形版：选目录 → 扫描 → 点一个候选 → 直接建，
-结果框里就是可复制的开工文案。CLI 和窗口共用 `src/create.rs`，行为不会漂移。
-
-### 省 token 设计（英文速查表 + skill 按需读）
-
-文案是发给 agent 的、人基本不读，所以按 token 成本优化过：
-
-- **闭环指令是英文速查表**。实测同义内容中文约 882 token、英文约 540 token（cl100k）——中文字在 BPE 分词里普遍 1 字 1+ token，英文 1 token 能装好几个字母。阶段名（未完成/进行中/…）保持中文，那是 Teambition 上的真实名字，改了 agent 对不上。
-- **skill 不内联全文，只列名字**。以前每次发文案都把全部启用 skill 的全文贴进去，skill 越多越大越贵；现在文案只给名字列表 + 一条读取命令，agent 用到哪个读哪个：
-
-```
-Enabled skills (3): 部署流程, 代码规范, 发布 checklist
-Read one on demand (do NOT read all): `tba skill <name> --project <id>`
-```
-
-```bat
-tba skill 部署流程 --project <id>   :: 打印该 skill 全文
-```
-
-不变量一条没丢（只经 tba 改状态/列、别自建任务、每条必须终结于 ask/done/close、长操作前后 beat、待回复永不超时、心跳超时退回队列、退出码 0/2/3 语义），由单测 `workflow_keeps_key_invariants` 守着；`prompt_with_huge_skill_stays_small` 防体积回潮。测量脚本：`tools/token_cmp.py`。
-
-文案含：任务标题/正文、已启用 skill 名字列表、共享记忆目录、开工命令（`claim` 或 `start`）、收尾规则。
-
-`--task` / `--task-file` 的正文会落盘到 `data/tasks/<标题>.md`，文案里给出绝对路径，agent 直接用 `tba start --file` 读，不用你贴正文。
-
-## 窗口设置（字号 / 字体）
-
-窗口左侧栏 → `设置`。
-
-**字号**：可左右拖的数字框（DragValue），按住往右拖就变大、往左拖变小，一格 1px；
-旁边还有 `-` / `+` 各一号。范围 12–40，默认 **18**。不用滑块——滑块拖到 18 这种精确值很难。
-
-改完立刻生效（正文、侧栏、按钮一起等比放大），并落盘到 `data/ui.toml`：
-
-```toml
-font_size = 18.0
-font = ""          # 空 = 自动（黑体优先）；也可填 simhei / msyh / deng / simsun / msjh ...
-```
-
-> 界面偏好单独存 `data/ui.toml`，不写 `config.toml`——后者存着访问令牌和工具映射，整体覆写风险太大。
-
-**中文字体可选**：设置页「中文字体」下拉列本机已装的中文字体，没装的标「（未安装）」。
-选中后整窗立刻换字体。存的是 key 不是路径，换机器不会因为路径不同而失效。
-
-字体链：**选中的字体** → 其余中文字体（黑体 / 雅黑 / 等线 / 宋体 / 正黑 / 苹方 / Noto）
-→ `seguisym.ttf`（符号）。只装一个字体时，它缺的字形会渲染成豆腐块（口）——
-之前只装等线，界面上到处是口，就是这个原因。
-
-**控制台窗口**：`tba.exe` 是 console 子系统（CLI 要 stdout），Windows 在**进程创建时**
-就给它分配控制台，早于 `main()`——代码里只能等跑起来再关，Win11 默认终端是 Windows
-Terminal，那一下还得等 WT 起窗，看着就是黑框闪一下。
-
-所以双击入口单独给一个 `tbagui.exe`：**GUI 子系统**，从创建起就没有控制台。它只做一件事，
-用 `CREATE_NO_WINDOW` 把 `tba.exe ui` 拉起来然后自己退出。安装包里的桌面 / 开始菜单
-快捷方式都指向它；PATH 里放的仍然是 `tba.exe`，命令行用法完全不变。
-
-> 为什么不把 `tba.exe` 直接改成 GUI 子系统：那样 PowerShell / cmd 不会等它结束，
-> 输出也会丢（实测 PowerShell 29ms 就返回），CLI 就废了。两个 exe 各干一件事最稳。
-
-`tba.exe` 里保留 `FreeConsole()` + `ShowWindow(SW_HIDE)` 兜底，现在只对 `tba ui` 生效。
-不带参数敲 `tba` 是 CLI 自举（要 stdout），不再隐藏控制台；双击 `tba.exe` 会打印自举卡后关闭。
-要开窗口用 `tba ui` 或双击 `tbagui.exe`。
-
-## MCP 接入
-
-挂上 MCP 后，agent 的工具列表里直接有 tba 能力。不用敲命令、不用找 exe、不用读约定文件。
-每台设备、每个 agent 产品配一次。
-
-接新项目时跑 `tba create --name "<选定的>" --go` 会顺手把 WorkBuddy 这一家写好
-（幂等、exe 绝对路径）；其他客户端仍按下面的通用片段自己贴。
-
-### 新设备：一句话装好
-
-在 PowerShell 里贴这一行（仓库已公开，脚本匿名可读）：
+## 开发与发版
 
 ```powershell
-irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/install.ps1 | iex
+cargo test --offline                 # 当前 115+ 用例
+cargo build --release --offline --locked
 ```
 
-`install.ps1` 下载最新 Release 的安装包、静默安装、合并写 `~/.workbuddy-ai/mcp.json`。
-不删 `data/`，不覆盖配置里别的 MCP server。装完去连接器管理页点「信任」。
+本机构建需要 MSVC `link.exe` 与 Windows SDK 库目录，完整环境变量见 [docs/REFERENCE.md](docs/REFERENCE.md)。
 
-- 装最新 tag。固定版本：先设 `$env:TBA_VERSION = 'v0.2.28'` 再跑。
-- 脚本写 exe 绝对路径。不依赖 PATH 刷新，宿主进程还活着也能起 MCP。
-- 安装目录改过的话，脚本会停下来提示改路径。
-- 设备已经装好 tba 时不用跑它，直接 `tba mcp --install`。命令写 exe 绝对路径，
-  不依赖 PATH 刷新；和一键脚本效果一致，只是不重新下载安装包。
-- 其他 agent 跑 `tba mcp` 打印可粘贴的配置片段，command 同样是本机 exe 绝对路径，
-  整段贴过去就行，不用手改路径。
+**发版**：`Cargo.toml` 改版本号 → 提交 → 打 `v*` tag 推上去，`.github/workflows/release.yml` 在 `windows-latest` 上构建 x64 + arm64，用 `installer/tba.iss` 出两个 setup.exe 并挂到 Release：
 
-在 agent 的 MCP 配置里加（示意，实际路径以 `tba mcp` 输出为准）：
-
-```json
-{
-  "mcpServers": {
-    "tba": {
-      "command": "C:\\Users\\<用户>\\tba\\tba.exe",
-      "args": ["serve"]
-    }
-  }
-}
+```powershell
+tba publish --tag v0.2.30 --watch
 ```
 
-工具：list_projects / list_project_skills / set_switch / list_tasks / ensure_stages / claim_task / complete_task / close_task / read_memory / write_memory / get_agent_prompt。
+手动触发 workflow 只构建、不上传 Release。安装脚本默认取 `releases/latest`，所以其他设备一句话安装就能拿到这一版。
 
-## 工具识别不准时
+**改流程图**：编辑 `docs/*.svg`（矢量源文件），用 Chrome 无头模式渲染同名 PNG，例如：
 
-Teambition MCP 的工具名由服务端动态下发。自动识别靠名字关键词打分。不准时：
-
-```bat
-tba tools               :: 看真实工具名 + 每个角色认到了哪个工具
-tba tools --overrides   :: 直接输出一份能用的 [tool_overrides] 片段
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
+  --hide-scrollbars --force-device-scale-factor=2 --window-size=1400,900 `
+  --screenshot="docs\flow-loop.png" "file:///D:/dev/mcp/docs/flow-loop.svg"
 ```
 
-把 `--overrides` 的输出贴进 `data/config.toml` 即可（只列当前工具集里真实存在的名字）：
+---
 
-```toml
-[tool_overrides]
-get_task = "teambition.task.query"
-```
+## 排查
 
-可用角色：list_projects / get_project / list_taskflows / get_taskflow / create_taskflow /
-list_stages / create_stage / list_task_types / create_task_type / create_task / update_task /
-move_task / list_tasks / get_task / move_to_list / read_activity / comment。
+先跑 `tba doctor`：一次列出 exe 路径 / 版本 / PATH / 令牌 / MCP 地址 / 数据目录 / 工具链 / 三个轮询参数。
 
-两条兜底，避免一条写错的配置把功能弄死：
-
-- **覆盖值必须真实存在**。写了工具集里没有的名字会被忽略、退回自动识别，`tba tools` 会列出
-  「这些名字在当前工具集里不存在，已忽略」并提示重跑 `--overrides`。
-- **`get_task` / `create_stage` 不再依赖手写覆盖**。真实工具名是 `teambition.task.query`
-  和 `teambition.project.taskflow-update`，早期规则把 `query` / 不带 stage 字样的名字排除了，
-  导致只有手写过 `[tool_overrides]` 的机器能跑——换台机器 `tba note` 就报「找不到 get_task 角色」。
-  现在空配置也能自己认出来（有单测钉着）。
-
-改完运行 `tba tools --refresh`。
-
-## 排查参数问题
-
-真实 Teambition MCP 的工具名长这样：`teambition.project.query`、`teambition.task.query`、`teambition.taskflowstatus.query`。自动识别按名字关键词打分，上面这些都能对上。
-
-要看某个工具到底要什么参数：
-
-```bat
-tba tools --refresh --json
-```
-
-会打印每个工具的完整 `inputSchema`。
-
-### 已经确认的真实语义
-
-从官方文档（Teambition MCP / Skill 使用指南 + TQL 参考）确认：
-
-| 项 | 真实行为 |
+| 现象 | 先看哪里 |
 |---|---|
-| 服务地址 | `https://open.teambition.com/api/mcp/v2`，Streamable HTTP |
-| 授权 | 默认 OAuth + PKCE（issuer `account.teambition.com`，scope 只有 `user`）；User Token 也能用 |
-| 项目查询 | `teambition.project.query` 要求 `projectId` / `tql` / `my` 至少给一个 |
-| 任务查询 | 走 **TQL**。`stageId`、`taskflowstatusId`、`projectId` 是 **TQL 字段**，不是独立的工具参数 |
-| 任务标题 | 在 **`content` 字段**里，正文在 `note` |
-| 分页 | 结束条件是 **`nextPageToken`** 为空 |
-| 回收站 | 任务查询必须默认带 `isArchived = false`，否则会把回收站任务混进来 |
-| 环境变量 | `TEAMBITION_MCP_HOST` / `TEAMBITION_MCP_TOKEN` 可覆盖默认地址和令牌 |
+| 邮件回信没反应 | `tba mail status`（能否收信）、`tba events`（有没有落盘）、标题里 `[TB ...]` 是否还在 |
+| 后台没唤起会话 | `data/waits/<claim>.wait` 心跳是否刷新、`tba inbox` 有没有标「等待中断」 |
+| 收尾了但看板列没动 | 列名是否对得上 `data/config.toml`，列不存在时只跳过移列 |
+| 领不到任务 | 退出码 3 = 目录未绑定项目，4 = 项目查不到；`tba ensure-project --project <id>` 重绑 |
+| MCP 没生效 | 配置写的是 exe 绝对路径、是否点过「信任」、是否新开会话 |
 
-`tba` 已经按这些实现：`list_projects` 自动传 `my=true`、`list_tasks` 自动拼 TQL 并带 `isArchived = false`、按 `nextPageToken` 翻页、skill 正文写进 `note`。
+更多历史细节、命令参数、GitButler / 工具链 / 截图等专题见 [文档索引](#文档索引)。
 
-如果换工具后遇到同类报错，把 `tba tools --refresh --json` 的输出发出来，按 schema 补参数即可。
+---
 
-## OAuth（可选）
+## 文档索引
 
-`data/config.toml` 填 client_id / client_secret / authorize_url / token_url 后，`tba login` 走本地回环授权。默认用 User Token 最省事。
+| 文件 | 内容 |
+|---|---|
+| [docs/流程图.md](docs/流程图.md) | 当前机制的完整文字版流程（状态机、命令、回复协议、邮件链路、兜底） |
+| [docs/REFERENCE.md](docs/REFERENCE.md) | 旧 README 全文归档，含命令细节 / 构建工具链 / 排错笔记；**部分章节描述旧机制，以本 README 为准** |
+| [docs/Teambition-能力清单.md](docs/Teambition-能力清单.md) | Teambition MCP 工具能力清单 |
+| [docs/通用能力方案.md](docs/通用能力方案.md) | 通用能力（本地文本库）设计 |
+| [AGENTS.md](AGENTS.md) | 提交进仓库、给 agent 看的红线与交回姿势 |
+| [install.ps1](install.ps1) / [installer/tba.iss](installer/tba.iss) | 一句话安装 / Inno Setup 打包脚本 |
 
-## 本地测试（不连真实 Teambition）
+---
 
-项目带一个模拟 Teambition MCP 服务，用来验证全流程：
+## 许可
 
-```bat
-python tools\mock_tb_mcp.py 8791
-```
-
-然后把 `data/config.toml` 的 `mcp_url` 改成 `http://127.0.0.1:8791/mcp`，`access_token` 随便填个非空值。
-模拟服务内置 2 个项目、11 个工具，故意把 Alpha 项目的阶段设成只有 2 个，用来验证 `tba init` 自动补齐。
-
-注意：模拟服务是**多线程内存版**，重启后状态全丢（阶段、任务、skill 都回初始值），
-但本地开关和台账不受影响。
-
-## 许可协议
-
-本项目采用 [Apache License 2.0](LICENSE) 开源，完整条款见仓库根目录的 `LICENSE`（安装包也会随附一份）。
-
-```
-Copyright 2026 Rei1mu
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
+[Apache License 2.0](LICENSE) · © 2026 Rei1mu

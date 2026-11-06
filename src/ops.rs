@@ -1404,6 +1404,7 @@ pub fn claim(
         created_at: chrono::Local::now().to_rfc3339(),
         updated_at: chrono::Local::now().to_rfc3339(),
         note: String::new(),
+        last_note: String::new(),
         heartbeat_at: chrono::Local::now().to_rfc3339(),
         tasklist_from: from_list,
         ask_at: String::new(),
@@ -1685,6 +1686,7 @@ pub fn take(store: &Store, target: &str, agent: &str) -> Result<TakeResult, Stri
         created_at: chrono::Local::now().to_rfc3339(),
         updated_at: chrono::Local::now().to_rfc3339(),
         note: String::new(),
+        last_note: String::new(),
         heartbeat_at: chrono::Local::now().to_rfc3339(),
         tasklist_from: from_list,
         ask_at: String::new(),
@@ -1785,6 +1787,7 @@ pub fn start(
         created_at: chrono::Local::now().to_rfc3339(),
         updated_at: chrono::Local::now().to_rfc3339(),
         note: "由 tb start 新建".to_string(),
+        last_note: String::new(),
         heartbeat_at: chrono::Local::now().to_rfc3339(),
         tasklist_from: from_list,
         ask_at: String::new(),
@@ -1847,7 +1850,7 @@ pub fn ask(store: &Store, claim_id: &str, question: &str) -> Result<Claim, Strin
     // 问题必须落到任务上——会话可能断，任务备注不会丢。
     // 写备注而不是评论：评论是用户的通道，agent 不往里写。
     let body = format!(
-        "**❓ 需要你回复**\n\n{}\n\n---\n> 问题已写进本任务备注。请在**评论**或**邮件**里回复数字。\n> 会话一直挂着等你，不会自己结束。\n> 任务状态已改为「{}」，看板列「{}」。回复后自动回到「{}」。",
+        "**❓ 需要你回复**\n\n{}\n\n---\n> 问题已写进本任务备注。请在**评论**或**邮件**里回复数字，或直接写一句话。\n> 后台常驻监听，收到回复就唤起会话，不用前台干等。\n> 任务状态已改为「{}」，看板列「{}」。回复后自动回到「{}」。",
         q,
         STAGE_WAIT,
         ctx.tb.cfg.tasklist_wait,
@@ -1879,10 +1882,24 @@ pub fn ask(store: &Store, claim_id: &str, question: &str) -> Result<Claim, Strin
         c.question = q.to_string();
         c.heartbeat_at = ts.clone();
     })?;
+    // 提问水位：回信一定是 UID 更大的**新**邮件。在发信之前把当时的 UIDNEXT
+    // 记到 data/mail/<claim>.uid，常驻监听就只抓「这次提问之后新到的未读信」，
+    // 信箱里堆积的几十封历史未读广告一封都不用下载。
+    // 落盘而不是放内存：监听收到回复会退出、会话唤起后重挂，水位要能续上；
+    // 手动重跑 tba wait 也仍然沿用同一次提问的水位。
+    if crate::mail::can_receive(&ctx.tb.cfg) {
+        match crate::mail::uid_watermark(&ctx.tb.cfg) {
+            Ok(wm) if wm.uidnext > 0 => {
+                crate::mail::save_watermark(&store.root, claim_id, &wm);
+            }
+            Ok(_) => eprintln!("⚠ IMAP 没给 UIDNEXT，退回全量扫未读（不影响等回复）"),
+            Err(e) => eprintln!("⚠ 读 IMAP 水位失败（退回全量扫未读，不影响等回复）: {e}"),
+        }
+    }
     // 邮件通知放在台账更新之后：即使发信挂了，任务状态也已经是「待回复」。
     // 失败要写进备注——agent 可能把这条命令丢后台，stderr 没人看，
     // 只有落在任务上你才看得见「邮件没发出去」。
-    if let Err(e) = notify_by_mail(&ctx.tb.cfg, &claim, q) {
+    if let Err(e) = notify_by_mail(&ctx.tb.cfg, &claim, q, &claim.last_note) {
         eprintln!("⚠ 邮件没发出去（问题已写进备注，不影响回数字）: {e}");
         let _ = ctx.append_task_note(
             &claim.task_id,
@@ -1915,6 +1932,8 @@ pub fn append_note(store: &Store, claim_id: &str, text: &str) -> Result<String, 
     }
     let mut ctx = Ctx::new(store.clone(), false)?;
     ctx.append_task_note(&claim.task_id, text)?;
+    // 本地留一份本次正文。ask 发邮件时只用这一段，不带累积的整条任务备注。
+    store.patch_claim(claim_id, |c| c.last_note = text.to_string())?;
     Ok("已追加到任务备注".to_string())
 }
 
@@ -1946,27 +1965,40 @@ pub fn resend_mail(store: &Store, claim_id: &str) -> Result<String, String> {
     } else {
         &claim.question
     };
-    notify_by_mail(&cfg, &claim, question)?;
+    notify_by_mail(&cfg, &claim, question, &claim.last_note)?;
     Ok(cfg.mail_to.clone())
 }
 
-// 邮件正文只放问题 + 回复要求 + 链接。
-// 不塞整条任务备注：备注里的数字、长文本会被客户端原样引用回来，
-// 解析器会把引用里的 0/1/2 当成用户的选择。
-// 第一行是引用边界：客户端把原邮件平铺进回信时，ops::strip_reply_noise 在这里截断。
-fn mail_body(claim: &Claim, question: &str) -> String {
+// 邮件正文只放「本次处理内容」+ 问题 + 回复要求 + 链接。
+// 不放累积的整条任务备注：那边有历次会话的内容，还有 0/1/2 选项说明，
+// 被客户端引用回来会干扰回信解析。
+// 第一行一律是「---」开头的标题行：客户端把原邮件平铺进回信时，
+// ops::strip_reply_noise 在这里截断，引用里的数字不会被误认成用户的选择。
+fn mail_body(claim: &Claim, question: &str, work: &str) -> String {
+    let work = work.trim();
+    let block = if work.is_empty() {
+        String::new()
+    } else {
+        format!("---------- 本次处理内容 ----------\n\n{work}\n\n")
+    };
     format!(
-        "---------- 问题 ----------\n\n{q}\n\n\
+        "{block}---------- 需要你回复 ----------\n\n{q}\n\n\
          请只回一个数字 0/1/2。不要保留引用原文，不要写其它内容。\n\n\
          链接：https://www.teambition.com/task/{task}\n\n\
          直接回复本邮件即可（请保留标题里的 [TB {cid}]，否则认不出是哪条任务）。",
+        block = block,
         q = question.trim(),
         task = claim.task_id,
         cid = claim.claim_id,
     )
 }
 
-fn notify_by_mail(cfg: &Config, claim: &Claim, question: &str) -> Result<(), String> {
+fn notify_by_mail(
+    cfg: &Config,
+    claim: &Claim,
+    question: &str,
+    work: &str,
+) -> Result<(), String> {
     // 用户主动关的，不算失败。
     if !cfg.mail_on_ask {
         return Ok(());
@@ -1974,8 +2006,17 @@ fn notify_by_mail(cfg: &Config, claim: &Claim, question: &str) -> Result<(), Str
     if !crate::mail::can_send(cfg) {
         return Err("邮件没配全：缺 SMTP 主机或收件人".to_string());
     }
-    let subject = format!("[TB {}] 需要你回复：{}", claim.claim_id, claim.task_name);
-    let body = mail_body(claim, question);
+    // 主题只带短名。task_name 常常就是整条任务正文，塞进主题会变成一大段「总的」描述。
+    let short: String = claim
+        .task_name
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(40)
+        .collect();
+    let subject = format!("[TB {}] 需要你回复：{}", claim.claim_id, short);
+    let body = mail_body(claim, question, work);
     match crate::mail::send(cfg, &subject, &body) {
         Ok(()) => {
             eprintln!("已发邮件通知: {}", cfg.mail_to);
@@ -2358,7 +2399,14 @@ pub enum WaitOutcome {
         body: String,
         waited_secs: u64,
     },
-    // 这一轮没等到，任务仍在「待回复 + 列3」
+    // 「执行中」期间收到用户回复：不改任务状态，只把原文交给 agent 决定。
+    // 常驻监听靠这个分支退出，shell 跑完 → task-notification → 唤醒会话。
+    Noted {
+        claim: Claim,
+        replies: Vec<String>,
+        waited_secs: u64,
+    },
+    // 这一轮没等到。只有 --once 会走到这里；常驻模式永不因超时退出。
     Timeout { claim: Claim, waited_secs: u64 },
     // 等待期间任务被别处收尾/退回了，别再等
     Gone {
@@ -2368,11 +2416,47 @@ pub enum WaitOutcome {
     },
 }
 
+// 常驻监听的「评论时间基准」。
+//
+// waiting 态用 ask_at（提问时刻）；running 态没有 ask_at，只能用「刚切进 running」
+// 的时刻。不能偷懒用进程启动时刻：用户可能直接在会话窗回话 → agent 跑 tba reply
+// 清掉 ask_at → 同一个监听进程从 waiting 切到 running，这时候拿几小时前的启动时刻
+// 当基准，会把所有历史评论重放成「新回复」，反复误唤醒。
+struct WatchBaseline {
+    since: String,
+    prev_ask: Option<bool>,
+}
+
+impl WatchBaseline {
+    fn new() -> Self {
+        Self {
+            since: chrono::Local::now().to_rfc3339(),
+            prev_ask: None,
+        }
+    }
+
+    /// 返回本轮过滤评论用的时间基准。`now` 由调用方传，方便单测。
+    fn observe(&mut self, has_ask: bool, ask_at: &str, now: &str) -> String {
+        if self.prev_ask != Some(has_ask) {
+            self.since = now.to_string();
+            self.prev_ask = Some(has_ask);
+        }
+        if has_ask {
+            ask_at.to_string()
+        } else {
+            self.since.clone()
+        }
+    }
+}
+
+/// `forever = true` 时永不因超时返回，只有读到回复 / 任务被收尾才退出。
+/// 一次 `tba ask` 就挂一个不会被 540 秒打断的监听，agent 不用再手动续等。
 pub fn wait(
     store: &Store,
     claim_id: &str,
     timeout_secs: u64,
     interval_secs: u64,
+    forever: bool,
 ) -> Result<WaitOutcome, String> {
     let mut claim = store
         .get_claim(claim_id)
@@ -2390,7 +2474,10 @@ pub fn wait(
     // 这时候用户既不知道要回什么，也没收到邮件。tb 替它补一次 ask：
     // 问题写进备注 + 状态转「待回复」+ 发邮件，然后按正常流程等回复。
     // 关掉 wait_auto_ask 就退回旧行为：只等外部收尾，不读评论。
-    if claim.ask_at.is_empty() && store.load_config().wait_auto_ask {
+    // 常驻模式是「纯监听」：agent 还在执行中时也可能挂着它，此时 ask_at 为空是正常的，
+    // 绝不能反过来补一次提问（会擅自把任务推成「待回复」还发一封邮件）。
+    // 自愈只留给 --once 的老路径，那儿本来就是「agent 忘了问」的补救。
+    if claim.ask_at.is_empty() && !forever && store.load_config().wait_auto_ask {
         match ask(store, claim_id, DONE_QUESTION) {
             Ok(c) => {
                 eprintln!(
@@ -2405,27 +2492,44 @@ pub fn wait(
         }
     }
 
-    // ask_at 为空 = 进行中态等用户手动收尾（改状态/拖列4-5），不读评论。
-    // ask_at 非空 = 提问后等回复。
-    let has_ask = !claim.ask_at.is_empty();
-
     let mut ctx = Ctx::new(store.clone(), false)?;
     let started = std::time::Instant::now();
     let interval = interval_secs.max(3);
     let timeout = timeout_secs.max(interval);
-    let ask_at = claim.ask_at.clone();
-    let mut next_report = 60u64;
+    let mut next_report = 300u64;
     // 邮件轮询节流：IMAP 一次往返比读评论贵，别跟评论一个频率。
     // 下限 5 秒，防止配置填 0/1 把邮箱服务器打成拒绝服务。
     let mail_poll = ctx.tb.cfg.mail_poll_secs.max(crate::config::MIN_MAIL_POLL_SECS);
     let mut last_mail = std::time::Instant::now() - std::time::Duration::from_secs(mail_poll);
-    // 一轮等待里最多回一封澄清信，别把用户邮箱刷屏。
-    let mut clarify_sent = false;
-
+    // 时间基准随「待回复 / 进行中」状态切换而重置，见 WatchBaseline 注释。
+    let mut baseline = WatchBaseline::new();
+    // 执行中态收到的回复先攒着，攒到就退出并唤醒会话。
+    let mut noted: Vec<String> = Vec::new();
+    // IMAP 扫描状态跨轮保留：ask 时记下的提问水位 + 已扫过的 UID。
+    // 只抓「提问之后新到的未读信」，不碰信箱里堆积的历史未读广告。
+    let mut mail_scan = crate::mail::MailScan::with_watermark(crate::mail::load_watermark(
+        &store.root,
+        claim_id,
+    ));
+    // 这两个都是 Teambition MCP 往返，同步串行跑会把主循环拖到几十秒一轮，
+    // 8 秒的邮件轮询就跟着变成 30 秒以上。它们本来也不需要 5 秒一次：
+    // 手动收尾是低频动作，心跳超时阈值是 300 秒。
+    let mut last_external = std::time::Instant::now() - std::time::Duration::from_secs(30);
+    let mut last_beat = std::time::Instant::now() - std::time::Duration::from_secs(60);
     loop {
+        let loop_started = std::time::Instant::now();
         // 每轮刷新「我在等」的标记。进程被杀就停更，别的命令据此判断
         // 「任务在等，但没人接了」——agent 把 ask 丢后台就是这么被发现的。
         store.wait_touch(claim_id);
+
+        // 常驻会跑很久，期间任务可能被 agent 在另一个进程里 ask / resume。
+        // 每轮回读一次：ask_at 空 = 进行中态，非空 = 提问后等回复。
+        // 不回读就会拿着启动时的旧状态，新的提问窗口收不到邮件回信。
+        let (has_ask, ask_at) = match store.get_claim(claim_id) {
+            Some(c) => (!c.ask_at.is_empty(), c.ask_at),
+            None => (false, String::new()),
+        };
+        let comment_after = baseline.observe(has_ask, &ask_at, &chrono::Local::now().to_rfc3339());
 
         // 等待期间任务可能被别处 done/close/release 掉，那就别再等了。
         if let Some(c) = store.get_claim(claim_id) {
@@ -2441,116 +2545,192 @@ pub fn wait(
 
         // 用户在网页手动收尾（改状态为 已解决/已完成，或拖到列4/列5）→ 任务已完成，
         // 标记本地 claim 收尾并停止等待，别再傻等评论。
-        if let Some(st) = external_done_state(&mut ctx, &claim.project_id, &claim.task_id) {
-            let _ = store.update_claim(claim_id, st, "用户手动收尾（改状态/拖到列4-5）");
-            let c = store.get_claim(claim_id).unwrap_or_else(|| claim.clone());
-            store.wait_drop(claim_id);
-            return Ok(WaitOutcome::Gone {
-                state: st.to_string(),
-                claim: c,
-                waited_secs: started.elapsed().as_secs(),
-            });
+        // 30 秒查一次就够：这是一次 MCP 往返，每 5 秒查会把邮件轮询一起拖慢。
+        if last_external.elapsed().as_secs() >= 30 {
+            last_external = std::time::Instant::now();
+            if let Some(st) = external_done_state(&mut ctx, &claim.project_id, &claim.task_id) {
+                let _ = store.update_claim(claim_id, st, "用户手动收尾（改状态/拖到列4-5）");
+                let c = store.get_claim(claim_id).unwrap_or_else(|| claim.clone());
+                store.wait_drop(claim_id);
+                return Ok(WaitOutcome::Gone {
+                    state: st.to_string(),
+                    claim: c,
+                    waited_secs: started.elapsed().as_secs(),
+                });
+            }
         }
 
-        // 邮件回信：配了 IMAP 就顺便轮询信箱，把回信**写成任务评论**，
-        // 后面完全复用「读评论 → resume」这条老路，不搞第二套状态机。
-        if has_ask && crate::mail::can_receive(&ctx.tb.cfg) && last_mail.elapsed().as_secs() >= mail_poll
-        {
+        // 邮件回信：不等 Teambition 接口，先查信箱。
+        // 不管 waiting 还是 running 都听邮件。以前只在 has_ask 时听，agent 干活那段
+        // 窗口用户回的邮件就永远没人消费，看着像「后台断了」。
+        if crate::mail::can_receive(&ctx.tb.cfg) && last_mail.elapsed().as_secs() >= mail_poll {
             last_mail = std::time::Instant::now();
+            let imap_started = std::time::Instant::now();
             let marker = format!("[TB {claim_id}]");
-            match crate::mail::fetch_replies(&ctx.tb.cfg, &marker) {
+            match crate::mail::fetch_replies_since(&ctx.tb.cfg, &marker, &mut mail_scan) {
                 Ok(msgs) => {
-                    for m in msgs {
-                        // 自己发出的澄清信偶尔会回到 INBOX：跳过，别当成用户回复。
-                        if m.trim_start().starts_with("没识别到你的选择") {
-                            continue;
-                        }
-                        // 抽不到数字就回一封澄清信，任务留在「待回复」继续等。
-                        // 原来把噪声写成评论后按 free text 忽略，用户会一直等不到结果。
-                        if parse_reply_num(&m).is_none() {
-                            if !clarify_sent && crate::mail::can_send(&ctx.tb.cfg) {
-                                clarify_sent = true;
-                                let subject =
-                                    format!("[TB {claim_id}] 没识别到回复，请只回一个数字");
-                                // 正文不放阿拉伯数字：万一被当成回信捞回来，也不会误解析成选择。
-                                let text = "没识别到你的选择。\n\
-                                            请只回一个数字，不要保留引用原文，不要写其它内容。\n\
-                                            数字含义见上一封邮件，或到 Teambition 任务评论里回复。";
-                                if let Err(e) = crate::mail::send(&ctx.tb.cfg, &subject, text) {
-                                    eprintln!("澄清邮件没发出去（{e}）");
-                                }
+                    // 自己发出的澄清信偶尔会回到 INBOX：跳过，别当成用户回复。
+                    let mails: Vec<String> = msgs
+                        .into_iter()
+                        .filter(|m| !m.trim_start().starts_with("没识别到你的选择"))
+                        .collect();
+                    for m in &mails {
+                        // 先落盘：会话还没被唤起、监听被重启，原话也还在。
+                        crate::events::append(&store.root, claim_id, "mail", m);
+                    }
+                    if has_ask && !mails.is_empty() {
+                        // ① 留痕：用户还是能在 Teambition 动态里看到自己回过什么。
+                        for m in &mails {
+                            let body = format!("（邮件回复）\n\n{m}");
+                            if let Err(e) = ctx.post_comment(&claim.task_id, &body) {
+                                eprintln!("邮件回信写入任务评论失败: {e}");
                             }
-                            continue;
                         }
-                        let body = format!("（邮件回复）\n\n{m}");
-                        if let Err(e) = ctx.post_comment(&claim.task_id, &body) {
-                            eprintln!("邮件回信写入任务评论失败: {e}");
+                        // ② **直接流转**，不再绕「写评论 → 下一轮读评论 → resume」。
+                        // 评论接口有可见性延迟时，旧路径会白等好几个循环，实测从
+                        // 邮件进 INBOX 到被捞起/处理要 30 秒以上。用户原话直接合成
+                        // CommentInfo 交给 agent，评论只当留痕、不再是必经之路。
+                        let last = mails.last().cloned().unwrap_or_default();
+                        let (action, body) = parse_reply(&format!("（邮件回复）\n\n{last}"));
+                        let replies: Vec<CommentInfo> = mails
+                            .iter()
+                            .map(|m| CommentInfo {
+                                id: String::new(),
+                                author: "邮件".to_string(),
+                                created: chrono::Local::now().to_rfc3339(),
+                                text: format!("（邮件回复）\n\n{m}"),
+                            })
+                            .collect();
+                        match resume(store, claim_id) {
+                            Ok((c, _)) => {
+                                let claim = if action == ReplyAction::Closed {
+                                    finish(store, claim_id, STAGE_DONE)?
+                                } else {
+                                    c
+                                };
+                                store.wait_drop(claim_id);
+                                return Ok(WaitOutcome::Replied {
+                                    claim,
+                                    replies,
+                                    action,
+                                    body,
+                                    waited_secs: started.elapsed().as_secs(),
+                                });
+                            }
+                            Err(e) => {
+                                // 评论已经写过了，让下面「读评论 → resume」那条老路兜底，
+                                // 别因为一次网络抖动把用户的回复吞掉。
+                                eprintln!("邮件回复直接流转失败（评论通道兜底）: {e}");
+                            }
+                        }
+                    } else if !mails.is_empty() {
+                        // 执行中态不往评论里写（那是用户的回复通道，会污染下一次 ask
+                        // 的时间基准），只交给 agent 看。
+                        for m in mails {
+                            noted.push(format!("（邮件回复）\n\n{m}"));
                         }
                     }
                 }
                 Err(e) => eprintln!("IMAP 收信失败（评论轮询照常）: {e}"),
             }
+            let spent = imap_started.elapsed();
+            if spent.as_secs() >= 2 {
+                eprintln!("… IMAP 轮询耗时 {:.1}s", spent.as_secs_f64());
+            }
         }
 
-        // 提问后等回复：只看「提问之后」的评论（ask_at 用服务端时间戳）。
-        // 进行中态（未提问）只等外部收尾，不读评论。
-        if has_ask {
-            let fresh: Vec<CommentInfo> = ctx
-                .read_comments(&claim.task_id)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|c| ts_after(&c.created, &ask_at))
-                .collect();
-            if !fresh.is_empty() {
-                // 按**最后一条**回复判动作：用户可能先打错再改口，以最后一条为准。
-                let last = fresh
-                    .last()
-                    .map(|c| c.text.clone())
-                    .unwrap_or_default();
-                let (action, body) = parse_reply(&last);
-                // 复用 resume：推回 进行中 + 列2，并清掉 ask_at 防止下次读重。
-                let (c, replies) = resume(store, claim_id)?;
-                // 回复 0 = 用户明确授权收尾 → tb 直接执行。
-                // （agent 自己跑 tb done 依然禁止，这里执行的是**用户**的指令。）
-                if action == ReplyAction::Closed {
-                    let c2 = finish(store, claim_id, STAGE_DONE)?;
-                    store.wait_drop(claim_id);
-                    return Ok(WaitOutcome::Replied {
-                        claim: c2,
-                        replies,
-                        action,
-                        body,
-                        waited_secs: started.elapsed().as_secs(),
-                    });
-                }
+        // 只看「监听基准之后」的评论。waiting 用 ask_at（提问时刻），
+        // running 用本次监听启动时刻。以前 running 干脆不读评论，那段窗口的
+        // 回复全丢了——这正是「执行中也能后台更新」要补的洞。
+        let fresh: Vec<CommentInfo> = ctx
+            .read_comments(&claim.task_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| ts_after(&c.created, &comment_after))
+            .collect();
+        if !fresh.is_empty() && !has_ask {
+            // 执行中态：不 resume、不改状态、不碰看板列，只记录 + 退出唤醒会话。
+            // 状态流转仍由 agent 看完原话后自己决定，避免跟它手上的活打架。
+            for c in &fresh {
+                crate::events::append(&store.root, claim_id, "comment", &c.text);
+                noted.push(c.text.clone());
+            }
+        } else if !fresh.is_empty() {
+            // 按**最后一条**回复判动作：用户可能先打错再改口，以最后一条为准。
+            let last = fresh
+                .last()
+                .map(|c| c.text.clone())
+                .unwrap_or_default();
+            let (action, body) = parse_reply(&last);
+            // 复用 resume：推回 进行中 + 列2，并清掉 ask_at 防止下次读重。
+            let (c, replies) = resume(store, claim_id)?;
+            // 回复 0 = 用户明确授权收尾 → tb 直接执行。
+            // （agent 自己跑 tb done 依然禁止，这里执行的是**用户**的指令。）
+            if action == ReplyAction::Closed {
+                let c2 = finish(store, claim_id, STAGE_DONE)?;
                 store.wait_drop(claim_id);
                 return Ok(WaitOutcome::Replied {
-                    claim: c,
+                    claim: c2,
                     replies,
                     action,
                     body,
                     waited_secs: started.elapsed().as_secs(),
                 });
             }
+            store.wait_drop(claim_id);
+            return Ok(WaitOutcome::Replied {
+                claim: c,
+                replies,
+                action,
+                body,
+                waited_secs: started.elapsed().as_secs(),
+            });
+        }
+
+        // 执行中收到的（邮件 + 评论）一起交出去。退出 → shell 完成通知 → 唤醒会话。
+        if !noted.is_empty() {
+            store.wait_drop(claim_id);
+            return Ok(WaitOutcome::Noted {
+                claim: claim.clone(),
+                replies: std::mem::take(&mut noted),
+                waited_secs: started.elapsed().as_secs(),
+            });
         }
 
         // 边等边续命：running 的 claim 靠这里保活，避免被 sweep 误判会话断开。
-        let _ = beat(store, claim_id);
+        // 常驻监听自己就是「会话还活着」的证据，不用 agent 再手动 beat。
+        // 心跳超时阈值 300 秒，60 秒刷一次绰绰有余，省下每轮一次 MCP 往返。
+        if last_beat.elapsed().as_secs() >= 60 {
+            last_beat = std::time::Instant::now();
+            let _ = beat(store, claim_id);
+        }
 
         let waited = started.elapsed().as_secs();
-        if waited >= timeout {
-            let c = store.get_claim(claim_id).unwrap_or(claim);
+        // 慢轮诊断：主循环被拖长时，邮件轮询的实际间隔也跟着变长。打出来别再靠猜。
+        let loop_secs = loop_started.elapsed().as_secs();
+        if loop_secs >= 12 {
+            eprintln!("… 本轮循环耗时 {loop_secs}s（邮件轮询间隔会被同步拉长）");
+        }
+        // 常驻模式永不因超时退出。以前每 540 秒 exit(2) 要 agent 手动重跑 wait，
+        // agent 那一轮回复一结束就没人续，监听就真的断了。
+        if !forever && waited >= timeout {
+            let c = store.get_claim(claim_id).unwrap_or_else(|| claim.clone());
             return Ok(WaitOutcome::Timeout {
                 claim: c,
                 waited_secs: waited,
             });
         }
-        // 进度走 stderr，不污染 stdout（agent 读的是 stdout 正文）。
+        // 进度走 stderr，不污染 stdout（agent 读的是 stdout 正文）。常驻会跑几小时，
+        // 5 分钟一条就够，别把日志刷爆。
         if waited >= next_report {
-            eprintln!("… 已等 {waited} 秒（每 {interval} 秒查一次，本轮上限 {timeout} 秒）");
-            next_report = waited + 60;
+            eprintln!("… 常驻监听中，已等 {waited} 秒（每 {interval} 秒查一次，收到回复才退出）");
+            next_report = waited + 300;
         }
-        let step = interval.min(timeout - waited).max(1);
+        let step = if forever {
+            interval
+        } else {
+            interval.min(timeout - waited).max(1)
+        };
         std::thread::sleep(std::time::Duration::from_secs(step));
     }
 }
@@ -3665,25 +3845,26 @@ fn workflow_text_zh(
     }
 
     // 第 3 步：数字协议由 tb 执行（agent 不解释、不跑 done），只有 0 收尾。
-    // ask 默认就地阻塞等回复，所以这里不再有单独的 wait 一步。
+    // ask 默认挂后台常驻监听，所以这里不再有单独的 wait 一步。
     s.push_str(&format!(
-        "3. 要用户输入：`{exe} ask <claim_id> -q \"问题（写清数字含义）\"`（问题进备注，转「{0}」+列「{1}」，发邮件，**问完就地阻塞等回复，别结束会话**）。回复数字 tb 自动处理：0=已解决→列{3}收尾；1=先写项目记忆→列{2}，写完再ask；2=未解决→列{2}自查再给选项；3+=自定义→列{2}；非数字=按原文。只有0收尾，其余回列{2}。只等别重复问。选项用纯文本编号，禁用选择框/弹窗。\n",
+        "3. 要用户输入：`{exe} ask <claim_id> -q \"问题（写清数字含义）\"`（问题进备注，转「{0}」+列「{1}」，发邮件，**问完后台常驻监听，本轮回复可正常结束**）。回复数字 tb 自动处理：0=已解决→列{3}收尾；1=先写项目记忆→列{2}，写完再ask；2=未解决→列{2}自查再给选项；3+=自定义→列{2}；非数字=按原文。只有0收尾，其余回列{2}。只等别重复问。选项用纯文本编号，禁用选择框/弹窗。\n",
         STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
     ));
 
     // 第 4 步：做完必须交回用户。ask 自带等待，所以是两步不是三步。
-    // 「禁止 run_in_background」要写死：agent 把 ask 丢后台 = 会话结束了但没人接回复，
-    // 任务卡在「待回复」，用户永远等不到下一步。
+    // 旧文案要求「前台阻塞 10 分钟、绝不结束会话」，那是当年兜 78s SIGTERM 的土办法。
+    // 现在 ask 常驻不超时退出，前台窗口只留 60 秒让工具把进程转后台（不杀），
+    // agent 本轮回复可以正常结束，收到回复时 task-notification 会把会话拉起来。
     // 调用姿势单独抽出来，两个分支共用，免得只改一处、文案分叉。
-    let ask_posture = "**ask 调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 600000`；Sandbox 约 78s 会 SIGTERM 强杀阻塞的 ask。前台超时自动转后台继续等（不是主动 run_in_background），用户回数字后 ask 退出、task-notification 唤醒 agent 续接。禁止 `--no-wait`。";
+    let ask_posture = "**ask 调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点工具自动把命令转后台（**不杀进程**），常驻监听继续挂着，不用在前台干等 10 分钟；agent 本轮回复正常结束即可。用户回邮件/评论后监听退出 → task-notification 唤醒会话。**会话窗直接回**：用户在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。禁止 `--no-wait`。";
     if memory_on {
         s.push_str(&format!(
-            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（0=收尾/1=先写记忆/2=还有问题；转「{0}」+列「{1}」+发邮件，**前台阻塞等回复，禁止 run_in_background，绝不结束会话**）。ask exit 0=回复 / exit 2=超时，改用 `{exe} wait <claim_id>`（别重跑 ask，会重发信）/ exit 3=用户已收尾（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
+            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（0=收尾/1=先写记忆/2=还有问题；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
             STAGE_WAIT, cfg.tasklist_wait, STAGE_DONE, STAGE_CLOSED, cfg.tasklist_done, cfg.tasklist_closed, STAGE_TODO, cfg.tasklist_queue
         ));
     } else {
         s.push_str(&format!(
-            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（0=收尾/1=先写记忆/2=还有问题；转「{0}」+列「{1}」+发邮件，**前台阻塞等回复，禁止 run_in_background，绝不结束会话**）。ask exit 0=回复 / exit 2=超时，改用 `{exe} wait <claim_id>`（别重跑 ask，会重发信）/ exit 3=用户已收尾（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
+            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（0=收尾/1=先写记忆/2=还有问题；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
             STAGE_WAIT, cfg.tasklist_wait, STAGE_DONE, STAGE_CLOSED, cfg.tasklist_done, cfg.tasklist_closed, STAGE_TODO, cfg.tasklist_queue
         ));
     }
@@ -4379,15 +4560,14 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **交回**：做完两步，不许省：\n\
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
-         `ask` 发邮件后**就地阻塞**等你回数字（0=收尾 1=写记忆 2=有问题）。\
-         退出码：0=收到回复；2=超时，改用 `{exe} wait <claim_id>`（别重跑 ask，会重发信）；\
-         3=已收尾。\n\
-         **调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 600000`。\
-         Sandbox 模式约 78s 会 SIGTERM 强杀阻塞的 `ask`，回复接不上。\
-         前台超时会自动转后台继续等（不是自己 `run_in_background`）；\
-         用户回数字后 `ask` 退出，task-notification 唤醒 agent 续接。\n\
-         **禁止主动 run_in_background、禁止 `--no-wait`、绝不结束会话**——断了没人接你回复。\
-         只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
+         `ask` 发邮件后**后台常驻监听**评论和邮件（0=收尾 1=写记忆 2=有问题）。\
+         退出码：0=收到回复 / 3=已收尾；常驻模式不会因超时退出。\n\
+         **调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。\
+         前台窗口到点自动转后台（不杀进程），不用在前台干等 10 分钟；\
+         收到回复后监听退出，task-notification 唤醒 agent 续接。\n\
+         **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、\
+         看不到它，所以先跑 `{exe} reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。\n\
+         禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
          **通用能力**（别自己拼脚本）：`doctor` 环境自检 / \
          `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / \
          `publish` 发版 / `shot` 截图。先 `{exe} --help`。\n\
@@ -4431,7 +4611,10 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         && old.contains("**流转**")
         && old.contains("**通用能力**")
         && old.contains("git create")
-        && old.contains("dangerouslyDisableSandbox");
+        && old.contains("dangerouslyDisableSandbox")
+        // 「会话窗直接回」是 v0.2.29 后台挂起文案的版本号：老入口还写着
+        // 「前台阻塞 / 绝不结束会话」，缺这句就整段重写一次。
+        && old.contains("会话窗直接回");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
 
     // 转发脚本只写 `tba.exe`，不带本机绝对路径，换设备一样能用。
@@ -4482,9 +4665,10 @@ fn claim_header(c: &Claim, exe: &str) -> String {
          ⚠ 做完必须交回，两步不许省：\n  \
          {exe} note {} --text \"改了什么/怎么验\"\n  \
          {exe} ask {} --done\n\
-         ask 会阻塞等你回数字：关 Sandbox（dangerouslyDisableSandbox: true）+ timeout: 600000；\
-         超时自动转后台继续等，用户回复触发 task-notification 唤醒续接；exit 2 用 {exe} wait <claim_id>。\
-         禁止 run_in_background、禁止 --no-wait、绝不结束会话。只有用户能收尾。\n",
+         ask 发信后后台常驻等回复：关 Sandbox（dangerouslyDisableSandbox: true）+ timeout: 60000；\
+         前台窗口到点自动转后台，收到回复触发 task-notification 唤醒续接。\
+         会话窗直接回也行，先跑 {exe} reply <claim_id> 推回「进行中」。\
+         禁止 --no-wait；只有用户能收尾。\n",
         c.claim_id, c.task_id, c.task_name, c.stage_from, c.stage_to, c.claim_id, c.claim_id
     )
 }
@@ -4659,6 +4843,28 @@ pub fn agent_prompt_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_baseline_resets_when_claim_leaves_waiting() {
+        // 场景：用户不回邮件也不回评论，直接在会话窗打字 → agent 跑 tba reply
+        // 清掉 ask_at。同一个常驻监听从 waiting 切到 running，基准必须换成
+        // 「刚切过去」的时刻，不能拿几小时前的进程启动时刻去重放历史评论。
+        let mut b = WatchBaseline {
+            since: "T0".into(),
+            prev_ask: None,
+        };
+        assert_eq!(b.observe(true, "ASK1", "T0"), "ASK1");
+        assert_eq!(b.observe(true, "ASK1", "T1"), "ASK1", "状态没变就不重置");
+
+        assert_eq!(b.observe(false, "", "T2"), "T2", "切进 running 要重置基准");
+        assert_eq!(b.observe(false, "", "T3"), "T2", "没再切换就别每轮重置");
+
+        assert_eq!(
+            b.observe(true, "ASK2", "T4"),
+            "ASK2",
+            "再次 ask 要用新的提问时刻"
+        );
+    }
 
     // 项目链接 + 看板列结果：create / go / init 共用这一份，缺一样都算回归。
     #[test]
@@ -5262,7 +5468,10 @@ mod tests {
         // 两条命令都得把 claim_id 填好，别让 agent 自己拼。
         assert!(h.contains("tba note clm-x --text"), "缺 note 命令: {h}");
         assert!(h.contains("tba ask clm-x --done"), "缺 ask 命令: {h}");
-        assert!(h.contains("绝不结束会话"), "缺不许断会话的硬话: {h}");
+        assert!(
+            h.contains("会话窗直接回也行") && h.contains("timeout: 60000"),
+            "缺后台挂起 + 会话窗回复的新姿势: {h}"
+        );
 
         // 提示必须在 claim_id 之后、紧跟其后——不能沉到正文后面去。
         let head = h.find("claim_id:").expect("缺 claim_id 行");
@@ -5286,6 +5495,7 @@ mod tests {
             created_at: ask_at.to_string(),
             updated_at: ask_at.to_string(),
             note: String::new(),
+            last_note: String::new(),
             heartbeat_at: ask_at.to_string(),
             tasklist_from: "2".into(),
             ask_at: ask_at.to_string(),
@@ -5332,21 +5542,22 @@ mod tests {
         assert!(store.wait_age("clm-dead").is_none(), "wait_drop 没删掉文件");
     }
 
-    // 邮件正文要带完整备注：用户在外面收信，光看到「已完成，请确认」判断不了
-    // agent 到底干了什么。
+    // 邮件正文要带本次处理内容：用户在外面收信，光看到「已完成，请确认」判断不了
+    // agent 这次干了什么。不带累积的整条任务备注。
     #[test]
-    fn mail_body_carries_full_note() {
+    fn mail_body_carries_this_run_note() {
         let c = fake_waiting("clm-1", "2026-10-31T15:00:00+08:00");
-        let note = "#### 2026-10-31 15:20\n\n改了三处：\n1. 改了 A\n2. 改了 B";
-        let body = mail_body(&c, "已完成，请确认", note);
-        assert!(body.contains("任务备注（完整）"), "缺备注分区标题");
-        assert!(body.contains("改了三处"), "备注正文没进邮件");
-        assert!(body.contains("改了 B"), "备注后半段被截断了");
+        let work = "改了三处：\n1. 改了 A\n2. 改了 B";
+        let body = mail_body(&c, "已完成，请确认", work);
+        assert!(body.contains("本次处理内容"), "缺本次处理内容分区标题");
+        assert!(body.contains("改了三处"), "本次正文没进邮件");
+        assert!(body.contains("改了 B"), "本次正文后半段被截断了");
         assert!(body.contains(&c.task_id), "缺任务链接");
         assert!(body.contains(&c.claim_id), "缺回信标记");
 
-        // 备注为空 → 退回只发问题，不发一封空信。
+        // 本次内容为空 → 退回只发问题，不发一封空信。
         let body = mail_body(&c, "已完成，请确认", "");
-        assert!(body.contains("已完成，请确认"), "备注为空时该退回问题");
+        assert!(body.contains("已完成，请确认"), "本次内容为空时该退回问题");
+        assert!(!body.contains("本次处理内容"), "本次内容为空时不该有空分区");
     }
 }

@@ -5,6 +5,7 @@ mod caps;
 mod cmds;
 mod config;
 mod create;
+mod events;
 mod git;
 mod gitbutler;
 mod mail;
@@ -248,7 +249,7 @@ pub enum Cmd {
         agent: Option<String>,
     },
     /// 提问：改成「待回复」+ 看板列「待回复」，问题写进任务备注，发邮件，
-    /// 然后就地阻塞等你回数字（会话不会断）。加 --no-wait 只问不等。
+    /// 然后后台常驻监听邮件/评论，收到回复才退出并唤醒会话（本轮回复可正常结束）。
     Ask {
         /// claim id（--off 时可以省略）
         claim_id: Option<String>,
@@ -258,7 +259,7 @@ pub enum Cmd {
         /// 用标准的「做完了，请确认」三选项（0 收尾 / 1 先写记忆再收尾 / 2 还有问题）
         #[arg(long)]
         done: bool,
-        /// 问完立刻返回，不阻塞等待（默认是就地等到用户回数字）
+        /// 只问不挂监听。红线禁止使用：没人接回复，任务会一直卡在「待回复」
         #[arg(long)]
         no_wait: bool,
         /// 直连模式：不写任务、不发邮件、不阻塞，只把问题打到 stdout，
@@ -280,19 +281,31 @@ pub enum Cmd {
         #[arg(long)]
         agent: Option<String>,
     },
-    /// 同步等回复：阻塞轮询任务评论，你在 Teambition 回一句就返回正文并继续
+    /// 常驻等回复：一直挂着监听评论和邮件，收到回复才退出（退出即唤醒会话）
     Wait {
         /// claim id（--off 时可以省略）
         claim_id: Option<String>,
-        /// 单轮最长等待秒数（默认 540，留余量给工具 600 秒上限）
+        /// --once 时的单轮最长等待秒数（默认 540）
         #[arg(long)]
         timeout: Option<u64>,
-        /// 轮询间隔秒数（默认 15）
+        /// 轮询间隔秒数（默认 5）
         #[arg(long)]
         interval: Option<u64>,
+        /// 只等一轮，到点退出码 2。默认常驻：不因超时退出，用户回一句才返回
+        #[arg(long)]
+        once: bool,
         /// 直连模式：不轮询 Teambition，直接返回（直连模式下本来就不需要等）
         #[arg(long)]
         off: bool,
+    },
+    /// 查看常驻监听期间记下的用户回复（执行中收到的那几句也在这里）
+    Events {
+        /// 只看某个 claim
+        #[arg(long)]
+        claim: Option<String>,
+        /// 显示最近几条（默认 20）
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// 续命：刷新心跳。长构建/长测试前后调用，避免被判定会话断开
     Beat { claim_id: String },

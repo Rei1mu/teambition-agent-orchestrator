@@ -3222,14 +3222,14 @@ impl App {
             .num_columns(2)
             .spacing([12.0, 8.0])
             .show(ui, |ui| {
-                ui.label("单轮最长等待");
+                ui.label("--once 单轮最长等待");
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.wait.timeout_secs)
                             .desired_width(70.0)
                             .hint_text("540"),
                     );
-                    ui.label("秒　到点返回退出码 2，agent 重跑同一条接着等");
+                    ui.label("秒　仅 --once 生效；默认常驻监听不超时");
                 });
                 ui.end_row();
 
@@ -3238,7 +3238,7 @@ impl App {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.wait.interval_secs)
                             .desired_width(70.0)
-                            .hint_text("15"),
+                            .hint_text("5"),
                     );
                     ui.label("秒　多久查一次你在 Teambition 的回复");
                 });
@@ -3249,9 +3249,9 @@ impl App {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.wait.mail_poll_secs)
                             .desired_width(70.0)
-                            .hint_text("20"),
+                            .hint_text("5"),
                     );
-                    ui.label("秒　多久查一次邮箱回信（IMAP 比读评论贵，别设太小）");
+                    ui.label("秒　只抓提问水位之后的新信，下限 5 秒");
                 });
                 ui.end_row();
             });

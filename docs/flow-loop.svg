@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="900" viewBox="0 0 1400 900" font-family="Microsoft YaHei, PingFang SC, Segoe UI, sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b6bd9"/>
+    </marker>
+    <marker id="arb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#3a7fbf"/>
+    </marker>
+    <style>
+      .bg { fill: #ffffff; }
+      .title { fill: #241a3d; font-size: 27px; font-weight: 700; }
+      .sub { fill: #6b5c8a; font-size: 15px; }
+      .lane { fill: #faf8ff; stroke: #e2d8f5; stroke-width: 1.5; rx: 12; }
+      .laneB { fill: #f4faff; stroke: #cfe3f7; stroke-width: 1.5; rx: 12; }
+      .laneC { fill: #f8fffa; stroke: #d6efdd; stroke-width: 1.5; rx: 12; }
+      .laneT { font-size: 15px; font-weight: 700; }
+      .laneA-t { fill: #7a5bc0; }
+      .laneB-t { fill: #2f6fa8; }
+      .laneC-t { fill: #2f8a55; }
+      .box { fill: #f3edff; stroke: #8b6bd9; stroke-width: 1.6; rx: 10; }
+      .blue { fill: #e8f3ff; stroke: #3a7fbf; stroke-width: 1.6; rx: 10; }
+      .green { fill: #e9f8ee; stroke: #43a06a; stroke-width: 1.6; rx: 10; }
+      .soft { fill: #fff8e8; stroke: #d9a441; stroke-width: 1.5; rx: 10; }
+      .t { fill: #2f2545; font-size: 14px; text-anchor: middle; }
+      .tb { fill: #2f2545; font-size: 15px; font-weight: 700; text-anchor: middle; }
+      .ts { fill: #5f537a; font-size: 13px; text-anchor: middle; }
+      .ln { stroke: #8b6bd9; stroke-width: 1.8; fill: none; marker-end: url(#ar); }
+      .lnb { stroke: #3a7fbf; stroke-width: 1.8; fill: none; marker-end: url(#arb); }
+      .lbl { fill: #7a5bc0; font-size: 13px; font-weight: 600; }
+      .note { fill: #6b5c8a; font-size: 13px; }
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1400" height="900"/>
+  <text class="title" x="40" y="46">③ 任务闭环 · 交回 → 后台常驻 → 回复唤醒</text>
+  <text class="sub" x="40" y="76">agent 本轮回复可以正常结束；后台常驻监听收到回复后退出，由任务通知把会话唤起。</text>
+
+  <!-- ============ Lane A ============ -->
+  <rect class="lane" x="30" y="100" width="1340" height="195"/>
+  <text class="laneT laneA-t" x="50" y="128">A · agent 本轮（可以正常结束，不必前台干等）</text>
+
+  <rect class="box" x="55" y="152" width="250" height="104"/>
+  <text class="tb" x="180" y="180">干活</text>
+  <text class="ts" x="180" y="203">tba note（本次处理内容）</text>
+  <text class="ts" x="180" y="224">tba beat 续命</text>
+  <text class="ts" x="180" y="244">结论只写任务备注</text>
+  <path class="ln" d="M 305 204 L 343 204"/>
+
+  <rect class="box" x="345" y="152" width="290" height="104"/>
+  <text class="tb" x="490" y="180">tba ask &lt;claim&gt; --done</text>
+  <text class="ts" x="490" y="203">写备注 · 状态「待回复」· 列 3</text>
+  <text class="ts" x="490" y="224">ask 前记 IMAP 水位（UIDNEXT）</text>
+  <text class="ts" x="490" y="244">发通知邮件（只带本次 last_note）</text>
+  <path class="ln" d="M 635 204 L 673 204"/>
+
+  <rect class="box" x="675" y="152" width="270" height="104"/>
+  <text class="tb" x="810" y="180">挂上后台常驻监听</text>
+  <text class="ts" x="810" y="203">本轮回复可以正常结束</text>
+  <text class="ts" x="810" y="224">别重跑 ask（会重复发信）</text>
+  <text class="ts" x="810" y="244">常驻模式不超时</text>
+
+  <rect class="soft" x="985" y="152" width="355" height="104"/>
+  <text class="tb" x="1162" y="178">红线</text>
+  <text class="ts" x="1162" y="200">不许 --no-wait；不许 agent 自己 done / close</text>
+  <text class="ts" x="1162" y="221">只有用户回 0 / 1 才收尾</text>
+  <text class="ts" x="1162" y="242">邮件标题带 [TB &lt;claim_id&gt;]，回复请保留</text>
+
+  <!-- ============ Lane B ============ -->
+  <rect class="laneB" x="30" y="315" width="1340" height="255"/>
+  <text class="laneT laneB-t" x="1010" y="343">B · 后台常驻监听 · 不超时</text>
+
+  <rect class="blue" x="55" y="362" width="315" height="88"/>
+  <text class="tb" x="212" y="390">评论轮询 · 5 秒</text>
+  <text class="ts" x="212" y="413">读 Teambition 任务评论</text>
+  <text class="ts" x="212" y="434">WatchBaseline 防历史评论重放</text>
+
+  <rect class="blue" x="410" y="362" width="340" height="88"/>
+  <text class="tb" x="580" y="390">邮件轮询 · 5 秒</text>
+  <text class="ts" x="580" y="413">只 FETCH 提问水位之后的新未读信</text>
+  <text class="ts" x="580" y="434">历史未读一封都不下载</text>
+
+  <rect class="blue" x="790" y="362" width="270" height="88"/>
+  <text class="tb" x="925" y="390">去重与容错</text>
+  <text class="ts" x="925" y="413">UID 去重 · 单封失败下轮重试</text>
+  <text class="ts" x="925" y="434">UIDVALIDITY 变化作废旧水位</text>
+
+  <rect class="soft" x="1100" y="362" width="240" height="88"/>
+  <text class="tb" x="1220" y="390">执行中收到回复</text>
+  <text class="ts" x="1220" y="413">WaitOutcome::Noted</text>
+  <text class="ts" x="1220" y="434">只记 events，不改任务状态</text>
+
+  <rect class="blue" x="410" y="482" width="520" height="70"/>
+  <text class="tb" x="670" y="509">收到回复 → events.jsonl + 评论留痕 → parse_reply + resume</text>
+  <text class="ts" x="670" y="532">状态回「进行中」· 列 2 → 后台进程退出（触发任务通知）</text>
+
+  <path class="lnb" d="M 810 256 L 810 300 L 212 300 L 212 360"/>
+  <path class="lnb" d="M 810 300 L 580 300 L 580 360"/>
+  <path class="lnb" d="M 212 450 L 212 468 L 580 468 L 580 480"/>
+  <path class="lnb" d="M 580 450 L 580 480"/>
+  <text class="note" x="960" y="558">水位 data/mail/&lt;claim&gt;.uid · 外部查询 30s / 心跳 60s</text>
+
+  <!-- 泳道之间的说明 -->
+  <text class="note" x="700" y="586" text-anchor="middle">后台进程退出 → task-notification 唤起会话（自动化通知本身不是用户确认）</text>
+
+  <!-- ============ Lane C ============ -->
+  <rect class="laneC" x="30" y="600" width="1340" height="280"/>
+  <text class="laneT laneC-t" x="50" y="628">C · 用户三路入站（任意一路都能继续）</text>
+
+  <rect class="green" x="55" y="645" width="390" height="88"/>
+  <text class="tb" x="250" y="673">① 邮件回复</text>
+  <text class="ts" x="250" y="696">保留标题 [TB &lt;claim_id&gt;] · SMTP 发 / IMAP 收</text>
+  <text class="ts" x="250" y="717">纯文字也收，不必非得回数字</text>
+
+  <rect class="green" x="470" y="645" width="370" height="88"/>
+  <text class="tb" x="655" y="673">② Teambition 评论</text>
+  <text class="ts" x="655" y="696">回 0 / 1 / 2，或直接写一句话</text>
+  <text class="ts" x="655" y="717">任务评论是给你的通道</text>
+
+  <rect class="green" x="865" y="645" width="475" height="88"/>
+  <text class="tb" x="1102" y="673">③ 会话窗直接输入</text>
+  <text class="ts" x="1102" y="696">平台直接唤醒会话，不经过 tba</text>
+  <text class="ts" x="1102" y="717">先跑 tba reply &lt;claim&gt; 把任务推回「进行中」再干活</text>
+
+  <rect class="green" x="55" y="762" width="410" height="86"/>
+  <text class="tb" x="260" y="790">唤醒</text>
+  <text class="ts" x="260" y="813">后台 shell 退出 → 任务通知唤起 agent</text>
+  <text class="ts" x="260" y="834">聊天窗输入由平台直接唤醒</text>
+
+  <rect class="green" x="490" y="762" width="380" height="86"/>
+  <text class="tb" x="680" y="790">回复解析</text>
+  <text class="ts" x="680" y="813">0 收尾 / 1 写记忆后收尾 / 2 还有问题</text>
+  <text class="ts" x="680" y="834">自由文本 = 新需求，继续干</text>
+
+  <rect class="green" x="895" y="762" width="445" height="86"/>
+  <text class="tb" x="1117" y="790">回到 A 继续</text>
+  <text class="ts" x="1117" y="813">只有用户回 0 / 1 才允许收尾</text>
+  <text class="ts" x="1117" y="834">session 通知 ≠ 收尾授权</text>
+
+  <path class="lnb" d="M 250 733 L 250 760"/>
+  <path class="lnb" d="M 655 733 L 655 760"/>
+  <path class="lnb" d="M 1102 733 L 1102 760"/>
+  <path class="ln" d="M 465 805 L 488 805"/>
+  <path class="ln" d="M 870 805 L 893 805"/>
+
+  <!-- 回环 -->
+  <path class="ln" d="M 1340 805 L 1378 805 L 1378 90 L 18 90 L 18 204 L 53 204"/>
+  <text class="lbl" x="1180" y="82">循环：没回 0 / 1 就继续</text>
+</svg>

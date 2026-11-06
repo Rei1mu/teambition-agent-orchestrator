@@ -182,20 +182,22 @@ fn resolve_project(project: Option<&str>) -> Result<String, String> {
     }
 }
 
-// 阻塞等用户回数字，直到回复 / 超时 / 别处收尾。
+// 常驻等用户回复，直到收到回复 / 别处收尾才退出（退出即唤醒会话）。
 //
-// 抽成独立函数是因为 ask 和 wait 都要用它：ask 问完就地开始等，
+// 抽成独立函数是因为 ask 和 wait 都要用它：ask 问完自动挂上常驻监听，
 // agent 只需要记一条命令，没有「问完忘了等」的中间态。
+// forever=true 时不因超时退出；只有 --once 老路径才会单轮到点返回。
 //
 // 退出码约定（agent 靠这个决定下一步，不要改）：
 //   正常返回 = 收到回复，正文和 action 已打印
-//   2        = 单轮超时（默认 540 秒），agent 再跑一次即可，别结束会话
+//   2        = --once 单轮超时（默认 540 秒），接着跑 tba wait 即可
 //   3        = 用户在网页上手动收尾了，停
 fn run_wait_block(
     store: &Store,
     claim_id: &str,
     timeout: Option<u64>,
     interval: Option<u64>,
+    forever: bool,
 ) -> Result<(), String> {
     let cfg = store.load_config();
     // 命令行参数优先，没给就用配置里的（data/config.toml，GUI 设置页也能改）。
@@ -206,7 +208,7 @@ fn run_wait_block(
     let iv = interval
         .unwrap_or(cfg.wait_interval_secs)
         .max(crate::config::MIN_WAIT_INTERVAL_SECS);
-    match wait(store, claim_id, t, iv)? {
+    match wait(store, claim_id, t, iv, forever)? {
         WaitOutcome::Replied {
             claim: c,
             replies,
@@ -258,6 +260,30 @@ fn run_wait_block(
             }
             Ok(())
         }
+        WaitOutcome::Noted {
+            claim: c,
+            replies,
+            waited_secs,
+        } => {
+            // 执行中收到的用户原话。任务状态一个字没动，交给 agent 判断。
+            println!(
+                "常驻监听 {} 秒后，收到你在【执行中】发来的回复（任务「{}」状态未改动）。",
+                waited_secs, c.task_name
+            );
+            let num = replies
+                .iter()
+                .rev()
+                .find_map(|r| parse_reply_num(r))
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into());
+            println!("reply={num} action=noted");
+            println!("\n---- 你的回复 ----");
+            for r in &replies {
+                println!("{r}\n");
+            }
+            println!("已记进 `tba events`。处理完重新跑 `tba wait {}` 继续常驻监听。", c.claim_id);
+            Ok(())
+        }
         WaitOutcome::Timeout {
             claim: c,
             waited_secs,
@@ -274,7 +300,7 @@ fn run_wait_block(
             );
             println!(
                 "继续等就再跑一次: tba wait {}\n\
-                 （退出码 2 = 本轮超时，不是失败。别结束会话，重跑就行。）",
+                 （退出码 2 = --once 单轮到点，不是失败；常驻模式不会超时。）",
                 c.claim_id
             );
             // 退出码 2 = 超时（没回复/没收尾），agent 据此再等一轮。
@@ -1554,7 +1580,7 @@ pub fn run() -> Result<(), String> {
                     println!("\n---- 任务正文 ----\n{}", t.content);
                 }
             }
-            println!("\n接单完成。做完必须交回用户：tba ask {} --done（会就地阻塞等用户回数字，别结束会话）", c.claim_id);
+            println!("\n接单完成。做完必须交回用户：tba ask {} --done（后台常驻监听，收到回复自动唤起会话；本轮回复可正常结束）", c.claim_id);
             println!("自定义问题用: tba ask {} -q \"...\"  |  放弃用: tba release {}", c.claim_id, c.claim_id);
         }
         Cmd::Start {
@@ -1607,7 +1633,7 @@ pub fn run() -> Result<(), String> {
                 },
                 r.list_now
             );
-            println!("\n开工完成。做完必须交回用户：tba ask {} --done（会就地阻塞等用户回数字，别结束会话）", c.claim_id);
+            println!("\n开工完成。做完必须交回用户：tba ask {} --done（后台常驻监听，收到回复自动唤起会话）", c.claim_id);
             println!("自定义问题用: tba ask {} -q \"...\"  |  放弃用: tba release {}", c.claim_id, c.claim_id);
         }
         Cmd::Ask {
@@ -1650,14 +1676,26 @@ pub fn run() -> Result<(), String> {
                     c.claim_id
                 );
             } else {
-                // 默认就地等：问完立刻阻塞，agent 没有「问完忘了等」的中间态。
-                // 这是「会话不许断」的关键——只要 agent 跑了 ask，它就卡在这里。
-                println!(
-                    "\n开始等回复（单轮最长 {} 秒，每 {} 秒查一次）。用户回数字后这条命令返回，会话继续。\n\
-                     超时退出码 2 = 本轮没等到，改用 `tba wait {}` 接着等（别重跑 ask，会重复发邮件），别结束会话。",
-                    cfg.wait_timeout_secs, cfg.wait_interval_secs, c.claim_id
-                );
-                run_wait_block(&store, &c.claim_id, None, None)?;
+                // 默认后台常驻监听：问完立刻挂上，收到回复退出并唤醒会话。
+                // 开工时可能已经挂了一个常驻监听（它每轮刷 waits/<claim>.wait）。
+                // 再起第二个只会两个进程抢同一封邮件，所以这时 ask 只管写问题 + 发信，
+                // 等回复交给那个已经活着的监听。
+                let live = store.wait_age(&c.claim_id);
+                if live.map_or(false, |age| (0..30).contains(&age)) {
+                    println!(
+                        "\n已有常驻监听在跑（{} 秒前刷新）。本次只写问题 + 发信，不重复挂监听；\n\
+                         你的回复会由那个监听接住并唤起会话。",
+                        live.unwrap_or(0)
+                    );
+                } else {
+                    println!(
+                        "\n开始常驻监听（每 {} 秒查一次评论/邮件，不设单轮上限）。\n\
+                         收到你的回复才返回，会话随即被唤起；执行中发来的话也会先记进 `tba events`。\n\
+                         不会因为等太久自己退出；agent 本轮回复可以正常结束，别重跑 ask（会重复发邮件）。",
+                        cfg.wait_interval_secs
+                    );
+                    run_wait_block(&store, &c.claim_id, None, None, true)?;
+                }
             }
         }
         Cmd::Reply { claim_id } => {
@@ -1724,6 +1762,7 @@ pub fn run() -> Result<(), String> {
             claim_id,
             timeout,
             interval,
+            once,
             off,
         } => {
             // 直连模式没有「等 Teambition 回复」这回事，直接返回别让人干等。
@@ -1734,7 +1773,23 @@ pub fn run() -> Result<(), String> {
                 return Ok(());
             }
             let claim_id = claim_id.ok_or("要给 claim id：`tba wait <claim_id>`")?;
-            run_wait_block(&store, &claim_id, timeout, interval)?;
+            // 默认常驻；只有显式 --once 才保留「单轮到点退出码 2」的老行为。
+            run_wait_block(&store, &claim_id, timeout, interval, !once)?;
+        }
+        Cmd::Events { claim, limit } => {
+            let rows = crate::events::recent(
+                &store.root,
+                limit.unwrap_or(20),
+                claim.as_deref(),
+            );
+            if rows.is_empty() {
+                println!("还没有记录到执行中收到的回复。");
+            } else {
+                for e in &rows {
+                    println!("[{}] {} 来源={}\n  {}", &e.ts, &e.claim_id, &e.source, &e.text);
+                }
+                println!("\n共 {} 条。`tba events` 只列出，不改任务状态。", rows.len());
+            }
         }
         Cmd::Beat { claim_id } => {
             let c = beat(&store, &claim_id)?;
@@ -1771,7 +1826,7 @@ pub fn run() -> Result<(), String> {
                     println!("到「待回复」自动发信: {}", if cfg.mail_on_ask { "开" } else { "关" });
                     println!("能发信: {} / 能收信: {}", mail::can_send(&cfg), mail::can_receive(&cfg));
                     println!(
-                        "等待: 单轮最长 {} 秒 · 评论轮询 {} 秒 · 邮件轮询 {} 秒（GUI 设置页可改）",
+                        "等待: --once 单轮最长 {} 秒 · 评论轮询 {} 秒 · 邮件轮询 {} 秒（常驻模式不超时；GUI 设置页可改）",
                         cfg.wait_timeout_secs, cfg.wait_interval_secs, cfg.mail_poll_secs
                     );
                 }

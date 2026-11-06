@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="470" viewBox="0 0 1400 470" font-family="Microsoft YaHei, PingFang SC, Segoe UI, sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b6bd9"/>
+    </marker>
+    <style>
+      .bg { fill: #ffffff; }
+      .title { fill: #241a3d; font-size: 27px; font-weight: 700; }
+      .sub { fill: #6b5c8a; font-size: 15px; }
+      .tag { fill: #7a5bc0; font-size: 13px; font-weight: 600; }
+      .box { fill: #f3edff; stroke: #8b6bd9; stroke-width: 1.6; rx: 10; }
+      .dia { fill: #e9dfff; stroke: #8b6bd9; stroke-width: 1.6; }
+      .end { fill: #e5d5ff; stroke: #6f48c4; stroke-width: 2; }
+      .soft { fill: #fff8e8; stroke: #d9a441; stroke-width: 1.5; rx: 10; }
+      .t { fill: #2f2545; font-size: 15px; text-anchor: middle; }
+      .tb { fill: #2f2545; font-size: 15px; font-weight: 700; text-anchor: middle; }
+      .ts { fill: #5f537a; font-size: 13px; text-anchor: middle; }
+      .ln { stroke: #8b6bd9; stroke-width: 1.8; fill: none; marker-end: url(#ar); }
+      .lbl { fill: #7a5bc0; font-size: 13px; font-weight: 600; }
+      .foot { fill: #6b5c8a; font-size: 13px; text-anchor: start; }
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1400" height="470"/>
+  <text class="title" x="40" y="48">② 开工自举 · 第二次会话</text>
+  <text class="sub" x="40" y="78">不带参数跑 tba，由它按当前工作区自己分支：有绑定就领任务，没绑定只列候选项目名。</text>
+  <text class="tag" x="40" y="106">入口指令：开工</text>
+
+  <!-- 没绑定分支 -->
+  <rect class="box" x="180" y="105" width="205" height="60"/>
+  <text class="t" x="282" y="130">本地列候选项目名</text>
+  <text class="ts" x="282" y="151">原样交用户拍板，不许自己起名</text>
+  <rect class="box" x="405" y="105" width="265" height="60"/>
+  <text class="t" x="537" y="130" style="font-size:13px">tba create --name &lt;名字&gt; --go</text>
+  <text class="ts" x="537" y="151">建完把项目链接原样转给用户</text>
+  <path class="ln" d="M 385 135 L 403 135"/>
+  <path class="ln" d="M 300 180 L 300 167"/>
+  <text class="lbl" x="252" y="176">否</text>
+  <path class="ln" d="M 532 165 L 532 204"/>
+
+  <!-- 主干 -->
+  <rect class="box" x="40" y="208" width="165" height="84"/>
+  <text class="tb" x="122" y="238">tba</text>
+  <text class="ts" x="122" y="260">（不带参数）</text>
+  <text class="ts" x="122" y="279">或 tba go</text>
+  <path class="ln" d="M 205 250 L 208 250"/>
+
+  <polygon class="dia" points="208,250 300,180 392,250 300,320"/>
+  <text class="t" x="300" y="240">有 .tba/project</text>
+  <text class="t" x="300" y="260">且项目还在？</text>
+  <path class="ln" d="M 392 250 L 428 250"/>
+  <text class="lbl" x="398" y="240">是</text>
+
+  <rect class="box" x="430" y="208" width="205" height="84"/>
+  <text class="tb" x="532" y="236">ensure_tasklists</text>
+  <text class="ts" x="532" y="258">只建缺的 1~5 数字列</text>
+  <text class="ts" x="532" y="278">已有列绝不删改</text>
+  <path class="ln" d="M 635 250 L 658 250"/>
+
+  <polygon class="dia" points="658,250 720,185 782,250 720,315"/>
+  <text class="t" x="720" y="247">补齐</text>
+  <text class="t" x="720" y="267">成功？</text>
+  <path class="ln" d="M 782 250 L 828 250"/>
+  <text class="lbl" x="788" y="240">是</text>
+  <path class="ln" d="M 720 315 L 720 340"/>
+  <text class="lbl" x="728" y="332">否</text>
+  <rect class="soft" x="560" y="342" width="360" height="64"/>
+  <text class="t" x="740" y="368">打印项目链接 + 手动补列兜底</text>
+  <text class="ts" x="740" y="390">降级不阻断领任务；下次 go 会自动再试</text>
+
+  <rect class="box" x="830" y="208" width="225" height="84"/>
+  <text class="tb" x="942" y="236">claim 领最早「未完成」</text>
+  <text class="ts" x="942" y="258">状态 → 进行中 · 列 1 → 2</text>
+  <text class="ts" x="942" y="278">输出 claim_id / EMPTY</text>
+  <path class="ln" d="M 1055 250 L 1078 250"/>
+
+  <rect class="box" x="1080" y="208" width="170" height="84"/>
+  <text class="tb" x="1165" y="238">按 skill 干活</text>
+  <text class="ts" x="1165" y="262">进入 ③ 任务闭环</text>
+  <path class="ln" d="M 1250 250 L 1276 250"/>
+
+  <rect class="end" x="1278" y="220" width="82" height="60" rx="30"/>
+  <text class="tb" x="1319" y="257">③</text>
+
+  <text class="foot" x="40" y="446">看板列：1 队列 / 2 进行中 / 3 待回复 / 4 已解决 / 5 已完成（作废）。列名可在 data/config.toml 覆盖。</text>
+</svg>

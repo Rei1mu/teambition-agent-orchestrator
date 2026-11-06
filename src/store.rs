@@ -28,6 +28,10 @@ pub struct Claim {
     pub updated_at: String,
     #[serde(default)]
     pub note: String,
+    // 本次任务最后一次「改了什么/怎么验」的正文。tba note 写入，ask 发邮件只带这一段，
+    // 不带累积的整条任务备注。
+    #[serde(default)]
+    pub last_note: String,
     // 最后一次心跳时间（rfc3339）。running 状态下超过阈值未更新即判定会话断开。
     #[serde(default)]
     pub heartbeat_at: String,

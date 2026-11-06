@@ -10,12 +10,17 @@
 // 只支持最主流的两种发信口：465（隐式 TLS）和 587/25（STARTTLS）。
 use crate::config::Config;
 use native_tls::TlsConnector;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
+// wait 的主循环里同步跑 IMAP，一次连不上会把评论轮询一起拖住（QQ 邮箱偶发
+// os error 10060）。超时给太长，用户回一句要等半分钟才有反应，所以按「快失败、
+// 下一轮再来」设短；正常往返几百毫秒，够用。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const IO_TIMEOUT: Duration = Duration::from_secs(8);
 
 // Read + Write 的组合 trait，方便统一持有「明文 socket」和「TLS socket」。
 trait Stream: Read + Write {}
@@ -404,8 +409,157 @@ pub fn recent(cfg: &Config, limit: usize) -> Result<Vec<MailRow>, String> {
     Ok(out)
 }
 
-// 从信箱里捞「主题或正文含 marker」的未读邮件，返回正文纯文本，并标记已读。
+// 一轮最多新抓多少封。正常情况下水位过滤后只剩 0~1 封；留个上限防意外。
+const MAX_FETCH_PER_POLL: usize = 40;
+
+// ---- 提问水位：只抓「发完提问信之后新到的」未读信 ----
+//
+// IMAP UID 单调递增，新邮件的 UID 一定 >= SELECT 返回的 UIDNEXT。ask 时把这个值
+// 记到 data/mail/<claim_id>.uid；常驻监听每轮 `UID SEARCH UNSEEN` 后**在本地**
+// 过滤掉低于水位的 UID，再 FETCH 正文。信箱里堆的 70 多封历史未读广告一次都不下。
+//
+// 为什么不在服务端写 `UID SEARCH UNSEEN <n>:*`：实测 QQ 邮箱不认这个 UID 范围，
+// 传 19564:* 照样把 15974 开头的老未读全吐回来。SEARCH 只回一行数字、很便宜，
+// 贵的是 FETCH 全文，所以本地过滤既够用又不挑服务商。
+#[derive(Clone, Debug)]
+pub struct Watermark {
+    pub uidvalidity: String,
+    pub uidnext: u64,
+}
+
+fn watermark_path(root: &Path, claim_id: &str) -> PathBuf {
+    root.join("mail").join(format!("{claim_id}.uid"))
+}
+
+pub fn save_watermark(root: &Path, claim_id: &str, wm: &Watermark) {
+    let p = watermark_path(root, claim_id);
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(p, format!("{}\n{}\n", wm.uidvalidity, wm.uidnext));
+}
+
+pub fn load_watermark(root: &Path, claim_id: &str) -> Option<Watermark> {
+    let s = std::fs::read_to_string(watermark_path(root, claim_id)).ok()?;
+    let mut lines = s.lines();
+    let uidvalidity = lines.next()?.trim().to_string();
+    let uidnext = lines.next()?.trim().parse::<u64>().ok()?;
+    (uidnext > 0).then_some(Watermark {
+        uidvalidity,
+        uidnext,
+    })
+}
+
+/// 从 IMAP 响应里取 `[KEY value]` 的 value。
+/// 例：`* OK [UIDNEXT 19570] Predicted next UID` -> "19570"。
+fn bracket_value(resp: &str, key: &str) -> Option<String> {
+    let line = resp.lines().find(|l| l.contains(key))?;
+    let rest = line.split(key).nth(1)?;
+    Some(rest.split(']').next()?.trim().to_string())
+}
+
+/// 提问时刻的邮箱水位。SELECT 的 OK 行带 UIDVALIDITY / UIDNEXT。
+pub fn uid_watermark(cfg: &Config) -> Result<Watermark, String> {
+    let host = cfg.imap_host.trim();
+    if host.is_empty() {
+        return Err("没配 IMAP 服务器".to_string());
+    }
+    let stream = connect(host, cfg.imap_port, true)?;
+    let mut s = BufReader::new(stream);
+    expect_ok(&mut s, "*")?;
+    imap_cmd(
+        &mut s,
+        "a1",
+        &format!("LOGIN {} {}", quote(cfg.smtp_user.trim()), quote(&cfg.smtp_pass)),
+    )?;
+    let select = imap_cmd(&mut s, "a2", "SELECT INBOX")?;
+    let _ = imap_cmd(&mut s, "z9", "LOGOUT");
+    Ok(Watermark {
+        uidvalidity: bracket_value(&select, "UIDVALIDITY").unwrap_or_else(|| "-".to_string()),
+        uidnext: bracket_value(&select, "UIDNEXT")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    })
+}
+
+/// 常驻监听的扫描状态：水位 + 哪些 UID 已经 FETCH 过。
+///
+/// 水位由 ask 落盘，跨进程有效——监听因收到回复退出、会话唤起后重挂，仍只抓
+/// 「这次提问之后新到的信」。scanned 只在进程内有效，作为第二层去重。
+#[derive(Default)]
+pub struct MailScan {
+    uidvalidity: Option<String>,
+    scanned: HashSet<String>,
+    watermark: Option<Watermark>,
+}
+
+impl MailScan {
+    pub fn with_watermark(wm: Option<Watermark>) -> Self {
+        MailScan {
+            watermark: wm,
+            ..Default::default()
+        }
+    }
+
+    /// 每轮开始校验 UIDVALIDITY，返回本轮的 UID 下界（0 = 不过滤）。
+    fn begin_round(&mut self, validity: &str) -> u64 {
+        if self
+            .uidvalidity
+            .as_deref()
+            .is_some_and(|v| v != validity)
+        {
+            // 邮箱被重建、UID 从头编号：旧水位会把新信全过滤掉，必须作废。
+            self.watermark = None;
+            self.scanned.clear();
+        }
+        self.uidvalidity = Some(validity.to_string());
+        match self.watermark.as_ref() {
+            Some(w) if w.uidvalidity == validity || w.uidvalidity == "-" => w.uidnext,
+            _ => 0,
+        }
+    }
+}
+
+/// 本地按水位过滤（不依赖服务端支持 UID 范围 SEARCH）。
+fn only_after_watermark(uids: &[String], min_uid: u64) -> Vec<String> {
+    uids.iter()
+        .filter(|u| match u.parse::<u64>() {
+            Ok(n) => n >= min_uid,
+            Err(_) => true, // 解析不了就别擅自丢
+        })
+        .cloned()
+        .collect()
+}
+
+/// 挑出本轮要抓的新 UID，并先记进 scanned（抓失败会摘掉、下一轮重试）。
+fn take_new_uids(uids: &[String], scan: &mut MailScan) -> Vec<String> {
+    let mut out = Vec::new();
+    for u in uids {
+        if scan.scanned.contains(u) {
+            continue;
+        }
+        if out.len() >= MAX_FETCH_PER_POLL {
+            break;
+        }
+        out.push(u.clone());
+        scan.scanned.insert(u.clone());
+    }
+    out
+}
+
+/// 一次性扫描（诊断 / `mail check` 用）：不带水位、不带跨轮状态，看全信箱。
 pub fn fetch_replies(cfg: &Config, marker: &str) -> Result<Vec<String>, String> {
+    let mut scan = MailScan::default();
+    fetch_replies_since(cfg, marker, &mut scan)
+}
+
+/// 从信箱里捞「主题或正文含 marker」的未读邮件，返回正文纯文本，并标记已读。
+/// `scan` 由常驻监听跨轮持有：先按提问水位过滤，再按已扫 UID 去重。
+pub fn fetch_replies_since(
+    cfg: &Config,
+    marker: &str,
+    scan: &mut MailScan,
+) -> Result<Vec<String>, String> {
     let host = cfg.imap_host.trim();
     if host.is_empty() {
         return Err("没配 IMAP 服务器（收邮件必需，SMTP 收不到回信）".to_string());
@@ -415,7 +569,9 @@ pub fn fetch_replies(cfg: &Config, marker: &str) -> Result<Vec<String>, String> 
     expect_ok(&mut s, "*")?; // 问候语
 
     imap_cmd(&mut s, "a1", &format!("LOGIN {} {}", quote(cfg.smtp_user.trim()), quote(&cfg.smtp_pass)))?;
-    imap_cmd(&mut s, "a2", "SELECT INBOX")?;
+    let select = imap_cmd(&mut s, "a2", "SELECT INBOX")?;
+    let validity = bracket_value(&select, "UIDVALIDITY").unwrap_or_else(|| "-".to_string());
+    let min_uid = scan.begin_round(&validity);
 
     let search = imap_cmd(&mut s, "a3", "UID SEARCH UNSEEN")?;
     let uids: Vec<String> = search
@@ -428,12 +584,24 @@ pub fn fetch_replies(cfg: &Config, marker: &str) -> Result<Vec<String>, String> 
                 .collect()
         })
         .unwrap_or_default();
+    let candidates = only_after_watermark(&uids, min_uid);
+    let batch = take_new_uids(&candidates, scan);
 
     let mut out = Vec::new();
-    for (i, uid) in uids.iter().enumerate() {
-        let raw = imap_fetch(&mut s, &format!("b{}", i + 1), uid)?;
+    // 信箱里没新信时连 FETCH 都不发，一轮就是 connect + LOGIN + SEARCH。
+    for (i, uid) in batch.iter().enumerate() {
+        let raw = match imap_fetch(&mut s, &format!("b{}", i + 1), uid) {
+            Ok(r) => r,
+            Err(e) => {
+                // 这一封可能正是用户的回信：网络抖一下不能把它永久跳过。
+                // 从去重表里摘掉，下一轮重试；其余已成功的不用重来。
+                scan.scanned.remove(uid);
+                eprintln!("IMAP 取信 {uid} 失败（下一轮重试）: {e}");
+                continue;
+            }
+        };
         let (subject, body) = parse_message(&raw);
-        if subject.contains(marker) || body.contains(marker) {
+        if marker_hit(&subject, marker) || marker_hit(&body, marker) {
             out.push(clean_reply(&body, marker));
             let _ = imap_cmd(
                 &mut s,
@@ -533,12 +701,30 @@ fn imap_fetch(s: &mut BufReader<Box<dyn Stream>>, tag: &str, uid: &str) -> Resul
     }
 }
 
+// marker 匹配：先精确，再退一步忽略全部空白。
+//
+// 为什么必须容错：通知邮件主题里带 `[TB clm-xxx-0]`，邮件客户端回复时会把长主题
+// 按显示宽度折行 / 重新编码成多段 RFC2047，插进空格甚至换行，实测 QQ 邮箱把
+// `[TB clm-18e572b5cd938980-0]` 变成 `[TB clm-18e572b5cd938 980-0]`、
+// 「需要你回复：发邮件…」变成「需要你回复：发 邮件…」。
+// fetch_replies 用完整 claim_id 做精确 contains，一断就永远匹配不上，
+// 邮件回复全被静默丢在 INBOX，wait 只能等 Teambition 评论 —— 表现就是
+// 「后台任务没监听到邮件，也没有重新唤起」。
+fn marker_hit(text: &str, marker: &str) -> bool {
+    if text.contains(marker) {
+        return true;
+    }
+    let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    let needle = compact(marker);
+    !needle.is_empty() && compact(text).contains(&needle)
+}
+
 // 把回信正文清理成用户新增的话：去掉 marker 行，再剥掉引用/转发/任务备注。
 // 剥离规则与评论通道共用，见 ops::strip_reply_noise。
 fn clean_reply(body: &str, marker: &str) -> String {
     let kept: Vec<&str> = body
         .lines()
-        .filter(|l| !l.contains(marker) && !l.trim().is_empty())
+        .filter(|l| !marker_hit(l, marker) && !l.trim().is_empty())
         .collect();
     crate::ops::strip_reply_noise(&kept.join("\n"))
 }
@@ -565,7 +751,10 @@ pub fn parse_message(raw: &str) -> (String, String) {
     let text = if ctype.contains("text/html") || text.trim_start().starts_with('<') {
         strip_html(&text)
     } else {
-        text
+        // 纯文本 part 也会混进 HTML 实体：实测 QQ 邮箱回复里出现
+        // 「会话 &nbsp; &nbsp;回复消息」。只还原实体、不剥标签——
+        // 正文里的 <claim_id>、代码块是内容，不能当 HTML 吃掉。
+        decode_entities(&text)
     };
     (subject, text)
 }
@@ -694,14 +883,19 @@ pub fn strip_html(s: &str) -> String {
             }
         }
     }
-    // 顺带把 &nbsp; 之类最常见的实体还原，够用即可。
-    out.replace("&nbsp;", " ")
+    decode_entities(&out).trim().to_string()
+}
+
+// 只还原最常见的几个命名实体，够用即可。
+// &nbsp; 放在 &amp; 前面是故意的：这样 "&amp;nbsp;" 解出来还是字面的 "&nbsp;"，
+// 不会被二次解码成空格。
+fn decode_entities(s: &str) -> String {
+    s.replace("&nbsp;", " ")
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
-        .trim()
-        .to_string()
+        .replace("&#39;", "'")
 }
 
 // RFC2047：=?UTF-8?B?xxx?= 或 =?UTF-8?Q?xxx?=
@@ -712,21 +906,31 @@ pub fn strip_html(s: &str) -> String {
 pub fn decode_rfc2047(s: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
+    // 上一段是不是刚解出来的 encoded-word。RFC 2047 规定：相邻两个
+    // encoded-word 之间的线性空白在显示时要忽略。长主题会被邮件客户端拆成
+    // 多段 base64 再折行，header() 折行时又补了一个 ' '，这个空格正好落在
+    // "[TB clm-xxx-0]" 中间，把 marker 切成 "[TB clm-xxx -0]"。
+    // fetch_replies 拿完整 marker 做精确匹配就永远命中不了，邮件回信全被漏掉。
+    let mut just_decoded = false;
     while let Some(start) = rest.find("=?") {
-        out.push_str(&rest[..start]);
+        let gap = &rest[..start];
         let after = &rest[start + 2..];
         let (Some(q1), Some(q2)) = (after.find('?'), after.find('?').and_then(|i| {
             after[i + 1..].find('?').map(|j| i + 1 + j)
         })) else {
-            out.push_str(&rest[start..]);
+            // 不是合法 encoded-word：原样吐出剩余全部（含刚没写出去的 gap）。
+            out.push_str(rest);
             return out;
         };
         let enc = after[q1 + 1..q2].to_uppercase();
         let payload_start = q2 + 1;
         let Some(end_rel) = after[payload_start..].find("?=") else {
-            out.push_str(&rest[start..]);
+            out.push_str(rest);
             return out;
         };
+        if !(just_decoded && gap.chars().all(|c| c.is_whitespace())) {
+            out.push_str(gap);
+        }
         let payload = &after[payload_start..payload_start + end_rel];
         let bytes = if enc == "B" {
             b64_decode(payload)
@@ -734,6 +938,7 @@ pub fn decode_rfc2047(s: &str) -> String {
             qp_decode(&payload.replace('_', " "))
         };
         out.push_str(&String::from_utf8_lossy(&bytes));
+        just_decoded = true;
         rest = &after[payload_start + end_rel + 2..];
     }
     out.push_str(rest);
@@ -862,6 +1067,62 @@ mod tests {
         assert_eq!(decode_rfc2047("Re: =?UTF-8?B?5Lit5paH?= 好"), "Re: 中文 好");
     }
 
+    // 复现 2026-11-06 的线上问题：QQ 邮箱把长主题拆成多段 RFC2047 再折行，
+    // 段间空白被当正文留下来，marker 被切成 "[TB clm-...938 980-0]"。
+    // RFC 2047 规定相邻 encoded-word 之间的线性空白在显示时必须忽略。
+    #[test]
+    fn rfc2047_ignores_whitespace_between_adjacent_encoded_words() {
+        let a = b64_encode(b"[TB clm-18e572b5cd938");
+        let b = b64_encode(b"980-0]");
+        let folded = format!("=?UTF-8?B?{a}?= =?UTF-8?B?{b}?=");
+        assert_eq!(decode_rfc2047(&folded), "[TB clm-18e572b5cd938980-0]");
+        // 折行带 CRLF + 前导空格也一样。
+        let folded = format!("=?UTF-8?B?{a}?=\r\n  =?UTF-8?B?{b}?=");
+        assert_eq!(decode_rfc2047(&folded), "[TB clm-18e572b5cd938980-0]");
+        // 普通文本里的空格不能吞掉。
+        assert_eq!(decode_rfc2047("Re: =?UTF-8?B?5Lit5paH?= 好"), "Re: 中文 好");
+    }
+
+    #[test]
+    fn marker_hit_survives_folded_subject() {
+        let marker = "[TB clm-18e572b5cd938980-0]";
+        let subject = "回复：[TB clm-18e572b5cd938 980-0] 需要你回复：发 邮件的内容不对，应该 是这次的处理内容，不 是总的";
+        assert!(marker_hit(subject, marker), "折行插空格的主题必须认出来");
+        assert!(marker_hit("回复：[TB clm-18e572b5cd938980-0]", marker));
+        assert!(
+            !marker_hit("ExileCon 2026 Is Arriving Soon!", marker),
+            "无关邮件不能被容错匹配捞进来"
+        );
+        assert!(marker_hit("回复：[TB x]", "[TB"), "mail check 用的短 marker 仍生效");
+    }
+
+    #[test]
+    fn folded_marker_reply_still_yields_digit() {
+        let marker = "[TB clm-18e572b5cd938980-0]";
+        let body = "[TB clm-18e572b5cd938 980-0] 收到\n2\nRR\n1729128196@qq.com\n\n> 引用原文";
+        assert_eq!(clean_reply(body, marker), "2\nRR\n1729128196@qq.com");
+        assert_eq!(
+            crate::ops::parse_reply_num(&clean_reply(body, marker)),
+            Some(2),
+            "签名里的长数字不能盖掉用户回的 2"
+        );
+    }
+
+    // 用户回的是一句自然语言（没数字）时，wait 也要把它写成评论唤醒 agent，
+    // 原文不能被丢、不能被签名的长数字误判成某个选项。
+    #[test]
+    fn free_text_mail_reply_keeps_the_whole_message() {
+        let marker = "[TB clm-18e572b5cd938980-0]";
+        let body = "[TB clm-18e572b5cd938980-0] 收到\n\
+                    邮件回复后反应很慢？能不能缩短？反应快一点\n\
+                    RR\n1729128196@qq.com";
+        let cleaned = clean_reply(body, marker);
+        assert!(crate::ops::parse_reply_num(&cleaned).is_none(), "纯文字不该被当成数字选项");
+        let (action, text) = crate::ops::parse_reply(&format!("（邮件回复）\n\n{cleaned}"));
+        assert_eq!(action, crate::ops::ReplyAction::Free);
+        assert!(text.contains("反应快一点"), "用户原话要原样带出来: {text}");
+    }
+
     #[test]
     fn parses_plain_reply_with_marker() {
         let raw = "Subject: Re: [TB clm-1-0] 需要你确认\r\n\
@@ -890,6 +1151,35 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_part_decodes_entities_but_keeps_angle_brackets() {
+        // 实测：QQ 邮箱回复里出现「会话 &nbsp; &nbsp;回复消息」，实体写在 text/plain 段。
+        // 修之前只有 text/html 分支会解码，纯文本里的 &nbsp; 原样混进用户回话。
+        let raw = "Subject: hi\r\n\
+                   Content-Type: multipart/alternative; boundary=\"BND\"\r\n\r\n\
+                   --BND\r\n\
+                   Content-Type: text/plain; charset=UTF-8\r\n\r\n\
+                   如果后台能唤起会话&nbsp; &nbsp;回复消息？详见 <claim_id>\r\n\
+                   --BND\r\n\
+                   Content-Type: text/html; charset=UTF-8\r\n\r\n\
+                   <p>HTML 回复</p>\r\n\
+                   --BND--\r\n";
+        let (_, text) = parse_message(raw);
+        assert!(!text.contains("&nbsp;"), "实体要还原成空格: {text}");
+        assert!(
+            text.contains("如果后台能唤起会话") && text.contains("回复消息？详见"),
+            "原话不能丢: {text}"
+        );
+        assert!(text.contains("<claim_id>"), "纯文本里的尖括号是内容，不能当标签吃掉: {text}");
+    }
+
+    #[test]
+    fn entities_are_not_double_decoded() {
+        // &amp;nbsp; 应该还原成字面 &nbsp;，而不是被二次解码成空格。
+        assert_eq!(decode_entities("a&amp;nbsp;b"), "a&nbsp;b");
+        assert_eq!(decode_entities("a&nbsp;b"), "a b");
+    }
+
+    #[test]
     fn html_body_is_stripped() {
         let raw = "Subject: x\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n\
                    <div>答复：<b>同意</b></div>";
@@ -904,6 +1194,88 @@ mod tests {
         let body = "[TB clm-1-0] 收到\n可以，按方案二做\n\n> 之前的问题\n> 更多引用";
         let got = clean_reply(body, "[TB clm-1-0]");
         assert_eq!(got, "可以，按方案二做");
+    }
+
+    // 信箱里 73 封无关未读信时，不能每 5 秒全量重下。分批 + 去重后，
+    // 第一轮抓 40 封，第二轮抓剩下 33 封，第三轮起只抓真正的新信。
+    #[test]
+    fn uid_scan_dedups_and_caps_each_poll() {
+        let all: Vec<String> = (1..=73).map(|i| i.to_string()).collect();
+        let mut scan = MailScan::default();
+        assert_eq!(scan.begin_round("v1"), 0);
+        let first = take_new_uids(&all, &mut scan);
+        assert_eq!(first.len(), 40);
+        let second = take_new_uids(&all, &mut scan);
+        assert_eq!(second.len(), 33);
+        assert!(take_new_uids(&all, &mut scan).is_empty(), "老 UID 不该再抓");
+
+        // 新到一封：只返回这一封。
+        let mut with_new = all.clone();
+        with_new.push("74".into());
+        assert_eq!(take_new_uids(&with_new, &mut scan), vec!["74"]);
+
+        // UIDVALIDITY 变了 = 邮箱重建，去重表必须清空。
+        assert_eq!(scan.begin_round("v2"), 0);
+        assert_eq!(take_new_uids(&all, &mut scan).len(), 40);
+    }
+
+    // 用户提的「只找发完提问信之后的未读邮件」：历史未读广告一封都不该 FETCH。
+    #[test]
+    fn watermark_filters_out_historical_unread() {
+        let uids: Vec<String> = (15974..=15990)
+            .chain([19569, 19570, 19571])
+            .map(|n| n.to_string())
+            .collect();
+        assert_eq!(
+            only_after_watermark(&uids, 19570),
+            vec!["19570", "19571"],
+            "水位之前的未读信必须全部挡掉"
+        );
+        assert_eq!(
+            only_after_watermark(&uids, 0).len(),
+            uids.len(),
+            "没有水位时退回全量"
+        );
+    }
+
+    // 邮箱重建后 UID 从头编号，旧水位会把新信全过滤掉，必须自动作废。
+    #[test]
+    fn stale_watermark_is_dropped_when_uidvalidity_changes() {
+        let mut scan = MailScan::with_watermark(Some(Watermark {
+            uidvalidity: "old".into(),
+            uidnext: 19570,
+        }));
+        assert_eq!(scan.begin_round("old"), 19570);
+        assert_eq!(scan.begin_round("new"), 0, "UIDVALIDITY 变了必须退回全扫");
+    }
+
+    #[test]
+    fn watermark_roundtrips_through_file() {
+        let dir = std::env::temp_dir().join(format!("tba-wm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        save_watermark(
+            &dir,
+            "clm-test",
+            &Watermark {
+                uidvalidity: "1763356823".into(),
+                uidnext: 19570,
+            },
+        );
+        let wm = load_watermark(&dir, "clm-test").expect("水位要能读回来");
+        assert_eq!(wm.uidvalidity, "1763356823");
+        assert_eq!(wm.uidnext, 19570);
+        assert!(load_watermark(&dir, "clm-other").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_value_reads_uidnext_and_uidvalidity() {
+        let resp = "* OK [UNSEEN 73]\r\n\
+                    * OK [UIDVALIDITY 1763356823] UID validity status\r\n\
+                    * OK [UIDNEXT 19570] Predicted next UID\r\n\
+                    a2 OK [READ-WRITE] SELECT completed\r\n";
+        assert_eq!(bracket_value(resp, "UIDNEXT").as_deref(), Some("19570"));
+        assert_eq!(bracket_value(resp, "UIDVALIDITY").as_deref(), Some("1763356823"));
     }
 
     #[test]

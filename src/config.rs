@@ -114,11 +114,14 @@ pub const PROJECT_URL_PREFIX: &str = "https://www.teambition.com/project/";
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 300;
 
 // tb wait 的默认参数：单轮 540 秒（Bash 工具上限 600 秒，留 60 秒余量让它主动返回，
-// 避免被 auto-background 后 agent 拿不到结果），每 15 秒查一次。
+// 避免被 auto-background 后 agent 拿不到结果），每 5 秒查一次评论。
 pub const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 540;
-pub const DEFAULT_WAIT_INTERVAL_SECS: u64 = 15;
-// 邮件轮询默认比评论慢：IMAP 一次往返（登录 + SEARCH + FETCH）比读一条评论贵得多。
-pub const DEFAULT_MAIL_POLL_SECS: u64 = 20;
+pub const DEFAULT_WAIT_INTERVAL_SECS: u64 = 5;
+// 邮件轮询：fetch_replies_since 会跨轮记住扫过的 UID，稳态一轮只有
+// connect + LOGIN + SEARCH（约 0.4 秒），不再重复下载全部未读信。所以直接贴着
+// 下限 5 秒跑；只有信箱里积压大量未读信时，前几轮才会分批多花几秒。
+// IMAP 是同步阻塞的，一轮卡住会连评论轮询一起拖住，别再往上调。
+pub const DEFAULT_MAIL_POLL_SECS: u64 = 5;
 
 // 下限。配置文件是手改的，GUI 也允许输入任意数字，写成 0 或 3 会把轮询变成忙等，
 // 一路把 Teambition 接口和邮箱服务器打到限流。生效前统一夹一次。
@@ -243,14 +246,15 @@ pub struct Config {
     pub imap_port: u16,
     // ---- 等待与轮询（都在「待回复」这一段里生效）----
     //
-    // 单轮最长等多久。到点返回退出码 2，agent 重跑同一条接着等。
-    // 上限受宿主工具约束：Bash 工具 600 秒会转后台，所以默认 540 留 60 秒余量。
+    // 仅 --once 老路径的单轮最长等待；到点返回退出码 2，再跑 tba wait 接着等。
+    // 默认常驻监听（forever）不读这个值，不会因超时退出。
+    // 540 是历史值，来自 Bash 工具 600 秒上限留的余量。
     #[serde(default = "default_wait_timeout")]
     pub wait_timeout_secs: u64,
     // 多久查一次任务评论。太小会让 Teambition API 压力大，太大回复延迟高。
     #[serde(default = "default_wait_interval")]
     pub wait_interval_secs: u64,
-    // 多久查一次邮箱（IMAP 一次往返比读评论贵，所以默认比评论间隔长）。
+    // 多久查一次邮箱。扫过的 UID 跨轮去重，稳态一轮很便宜，默认与评论同频。
     #[serde(default = "default_mail_poll")]
     pub mail_poll_secs: u64,
 
