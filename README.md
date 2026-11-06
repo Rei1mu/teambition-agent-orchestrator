@@ -1,6 +1,6 @@
 # TBA
 
-![version](https://img.shields.io/badge/version-0.2.30-blue) ![platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20arm64-lightgrey) ![license](https://img.shields.io/badge/license-Apache--2.0-green) ![rust](https://img.shields.io/badge/rust-2021-orange)
+![version](https://img.shields.io/badge/version-0.2.31-blue) ![platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20arm64-lightgrey) ![license](https://img.shields.io/badge/license-Apache--2.0-green) ![rust](https://img.shields.io/badge/rust-2021-orange)
 
 **Teambition Agent Orchestrator** —— 让 AI agent 在 Teambition 上排队领任务、把过程写进任务备注，交回后由**后台常驻监听**等你在邮件 / 评论 / 会话窗回复，回复一到自动唤起会话继续，不用前台干等 10 分钟。
 
@@ -37,6 +37,7 @@
 - **后台常驻监听**：`tba ask` 交回后挂后台，agent 本轮回复可以正常结束；评论 / 邮件轮询都是 5 秒，收到回复由任务通知唤起会话。
 - **三路入站**：邮件回复、Teambition 评论、会话窗直接输入，任意一路都能继续；执行中收到的回复也会落盘留痕，不丢。
 - **只抓新信**：按提问时刻的 IMAP `UIDNEXT` 水位过滤，历史未读信一封都不下载，实测端到端从 31~41 秒降到秒级。
+- **手机端看得见待回复内容**：Teambition 手机端不渲染内置备注，`ask` 会把与邮件逐字相同的正文同步写进任务文本字段「待回复」；收到回复或收尾自动清空。
 - **离线直连 / 共享记忆 / skill 库 / MCP / 打包发版**：不需要 Teambition 时也能用 `tba go -off` 只在本机跑。
 
 ---
@@ -88,7 +89,7 @@ tba
 irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/install.ps1 | iex
 ```
 
-脚本下载最新 Release → 静默安装 → 合并写 `~/.workbuddy-ai/mcp.json`（只动 `mcpServers.tba`，不删 `data/`、不覆盖别的 server）。固定版本：先设 `$env:TBA_VERSION = 'v0.2.30'`。脚本写 exe 绝对路径，不依赖 PATH 刷新。
+脚本下载最新 Release → 静默安装 → 合并写 `~/.workbuddy-ai/mcp.json`（只动 `mcpServers.tba`，不删 `data/`、不覆盖别的 server）。固定版本：先设 `$env:TBA_VERSION = 'v0.2.31'`。脚本写 exe 绝对路径，不依赖 PATH 刷新。
 
 ### 从源码构建
 
@@ -175,6 +176,7 @@ MSVC 工具链要求与本机构建约定见 [docs/REFERENCE.md](docs/REFERENCE.
      ├─ 交回：tba ask <claim> --done
      │        写备注 · 状态「待回复」· 列 3
      │        ask 前记 IMAP 水位（UIDNEXT）· 发通知邮件（只带本次处理内容）
+     │        同一份正文同步写入文本字段「待回复」（手机端可见）
      └─ 自动挂上后台常驻监听 → 本轮回复可以正常结束
         （别重跑 ask，会重复发信；不许 --no-wait）
 
@@ -242,6 +244,24 @@ flowchart TD
 | Teambition 评论 | 由后台监听 5 秒轮询 | 评论专属用户，agent 只写任务备注 |
 | 会话窗直接输入 | 平台直接唤醒会话，不经过 tba | 先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活 |
 
+### 手机端「待回复」字段（每个项目配置一次）
+
+Teambition 手机端任务详情不渲染内置备注 `note`，所以本轮待回复内容另存一份到文本自定义字段「待回复」。`tba ask` 写入与通知邮件**逐字相同**的正文，`tba resume` / 收尾时清空。字段按名称定位，不存在就跳过并打一行警告——邮件和任务备注始终是主通道，字段不会成为单点故障。
+
+字段需要人工建一次并绑到任务类型（**只建不绑，任务详情里不会出现**）。在目标项目里执行：
+
+```bash
+# 1. 先看有没有；result 为 [] 才建（也可在网页端项目设置里新建「文本」字段）
+tba raw teambition.project.customfield-query --args '{"projectId":"<项目ID>","name":"待回复"}'
+tba raw teambition.project.customfield-create --args '{"projectId":"<项目ID>","name":"待回复","type":"text"}'  # 记下返回的 id
+
+# 2. 绑到默认任务类型（sfcId 用 sfc-query 取 type=default 的那条 id）
+tba raw teambition.project.sfc-query --args '{"projectId":"<项目ID>"}'
+tba raw teambition.project.sfc-field-upsert --args '{"projectId":"<项目ID>","sfcId":"<任务类型ID>","customfieldId":"<字段ID>"}'
+```
+
+`text` 字段实测写 4000 字完整回读、不截断；不要用 `customfield-rtf-update`，它会把正文截断到 100 字。
+
 **红线（给 agent）**
 
 - 做完必须 `tba ask --done`，然后让它转后台常驻监听；**不许 `--no-wait`**。
@@ -265,7 +285,7 @@ flowchart TD
 | 查看 | `tba status` · `tba inbox` · `tba show <链接>` · `tba doctor` | 台账 / 待回复 / 单任务 / 自检 |
 | 邮件 | `tba mail status` · `tba mail test` · `tba mail check` · `tba mail resend <claim>` | 配置 / 发测试信 / 收一次 / 重发通知 |
 | 收尾 | `tba done <claim>` · `tba close <claim>` · `tba release <claim> --reason "..."` | 已解决 / 作废 / 退回队列（**仅用户授权后**） |
-| 发版 | `tba publish --tag v0.2.30 --watch` | 打 tag → 推 → 等 CI → 列产物 |
+| 发版 | `tba publish --tag v0.2.31 --watch` | 打 tag → 推 → 等 CI → 列产物 |
 
 > `tba mail check` 是诊断命令：会全量扫未读并把命中的信标记为已读，平时别拿它当常驻链路用。
 
@@ -339,7 +359,7 @@ cargo build --release --offline --locked
 **发版**：`Cargo.toml` 改版本号 → 提交 → 打 `v*` tag 推上去，`.github/workflows/release.yml` 在 `windows-latest` 上构建 x64 + arm64，用 `installer/tba.iss` 出两个 setup.exe 并挂到 Release：
 
 ```powershell
-tba publish --tag v0.2.30 --watch
+tba publish --tag v0.2.31 --watch
 ```
 
 手动触发 workflow 只构建、不上传 Release。安装脚本默认取 `releases/latest`，所以其他设备一句话安装就能拿到这一版。

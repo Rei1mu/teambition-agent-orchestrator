@@ -38,27 +38,28 @@
   <rect class="lane" x="30" y="100" width="1340" height="195"/>
   <text class="laneT laneA-t" x="50" y="128">A · agent 本轮（可以正常结束，不必前台干等）</text>
 
-  <rect class="box" x="55" y="152" width="250" height="104"/>
+  <rect class="box" x="55" y="152" width="250" height="124"/>
   <text class="tb" x="180" y="180">干活</text>
   <text class="ts" x="180" y="203">tba note（本次处理内容）</text>
   <text class="ts" x="180" y="224">tba beat 续命</text>
   <text class="ts" x="180" y="244">结论只写任务备注</text>
   <path class="ln" d="M 305 204 L 343 204"/>
 
-  <rect class="box" x="345" y="152" width="290" height="104"/>
+  <rect class="box" x="345" y="152" width="290" height="124"/>
   <text class="tb" x="490" y="180">tba ask &lt;claim&gt; --done</text>
   <text class="ts" x="490" y="203">写备注 · 状态「待回复」· 列 3</text>
   <text class="ts" x="490" y="224">ask 前记 IMAP 水位（UIDNEXT）</text>
   <text class="ts" x="490" y="244">发通知邮件（只带本次 last_note）</text>
+  <text class="ts" x="490" y="265">同步写「待回复」字段（手机端可见）</text>
   <path class="ln" d="M 635 204 L 673 204"/>
 
-  <rect class="box" x="675" y="152" width="270" height="104"/>
+  <rect class="box" x="675" y="152" width="270" height="124"/>
   <text class="tb" x="810" y="180">挂上后台常驻监听</text>
   <text class="ts" x="810" y="203">本轮回复可以正常结束</text>
   <text class="ts" x="810" y="224">别重跑 ask（会重复发信）</text>
   <text class="ts" x="810" y="244">常驻模式不超时</text>
 
-  <rect class="soft" x="985" y="152" width="355" height="104"/>
+  <rect class="soft" x="985" y="152" width="355" height="124"/>
   <text class="tb" x="1162" y="178">红线</text>
   <text class="ts" x="1162" y="200">不许 --no-wait；不许 agent 自己 done / close</text>
   <text class="ts" x="1162" y="221">只有用户回 0 / 1 才收尾</text>

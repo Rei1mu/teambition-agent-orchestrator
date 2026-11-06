@@ -37,6 +37,8 @@ pub struct ToolMap {
     pub read_activity: Option<String>,
     // 发评论。tb ask 把问题写到任务上。
     pub comment: Option<String>,
+    // 按字段名写任务自定义字段。ask 把「待回复」正文写进字段，手机端才看得见。
+    pub update_customfield: Option<String>,
     // config.toml [tool_overrides] 里写了、但当前工具集里**不存在**的那些。
     // 不报错但要说出来：手写的名字过期后，静默失败最难查。
     pub stale_overrides: Vec<(String, String)>,
@@ -368,6 +370,10 @@ impl ToolMap {
             .or_else(|| pick_suffix(tools, &["task.update-stage", "task.update-list"]));
         m.read_activity = get("read_activity").or_else(|| pick_suffix(tools, &["task.activity"]));
         m.comment = get("comment").or_else(|| pick_suffix(tools, &["task.comment"]));
+        // 名字必须精确：task.customfield-update 旁边还有 file/member/rtf/table 四个变体，
+        // 用 suffix 精确匹配才不会误挑到 rtf-update（那个会把正文截断到 100 字）。
+        m.update_customfield = get("update_customfield")
+            .or_else(|| pick_suffix(tools, &["task.customfield-update"]));
         m.stale_overrides = stale;
 
         m
@@ -388,7 +394,7 @@ impl ToolMap {
 
     // 人读摘要。tb tools 命令用。
     pub fn summary(&self) -> Vec<(&'static str, String)> {
-        let rows: [(&'static str, &Option<String>); 18] = [
+        let rows: [(&'static str, &Option<String>); 19] = [
             ("list_projects", &self.list_projects),
             ("create_project", &self.create_project),
             ("get_project", &self.get_project),
@@ -407,6 +413,7 @@ impl ToolMap {
             ("move_to_list", &self.move_to_list),
             ("read_activity", &self.read_activity),
             ("comment", &self.comment),
+            ("update_customfield", &self.update_customfield),
         ];
         rows.iter()
             .map(|(k, v)| {
@@ -731,6 +738,30 @@ mod tests {
             Some("teambition.project.task-query")
         );
         assert!(m.stale_overrides.is_empty());
+    }
+
+    // 「待回复」字段必须写到 text 字段工具上。旁边还有 rtf/file/member/table
+    // 四个同前缀变体，挑错一个（尤其 rtf-update）正文会被截断到 100 字。
+    #[test]
+    fn update_customfield_picks_plain_text_tool() {
+        let mut tools = real_set();
+        tools.push(t(
+            "teambition.task.customfield-rtf-update",
+            "将 Markdown 转为富文本并更新任务自定义字段",
+        ));
+        tools.push(t(
+            "teambition.task.customfield-file-update",
+            "使用已上传的文件令牌覆盖任务文件自定义字段",
+        ));
+        tools.push(t(
+            "teambition.task.customfield-update",
+            "用 JSON 数组覆盖任务自定义字段",
+        ));
+        let m = ToolMap::resolve(&tools, &HashMap::new());
+        assert_eq!(
+            m.update_customfield.as_deref(),
+            Some("teambition.task.customfield-update")
+        );
     }
 
     #[test]

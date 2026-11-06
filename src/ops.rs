@@ -1483,6 +1483,8 @@ pub fn finish(store: &Store, claim_id: &str, to_stage: &str) -> Result<Claim, St
         );
     }
     store.update_claim(claim_id, new_state, "")?;
+    // 收尾了就别留着「待回复」内容，否则手机端会以为还有球在你那边。
+    sync_reply_field(&mut ctx, &claim, "");
     let mut c = claim;
     c.state = new_state.to_string();
     Ok(c)
@@ -1825,6 +1827,42 @@ pub const DONE_QUESTION: &str = "已完成，请确认：\n\n\
 2 = 还有问题，继续改（回「进行中」）\n\n\
 直接回复数字即可。会话会一直挂着等你，不会自己结束。";
 
+// 手机端 Teambition 不渲染内置备注 `note`，任务详情里的备注是一片空白。
+// 所以把「本轮待回复内容」再镜像一份到文本自定义字段「待回复」。
+// 字段要在项目里先建好、并绑到任务类型(sfc)，否则任务详情根本不显示它。
+pub const REPLY_CF_NAME: &str = "待回复";
+
+// text 字段的值格式是 [{"title":"..."}]，[] 表示清空。
+// 纯函数，单测可覆盖：漏一个括号手机上就是一片空白，值得钉死。
+fn reply_field_json(text: &str) -> String {
+    if text.trim().is_empty() {
+        "[]".to_string()
+    } else {
+        json!([{ "title": text }]).to_string()
+    }
+}
+
+// 写入 / 清空「待回复」字段。按字段名定位（cfName），不用先查字段 ID。
+// 字段不存在、工具没识别到、网关报错都只警告：邮件和任务备注是主通道，
+// 字段只是手机端的镜像，绝不能因为它失败就卡住 ask / resume。
+fn sync_reply_field(ctx: &mut Ctx, claim: &Claim, text: &str) {
+    let tool = match ctx.need("update_customfield", &ctx.map.update_customfield) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("⚠ 没同步「{REPLY_CF_NAME}」字段: {e}");
+            return;
+        }
+    };
+    let args = json!({
+        "taskId": claim.task_id,
+        "cfName": REPLY_CF_NAME,
+        "jsonValue": reply_field_json(text),
+    });
+    if let Err(e) = ctx.tb.call(&tool, args) {
+        eprintln!("⚠ 没同步「{REPLY_CF_NAME}」字段（不影响回复）: {e}");
+    }
+}
+
 // 提问：进行中 -> 待回复（列3），把问题写进任务备注等用户评论回复。
 pub fn ask(store: &Store, claim_id: &str, question: &str) -> Result<Claim, String> {
     let claim = store
@@ -1908,6 +1946,9 @@ pub fn ask(store: &Store, claim_id: &str, question: &str) -> Result<Claim, Strin
             ),
         );
     }
+    // 手机端看不到 note，把同一份邮件正文镜像到「待回复」字段。
+    // 复用 mail_body 而不是另拼一段，保证字段和邮件逐字一致。
+    sync_reply_field(&mut ctx, &claim, &mail_body(&claim, q, &claim.last_note));
     store
         .get_claim(claim_id)
         .ok_or_else(|| format!("找不到 claim: {claim_id}"))
@@ -2078,6 +2119,8 @@ pub fn resume(store: &Store, claim_id: &str) -> Result<(Claim, Vec<CommentInfo>)
         c.ask_at = String::new();
         c.heartbeat_at = ts.clone();
     })?;
+    // 球回到 agent 这边，「待回复」字段不该再挂着上一轮的问题。
+    sync_reply_field(&mut ctx, &claim, "");
     let c = store
         .get_claim(claim_id)
         .ok_or_else(|| format!("找不到 claim: {claim_id}"))?;
@@ -5559,5 +5602,36 @@ mod tests {
         let body = mail_body(&c, "已完成，请确认", "");
         assert!(body.contains("已完成，请确认"), "本次内容为空时该退回问题");
         assert!(!body.contains("本次处理内容"), "本次内容为空时不该有空分区");
+    }
+
+    // 「待回复」字段是手机端唯一的可见副本，值格式错了就是一片空白。
+    // text 字段要 [{title: ...}]，清空要 []。
+    #[test]
+    fn reply_field_json_shape() {
+        let v: serde_json::Value =
+            serde_json::from_str(&reply_field_json("本轮内容\n第二行")).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["title"], "本轮内容\n第二行");
+
+        assert_eq!(reply_field_json(""), "[]");
+        assert_eq!(reply_field_json("  \n "), "[]");
+    }
+
+    // 字段要和邮件逐字一致，且长正文、引号、反斜杠不能被 JSON 转义弄坏。
+    #[test]
+    fn reply_field_mirrors_mail_body_exactly() {
+        let c = fake_waiting("clm-1", "2026-10-31T15:00:00+08:00");
+        let work = format!(
+            "改了 {} 处，含 \"引号\" 与 \\ 反斜杠\n{}",
+            3,
+            "长".repeat(4000)
+        );
+        let body = mail_body(&c, DONE_QUESTION, &work);
+        let v: serde_json::Value = serde_json::from_str(&reply_field_json(&body)).unwrap();
+        let got = v[0]["title"].as_str().unwrap();
+        assert_eq!(got, body, "字段内容与邮件正文不一致");
+        assert!(got.contains("0 = 收尾"), "字段里缺回复选项");
+        assert!(got.contains(&c.task_id), "字段里缺任务链接");
+        assert!(got.contains("长".repeat(4000).as_str()), "长正文被截断");
     }
 }
