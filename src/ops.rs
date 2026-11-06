@@ -1854,13 +1854,6 @@ pub fn ask(store: &Store, claim_id: &str, question: &str) -> Result<Claim, Strin
         STAGE_DOING
     );
     ctx.append_task_note(&claim.task_id, &body)?;
-    // 邮件要带**完整备注**：用户在邮箱里就能看到 agent 干了什么、结论是什么，
-    // 不用再跳回 Teambition 网页翻。备注读失败不影响提问，退回只发问题。
-    let full_note = read_task_notes(&mut ctx, &[claim.task_id.clone()])
-        .ok()
-        .and_then(|v| v.into_iter().next())
-        .map(|(_, n)| n)
-        .unwrap_or_default();
     // 时间戳基准：wait 用它过滤「提问之后的评论」。
     // 以前取评论的 createTime，现在 agent 不写评论了，直接取本地时间。
     let asked_at = chrono::Local::now().to_rfc3339();
@@ -1889,7 +1882,7 @@ pub fn ask(store: &Store, claim_id: &str, question: &str) -> Result<Claim, Strin
     // 邮件通知放在台账更新之后：即使发信挂了，任务状态也已经是「待回复」。
     // 失败要写进备注——agent 可能把这条命令丢后台，stderr 没人看，
     // 只有落在任务上你才看得见「邮件没发出去」。
-    if let Err(e) = notify_by_mail(&ctx.tb.cfg, &claim, q, &full_note) {
+    if let Err(e) = notify_by_mail(&ctx.tb.cfg, &claim, q) {
         eprintln!("⚠ 邮件没发出去（问题已写进备注，不影响回数字）: {e}");
         let _ = ctx.append_task_note(
             &claim.task_id,
@@ -1948,47 +1941,32 @@ pub fn resend_mail(store: &Store, claim_id: &str) -> Result<String, String> {
     if !cfg.mail_on_ask {
         return Err("mail_on_ask 是关的，不会发通知信。要发就先把开关打开".into());
     }
-    let mut ctx = Ctx::new(store.clone(), false)?;
-    let note = read_task_notes(&mut ctx, &[claim.task_id.clone()])
-        .ok()
-        .and_then(|v| v.into_iter().next())
-        .map(|(_, n)| n)
-        .unwrap_or_default();
     let question = if claim.question.trim().is_empty() {
         DONE_QUESTION
     } else {
         &claim.question
     };
-    notify_by_mail(&cfg, &claim, question, &note)?;
+    notify_by_mail(&cfg, &claim, question)?;
     Ok(cfg.mail_to.clone())
 }
 
-// 邮件正文。带上**完整备注**——用户在外面收邮件时，光看到一个「已完成，请确认」
-// 是没法判断的，得能看到 agent 到底改了什么、结论是什么。
-//
-// 备注为空（读失败或还没写过）就退回只发问题，别发一封空信。
-fn mail_body(claim: &Claim, question: &str, note: &str) -> String {
-    let content = if note.trim().is_empty() { question } else { note };
+// 邮件正文只放问题 + 回复要求 + 链接。
+// 不塞整条任务备注：备注里的数字、长文本会被客户端原样引用回来，
+// 解析器会把引用里的 0/1/2 当成用户的选择。
+// 第一行是引用边界：客户端把原邮件平铺进回信时，ops::strip_reply_noise 在这里截断。
+fn mail_body(claim: &Claim, question: &str) -> String {
     format!(
-        "任务「{name}」需要你回复。\n\n\
-         ======== 任务备注（完整） ========\n\n\
-         {content}\n\n\
-         ================================\n\n\
+        "---------- 问题 ----------\n\n{q}\n\n\
+         请只回一个数字 0/1/2。不要保留引用原文，不要写其它内容。\n\n\
          链接：https://www.teambition.com/task/{task}\n\n\
          直接回复本邮件即可（请保留标题里的 [TB {cid}]，否则认不出是哪条任务）。",
-        name = claim.task_name,
-        content = content.trim(),
+        q = question.trim(),
         task = claim.task_id,
         cid = claim.claim_id,
     )
 }
 
-fn notify_by_mail(
-    cfg: &Config,
-    claim: &Claim,
-    question: &str,
-    note: &str,
-) -> Result<(), String> {
+fn notify_by_mail(cfg: &Config, claim: &Claim, question: &str) -> Result<(), String> {
     // 用户主动关的，不算失败。
     if !cfg.mail_on_ask {
         return Ok(());
@@ -1997,7 +1975,7 @@ fn notify_by_mail(
         return Err("邮件没配全：缺 SMTP 主机或收件人".to_string());
     }
     let subject = format!("[TB {}] 需要你回复：{}", claim.claim_id, claim.task_name);
-    let body = mail_body(claim, question, note);
+    let body = mail_body(claim, question);
     match crate::mail::send(cfg, &subject, &body) {
         Ok(()) => {
             eprintln!("已发邮件通知: {}", cfg.mail_to);
@@ -2253,61 +2231,121 @@ impl ReplyAction {
     }
 }
 
-// 解析用户回复。返回 (动作, 去掉数字前缀后的正文)。
+// 剥离引用/转发/任务备注，只留用户新增文本。
 //
-// 防歧义的规则（宁可当文本，也不猜错——猜错就是收错任务）：
-//   * 首字符必须是 ASCII 数字，否则当文本（"好的，0" 不认）；
-//   * 数字后面必须紧跟「结尾 / 非 ASCII 字母数字」（"0可以了" 认，"0abc" 不认）；
-//   * 去掉前缀后正文里还有数字 → 当文本（"1 和 2 都做了" 有歧义，不猜）。
-pub fn parse_reply(text: &str) -> (ReplyAction, String) {
-    let t = text.trim();
-    if t.is_empty() {
-        return (ReplyAction::Free, String::new());
-    }
-    let first = match t.chars().next() {
-        Some(c) => c,
-        None => return (ReplyAction::Free, String::new()),
-    };
-    if !first.is_ascii_digit() {
-        return (ReplyAction::Free, t.to_string());
-    }
-    // 连续数字的结束位置
-    let mut end = 0usize;
-    for (i, c) in t.char_indices() {
-        if c.is_ascii_digit() {
-            end = i + c.len_utf8();
-        } else {
+// 邮件回信常带整封原始邮件（含 0/1/2 选项说明、任务备注、链接），
+// 不剥掉就会从引用里抽出错误的数字，把任务误收尾。
+// 两通道共用：Teambition 评论、邮件回信写成评论后的文本，都先过这里。
+pub fn strip_reply_noise(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // 工具自己加的标记行：跳过，不算用户的话。
+        if t.starts_with("（邮件回复）") || t.starts_with("[TB ") {
+            continue;
+        }
+        let low = t.to_ascii_lowercase();
+        // 引用/转发边界。命中就截断，后面全部丢掉。
+        // 通知邮件第一行特意用「--- 问题 ---」：客户端把原邮件平铺进回信时，
+        // 这行就是引用区的第一行，能在这里截断。
+        if t.starts_with('>')
+            || t.starts_with('＞')
+            || t.starts_with("---")
+            || t.starts_with("___")
+            || t.starts_with("====")
+            || low.starts_with("from:")
+            || low.starts_with("to:")
+            || low.starts_with("sent:")
+            || low.starts_with("subject:")
+            || low.starts_with("date:")
+            || low.starts_with("cc:")
+            || (low.starts_with("on ") && low.contains("wrote:"))
+            || t.starts_with("发件人")
+            || t.starts_with("收件人")
+            || t.starts_with("抄送")
+            || t.starts_with("发送时间")
+            || t.starts_with("主题")
+            || t.starts_with("日期")
+            || t.contains("原始邮件")
+            || t.contains("original message")
+            || t.contains("任务备注")
+            || t.contains("写道")
+            || t.contains("wrote:")
+            || t.starts_with("链接：")
+            || t.starts_with("链接:")
+            || t.starts_with("请只回一个数字")
+            || t.starts_with("直接回复本邮件")
+            || low.starts_with("http://")
+            || low.starts_with("https://")
+        {
             break;
         }
+        out.push(t);
     }
-    let num_str = &t[..end];
-    let rest = &t[end..];
-    // 数字后面紧跟 ASCII 字母数字 → 不是选项（如 "0abc" / "123x"）
-    if let Some(c) = rest.chars().next() {
-        if c.is_ascii_alphanumeric() {
-            return (ReplyAction::Free, t.to_string());
+    out.join("\n")
+}
+
+// 找第一个「独立的单个数字」。前后是 ASCII 字母数字的跳过，
+// 连续多位数字（年份、任务号、日期）也跳过，避免从噪声里抽错。
+fn first_reply_digit(text: &str) -> Option<(u32, std::ops::Range<usize>)> {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
         }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        let end = i;
+        if end - start != 1 {
+            continue;
+        }
+        let before = start.checked_sub(1).map(|j| b[j]);
+        let after = b.get(end).copied();
+        if before.map_or(false, |c| c.is_ascii_alphanumeric())
+            || after.map_or(false, |c| c.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        return Some(((b[start] - b'0') as u32, start..end));
     }
-    let n: u32 = match num_str.parse() {
-        Ok(n) => n,
-        Err(_) => return (ReplyAction::Free, t.to_string()),
+    None
+}
+
+// 两通道共用的数字解析。评论、邮件回信都走这里。
+pub fn parse_reply_num(text: &str) -> Option<u32> {
+    first_reply_digit(&strip_reply_noise(text)).map(|(n, _)| n)
+}
+
+// 解析用户回复。返回 (动作, 去掉数字后的正文)。
+// 宽松规则：剥离引用后，从用户新增文本里抽第一个独立数字。
+pub fn parse_reply(text: &str) -> (ReplyAction, String) {
+    let added = strip_reply_noise(text);
+    let Some((n, range)) = first_reply_digit(&added) else {
+        return (ReplyAction::Free, added);
     };
-    let body = rest
+    let mut body = String::with_capacity(added.len());
+    body.push_str(&added[..range.start]);
+    body.push_str(&added[range.end..]);
+    let body = body
         .trim_start_matches(|c: char| {
             c.is_whitespace() || ".,。，、:：;；)）]】".contains(c)
         })
-        .trim();
-    // 正文里再出现数字 → 有歧义，不猜
-    if body.chars().any(|c| c.is_ascii_digit()) {
-        return (ReplyAction::Free, t.to_string());
-    }
+        .trim()
+        .to_string();
     let act = match n {
         0 => ReplyAction::Closed,
         1 => ReplyAction::Summarize,
         2 => ReplyAction::Recheck,
         _ => ReplyAction::Custom(n),
     };
-    (act, body.to_string())
+    (act, body)
 }
 
 pub enum WaitOutcome {
@@ -2381,6 +2419,8 @@ pub fn wait(
     // 下限 5 秒，防止配置填 0/1 把邮箱服务器打成拒绝服务。
     let mail_poll = ctx.tb.cfg.mail_poll_secs.max(crate::config::MIN_MAIL_POLL_SECS);
     let mut last_mail = std::time::Instant::now() - std::time::Duration::from_secs(mail_poll);
+    // 一轮等待里最多回一封澄清信，别把用户邮箱刷屏。
+    let mut clarify_sent = false;
 
     loop {
         // 每轮刷新「我在等」的标记。进程被杀就停更，别的命令据此判断
@@ -2421,6 +2461,27 @@ pub fn wait(
             match crate::mail::fetch_replies(&ctx.tb.cfg, &marker) {
                 Ok(msgs) => {
                     for m in msgs {
+                        // 自己发出的澄清信偶尔会回到 INBOX：跳过，别当成用户回复。
+                        if m.trim_start().starts_with("没识别到你的选择") {
+                            continue;
+                        }
+                        // 抽不到数字就回一封澄清信，任务留在「待回复」继续等。
+                        // 原来把噪声写成评论后按 free text 忽略，用户会一直等不到结果。
+                        if parse_reply_num(&m).is_none() {
+                            if !clarify_sent && crate::mail::can_send(&ctx.tb.cfg) {
+                                clarify_sent = true;
+                                let subject =
+                                    format!("[TB {claim_id}] 没识别到回复，请只回一个数字");
+                                // 正文不放阿拉伯数字：万一被当成回信捞回来，也不会误解析成选择。
+                                let text = "没识别到你的选择。\n\
+                                            请只回一个数字，不要保留引用原文，不要写其它内容。\n\
+                                            数字含义见上一封邮件，或到 Teambition 任务评论里回复。";
+                                if let Err(e) = crate::mail::send(&ctx.tb.cfg, &subject, text) {
+                                    eprintln!("澄清邮件没发出去（{e}）");
+                                }
+                            }
+                            continue;
+                        }
                         let body = format!("（邮件回复）\n\n{m}");
                         if let Err(e) = ctx.post_comment(&claim.task_id, &body) {
                             eprintln!("邮件回信写入任务评论失败: {e}");
@@ -3613,14 +3674,16 @@ fn workflow_text_zh(
     // 第 4 步：做完必须交回用户。ask 自带等待，所以是两步不是三步。
     // 「禁止 run_in_background」要写死：agent 把 ask 丢后台 = 会话结束了但没人接回复，
     // 任务卡在「待回复」，用户永远等不到下一步。
+    // 调用姿势单独抽出来，两个分支共用，免得只改一处、文案分叉。
+    let ask_posture = "**ask 调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 600000`；Sandbox 约 78s 会 SIGTERM 强杀阻塞的 ask。前台超时自动转后台继续等（不是主动 run_in_background），用户回数字后 ask 退出、task-notification 唤醒 agent 续接。禁止 `--no-wait`。";
     if memory_on {
         s.push_str(&format!(
-            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（0=收尾/1=先写记忆/2=还有问题；转「{0}」+列「{1}」+发邮件，**前台阻塞等回复，禁止 run_in_background，绝不结束会话**）。ask exit 0=回复 / exit 2=超时，改用 `{exe} wait <claim_id>`（别重跑 ask，会重发信）/ exit 3=用户已收尾（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。\n",
+            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（0=收尾/1=先写记忆/2=还有问题；转「{0}」+列「{1}」+发邮件，**前台阻塞等回复，禁止 run_in_background，绝不结束会话**）。ask exit 0=回复 / exit 2=超时，改用 `{exe} wait <claim_id>`（别重跑 ask，会重发信）/ exit 3=用户已收尾（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
             STAGE_WAIT, cfg.tasklist_wait, STAGE_DONE, STAGE_CLOSED, cfg.tasklist_done, cfg.tasklist_closed, STAGE_TODO, cfg.tasklist_queue
         ));
     } else {
         s.push_str(&format!(
-            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（0=收尾/1=先写记忆/2=还有问题；转「{0}」+列「{1}」+发邮件，**前台阻塞等回复，禁止 run_in_background，绝不结束会话**）。ask exit 0=回复 / exit 2=超时，改用 `{exe} wait <claim_id>`（别重跑 ask，会重发信）/ exit 3=用户已收尾（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。\n",
+            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（0=收尾/1=先写记忆/2=还有问题；转「{0}」+列「{1}」+发邮件，**前台阻塞等回复，禁止 run_in_background，绝不结束会话**）。ask exit 0=回复 / exit 2=超时，改用 `{exe} wait <claim_id>`（别重跑 ask，会重发信）/ exit 3=用户已收尾（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
             STAGE_WAIT, cfg.tasklist_wait, STAGE_DONE, STAGE_CLOSED, cfg.tasklist_done, cfg.tasklist_closed, STAGE_TODO, cfg.tasklist_queue
         ));
     }
@@ -3701,7 +3764,7 @@ fn workflow_text(
     ));
 
     let handoff = format!(
-        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\"`; (b) `{exe} ask <claim_id> --done` (0=close/1=memory then close/2=still broken; -> {0} + column \"{1}\", mail sent; BLOCKS in foreground - NEVER run_in_background, never end session). NEVER stop in {2} - the user's reply would go unread. ",
+        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\"`; (b) `{exe} ask <claim_id> --done` (0=close/1=memory then close/2=still broken; -> {0} + column \"{1}\", mail sent; BLOCKS in foreground - NEVER run_in_background, never end session). Run ask with sandbox OFF (`dangerouslyDisableSandbox: true`) and `timeout: 600000`: sandbox SIGTERMs a blocking ask at ~78s. On foreground timeout the tool auto-backgrounds it; the user's reply ends ask and a task-notification wakes the agent. NEVER set run_in_background yourself, never `--no-wait`. NEVER stop in {2} - the user's reply would go unread. ",
         STAGE_WAIT, cfg.tasklist_wait, STAGE_DOING
     );
 
@@ -4319,7 +4382,11 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          `ask` 发邮件后**就地阻塞**等你回数字（0=收尾 1=写记忆 2=有问题）。\
          退出码：0=收到回复；2=超时，改用 `{exe} wait <claim_id>`（别重跑 ask，会重发信）；\
          3=已收尾。\n\
-         **禁止 run_in_background，绝不结束会话**——断了没人接你回复。\
+         **调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 600000`。\
+         Sandbox 模式约 78s 会 SIGTERM 强杀阻塞的 `ask`，回复接不上。\
+         前台超时会自动转后台继续等（不是自己 `run_in_background`）；\
+         用户回数字后 `ask` 退出，task-notification 唤醒 agent 续接。\n\
+         **禁止主动 run_in_background、禁止 `--no-wait`、绝不结束会话**——断了没人接你回复。\
          只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
          **通用能力**（别自己拼脚本）：`doctor` 环境自检 / \
          `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / \
@@ -4356,12 +4423,15 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     // 已经是新版就不用动：入口段只有一份、带裸命令、带「交回」「流转」「通用能力」。
     // 「**工具**：`tba`」同时当版本号用——老入口里是本机绝对路径，缺这句就整段
     // 替换成新版（不会重复追加）。`git create` 也是版本号（v0.2.20 加的）。
+    // `dangerouslyDisableSandbox` 是交回姿势的版本号：老入口缺这句要重写一次，
+    // 否则 agent 拿旧姿势跑 ask，78s 就被 SIGTERM 强杀。
     let entry_ok = old.matches(ENTRY_MARK).count() == 1
         && old.contains(&format!("**工具**：`{exe}`"))
         && old.contains("**交回**")
         && old.contains("**流转**")
         && old.contains("**通用能力**")
-        && old.contains("git create");
+        && old.contains("git create")
+        && old.contains("dangerouslyDisableSandbox");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
 
     // 转发脚本只写 `tba.exe`，不带本机绝对路径，换设备一样能用。
@@ -4412,7 +4482,9 @@ fn claim_header(c: &Claim, exe: &str) -> String {
          ⚠ 做完必须交回，两步不许省：\n  \
          {exe} note {} --text \"改了什么/怎么验\"\n  \
          {exe} ask {} --done\n\
-         ask 会阻塞等你回数字，禁止 run_in_background，绝不结束会话。只有用户能收尾。\n",
+         ask 会阻塞等你回数字：关 Sandbox（dangerouslyDisableSandbox: true）+ timeout: 600000；\
+         超时自动转后台继续等，用户回复触发 task-notification 唤醒续接；exit 2 用 {exe} wait <claim_id>。\
+         禁止 run_in_background、禁止 --no-wait、绝不结束会话。只有用户能收尾。\n",
         c.claim_id, c.task_id, c.task_name, c.stage_from, c.stage_to, c.claim_id, c.claim_id
     )
 }
@@ -4852,9 +4924,9 @@ mod tests {
         assert_eq!(parse_reply("2. 还是报错").1, "还是报错");
 
         // 不认：数字不在开头 / 后面跟字母 / 正文还有数字（有歧义）/ 空
-        assert_eq!(parse_reply("好的，0").0, ReplyAction::Free);
+        assert_eq!(parse_reply("好的，0").0, ReplyAction::Closed);
         assert_eq!(parse_reply("0abc").0, ReplyAction::Free);
-        assert_eq!(parse_reply("1 和 2 都做了").0, ReplyAction::Free);
+        assert_eq!(parse_reply("1 和 2 都做了").0, ReplyAction::Summarize);
         assert_eq!(parse_reply("把那个函数也改一下").0, ReplyAction::Free);
         assert_eq!(parse_reply("").0, ReplyAction::Free);
 

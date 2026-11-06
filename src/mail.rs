@@ -533,34 +533,14 @@ fn imap_fetch(s: &mut BufReader<Box<dyn Stream>>, tag: &str, uid: &str) -> Resul
     }
 }
 
-// 把回信正文清理成一句能当任务评论用的话：去掉引用的原文、去掉 marker 行。
+// 把回信正文清理成用户新增的话：去掉 marker 行，再剥掉引用/转发/任务备注。
+// 剥离规则与评论通道共用，见 ops::strip_reply_noise。
 fn clean_reply(body: &str, marker: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for line in body.lines() {
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        // 常见引用/签名分隔：> 开头、-----Original Message-----、On ... wrote:
-        if t.starts_with('>')
-            || t.starts_with("---")
-            || t.starts_with("___")
-            || t.starts_with("发件人:")
-            || t.starts_with("From:")
-            || t.contains("wrote:")
-        {
-            break;
-        }
-        if t.contains(marker) {
-            continue;
-        }
-        out.push(t.to_string());
-    }
-    if out.is_empty() {
-        body.trim().to_string()
-    } else {
-        out.join("\n")
-    }
+    let kept: Vec<&str> = body
+        .lines()
+        .filter(|l| !l.contains(marker) && !l.trim().is_empty())
+        .collect();
+    crate::ops::strip_reply_noise(&kept.join("\n"))
 }
 
 // 解析一封 RFC822 邮件：返回（解码后的主题，纯文本正文）。
