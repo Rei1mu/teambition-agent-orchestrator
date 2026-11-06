@@ -56,7 +56,12 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 1. **agent 只写任务备注，不写评论。** 评论是用户的回复通道，写进去会污染 `ask` 的读取。
 2. **不许自己跑 `tba done` / `tba close`。** 只有用户回 `0` 才收尾。
-3. **做完必须 `tba ask --done`，然后让它转后台常驻监听。** 调用姿势：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点工具自动把命令转后台（**不杀进程**），不用在前台干等 10 分钟，agent 本轮回复可以正常结束。用户邮件/Teambition 回复后 `ask` 退出，task-notification 唤醒 agent 续接。**不许 `--no-wait`**。常驻模式不超时，退出码 2 只在 `--once` 出现（那时用 `tba wait <claim>` 接着等，别重跑 `ask`，会重发信）。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
+3. **做完必须 `tba ask --done`，然后让它转后台常驻监听。** 两种姿势二选一，**两种都必须关 Sandbox（`dangerouslyDisableSandbox: true`）**：
+
+   - **前台转后台**：`timeout: 60000`，到点工具自动把命令转后台（**不杀进程**），不用在前台干等 10 分钟。
+   - **直接后台**：`run_in_background: true` + **`timeout: 600000`**。这个 timeout 不能省：不带就是默认 120 秒，后台 shell 会被杀掉，任务卡在「待回复」没人接（2026-11-07 实测踩过一次，表现为后台任务 exit code 1、无输出、心跳停止刷新）。
+
+   agent 本轮回复可以正常结束；用户邮件/Teambition 回复后 `ask` 退出，task-notification 唤醒 agent 续接。**不许 `--no-wait`**、不许 agent 自己 `done` / `close`，只有用户回 `0` / `1` 才收尾。常驻模式不超时，退出码 2 只在 `--once` 出现。**监听意外中断（或 `--once` 到点）时用 `tba wait <claim>` 续接，别重跑 `ask`（会重复发信）**。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
 
@@ -91,7 +96,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 ② `tba ask <claim_id> --done`
 
 `ask` 发邮件后**后台常驻监听**评论和邮件（0=收尾 1=写记忆 2=有问题）。退出码：0=收到回复 / 3=已收尾；常驻模式不会因超时退出。
-**调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点自动转后台（不杀进程），不用干等 10 分钟；收到回复后监听退出，task-notification 唤醒 agent 续接。
+**调用姿势**（两种都必须关 Sandbox `dangerouslyDisableSandbox: true`）：① 前台转后台用 `timeout: 60000`，到点自动转后台（不杀进程）；② 直接 `run_in_background: true` 时**必须同时给 `timeout: 600000`**，否则默认 120 秒会把后台 shell 杀掉、没人接回复。收到回复后监听退出，task-notification 唤醒 agent 续接。监听意外中断用 `tba wait <claim_id>` 续接，别重跑 `ask`。
 **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。
 禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `tba release`。
 
