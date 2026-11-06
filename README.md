@@ -1,5 +1,50 @@
 # TBA
 
+> 开源协议：[Apache License 2.0](LICENSE) · 仓库已公开，一句话安装可直接用。
+
+## 流程图：两次会话
+
+**设备接入和干活分两次会话**：第一次装好 tba 与 MCP、token 由用户自己填；第二次不带参数跑 `tba`，由它按工作区决定领任务还是列候选。
+
+### ① 第一次会话：「接入tba cli」（每台设备一次）
+
+```mermaid
+flowchart TD
+    A(["① 接入tba cli"]) --> B["tba --version → tba onboard<br/>没装就先跑 PowerShell 一句话安装"]
+    B --> C{"TOKEN MISSING?"}
+    C -->|是| D["自动起 tbagui.exe<br/>用户自己填 token，本次会话停"]
+    C -->|否| E["幂等写 MCP + 打印通用片段<br/>agent 自装 → 用户点「信任」"]
+    E --> F(["② 开工（下一次会话）"])
+    D -.-> F
+```
+
+### ② 第二次会话：「开工」或 `tba go`
+
+```mermaid
+flowchart TD
+    A(["② 开工 / tba go"]) --> B["不带参数执行 tba"]
+    B --> C{"有 .tba/project<br/>且线上项目还在?"}
+    C -->|否| D["列本地候选 → 用户拍板<br/>tba create --name X --go"]
+    C -->|是| E
+    D --> E["ensure_tasklists<br/>只建缺的 1~5（不改不删）"]
+    E --> F{"补齐成功?"}
+    F -->|否| G["项目链接 + 手动补列兜底<br/>不阻断领任务"]
+    F -->|是| H
+    G --> H["领任务 claim_id / EMPTY<br/>按 skill 干活：未完成 → 已解决"]
+```
+
+**读图要点**
+
+| 环节 | 谁做 | 要点 |
+|---|---|---|
+| 设备接入（第一次会话） | agent，每台设备一次 | `install.ps1` 只自动写 WorkBuddy AI 一家 MCP；其他客户端把 `tba mcp` 的通用片段合并进**自己**的配置（MCP 协议通用，配置路径不通用，方案 C） |
+| token | 只有用户 | `TOKEN MISSING` 时 `tbagui.exe` 自动打开；agent 不代填、不改 `data/config.toml`；本次会话停在这里 |
+| 开工（第二次会话） | 不带参数的 `tba` | 有绑定就领任务；没绑定只列候选项目名，**项目名必须用户拍板**，然后 `tba create --name "<选定的>" --go` |
+| 看板列 1~5 | tba 自动 | 用 `task-group-query` + `task-list-create` 只建缺的数字列，全齐时静默；老服务端 / 接口失败才打印项目链接与手动兜底步骤 |
+| 直连 `tba go -off <任务>` | agent 本地 | 不领任务、不写任务、不发邮件、不等待 Teambition 回复，只在对话框里交互 |
+
+常驻能力：`tba serve` 是 stdio MCP server，挂到任何支持 MCP 的客户端；`tba ui` 是窗口；exe 同目录的 `data/` 放台账、skill 缓存和记忆，所有 agent 共享。
+
 ## 项目目标
 
 **让同一个项目在任何设备、任何 agent 上都能无缝继续开发，同时把 token 开销压到极致，并保证 agent 不会跑错关键流程。**
@@ -44,7 +89,7 @@
 >
 > **用户说「接入tba cli」= 设备接入（第一次会话）**，按顺序做：
 > 1. 直接跑 `tba --version`。成功 = 已装，跳到第 3 步；报「找不到命令」= 没装，走第 2 步。
-> 2. 在 PowerShell 跑 `irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/install.ps1 | iex`。它下载安装 `tba.exe` 并写一份 WorkBuddy AI 的 MCP 配置。返回 404/权限错误就把错误原样报给用户（仓库需要是 public），不要改脚本、不要自己找 exe。
+> 2. 在 PowerShell 跑 `irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/install.ps1 | iex`。它下载安装 `tba.exe` 并写一份 WorkBuddy AI 的 MCP 配置。仓库已公开，脚本匿名可读；真返回 404/权限错误就把错误原样报给用户，不要改脚本、不要自己找 exe。
 > 3. 跑 `tba onboard`，读状态行 `TOKEN` / `GUI` / `BINDING` 和打印出来的 MCP 片段。
 > 4. `TOKEN MISSING` 时窗口已自动打开：**停下来等用户自己填 Teambition token**。不要代填、不要改 `data/config.toml`，本次会话到此为止。
 > 5. 把 `mcpServers.tba` 合并进**你自己客户端**的 MCP 配置：先备份 → 找你自己产品的配置文件位置（不要假设是哪一家）→ 只加/改 `tba` 这一项、别覆盖别的 server → 读回校验 → 回报改动位置。
@@ -1082,7 +1127,7 @@ Terminal，那一下还得等 WT 起窗，看着就是黑框闪一下。
 
 ### 新设备：一句话装好
 
-仓库公开后，在 PowerShell 里贴这一行：
+在 PowerShell 里贴这一行（仓库已公开，脚本匿名可读）：
 
 ```powershell
 irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/install.ps1 | iex
@@ -1091,7 +1136,7 @@ irm https://raw.githubusercontent.com/Rei1mu/teambition-agent-orchestrator/main/
 `install.ps1` 下载最新 Release 的安装包、静默安装、合并写 `~/.workbuddy-ai/mcp.json`。
 不删 `data/`，不覆盖配置里别的 MCP server。装完去连接器管理页点「信任」。
 
-- 装最新 tag。固定版本：先设 `$env:TBA_VERSION = 'v0.2.27'` 再跑。
+- 装最新 tag。固定版本：先设 `$env:TBA_VERSION = 'v0.2.28'` 再跑。
 - 脚本写 exe 绝对路径。不依赖 PATH 刷新，宿主进程还活着也能起 MCP。
 - 安装目录改过的话，脚本会停下来提示改路径。
 - 设备已经装好 tba 时不用跑它，直接 `tba mcp --install`。命令写 exe 绝对路径，
@@ -1193,3 +1238,23 @@ python tools\mock_tb_mcp.py 8791
 
 注意：模拟服务是**多线程内存版**，重启后状态全丢（阶段、任务、skill 都回初始值），
 但本地开关和台账不受影响。
+
+## 许可协议
+
+本项目采用 [Apache License 2.0](LICENSE) 开源，完整条款见仓库根目录的 `LICENSE`（安装包也会随附一份）。
+
+```
+Copyright 2026 Rei1mu
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```

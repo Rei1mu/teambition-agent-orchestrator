@@ -1,8 +1,11 @@
 [package]
 name = "tba-cli"
-version = "0.2.27"
+version = "0.2.28"
 edition = "2021"
 description = "TBA - Teambition Agent (CLI + MCP + egui 窗口)"
+license = "Apache-2.0"
+repository = "https://github.com/Rei1mu/teambition-agent-orchestrator"
+readme = "README.md"
 default-run = "tba"
 
 [[bin]]

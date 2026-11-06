@@ -94,6 +94,8 @@ Source: "{#SrcExe}"; DestDir: "{app}"; Flags: ignoreversion
 ; tba.exe 仍然是 console 子系统（CLI 要能往 stdout 写），所以两个都要装。
 ; 不给 #if 兜底：缺这个文件就该让打包失败——否则打出来的包里快捷方式指向空气。
 Source: "{#SrcGuiExe}"; DestDir: "{app}"; Flags: ignoreversion
+; Apache-2.0 要求随二进制分发一份协议全文，装完在 {app}\LICENSE。
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 ; 0.2.12 里这个启动器叫 tbaw.exe，改名后旧文件不会被自动清掉（Inno 只删自己这版
 ; 装过的文件）。留着就是个孤儿 exe，显式删一次。
