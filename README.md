@@ -6,32 +6,50 @@
 
 **设备接入和干活分两次会话**：第一次装好 tba 与 MCP、token 由用户自己填；第二次不带参数跑 `tba`，由它按工作区决定领任务还是列候选。
 
+> 这两张图是仓库里的静态 PNG（`docs/`），不依赖 GitHub 的 Mermaid 前端渲染，任何 Markdown 阅读器都能显示。图片加载不到时，展开每节下面的「纯文字版」。
+
 ### ① 第一次会话：「接入tba cli」（每台设备一次）
 
-```mermaid
-flowchart TD
-    A(["① 接入tba cli"]) --> B["tba --version → tba onboard<br/>没装就先跑 PowerShell 一句话安装"]
-    B --> C{"TOKEN MISSING?"}
-    C -->|是| D["自动起 tbagui.exe<br/>用户自己填 token，本次会话停"]
-    C -->|否| E["幂等写 MCP + 打印通用片段<br/>agent 自装 → 用户点「信任」"]
-    E --> F(["② 开工（下一次会话）"])
-    D -.-> F
+![第一次会话：设备接入流程](docs/flow-onboard.png)
+
+<details>
+<summary>纯文字版（不依赖图片）</summary>
+
+```text
+① 接入tba cli（第一次会话，每台设备一次）
+  ├─ tba --version
+  │    └─ 找不到命令 → PowerShell 跑一句话安装脚本
+  ├─ tba onboard   （只查本地 / 不联网 / 不碰任务队列）
+  ├─ TOKEN MISSING → 自动起 tbagui.exe，用户自己填 token
+  │                  → 本次会话到此为止，另开会话进 ②
+  └─ TOKEN OK     → 幂等写 WorkBuddy AI MCP + 打印 tba mcp 片段
+                     → agent 把片段合并进自己客户端配置
+                     → 用户点「信任」→ 下一次会话生效 → ②
 ```
+
+</details>
 
 ### ② 第二次会话：「开工」或 `tba go`
 
-```mermaid
-flowchart TD
-    A(["② 开工 / tba go"]) --> B["不带参数执行 tba"]
-    B --> C{"有 .tba/project<br/>且线上项目还在?"}
-    C -->|否| D["列本地候选 → 用户拍板<br/>tba create --name X --go"]
-    C -->|是| E
-    D --> E["ensure_tasklists<br/>只建缺的 1~5（不改不删）"]
-    E --> F{"补齐成功?"}
-    F -->|否| G["项目链接 + 手动补列兜底<br/>不阻断领任务"]
-    F -->|是| H
-    G --> H["领任务 claim_id / EMPTY<br/>按 skill 干活：未完成 → 已解决"]
+![第二次会话：开工自举流程](docs/flow-go.png)
+
+<details>
+<summary>纯文字版（不依赖图片）</summary>
+
+```text
+② 开工 / tba go（第二次会话）
+  ├─ 不带参数执行 tba
+  ├─ 有 .tba/project 且线上项目还在？
+  │    ├─ 否 → 本地列候选项目名 → 原样交用户拍板
+  │    │        → tba create --name "<选定的>" --go
+  │    └─ 是 → 直接往下
+  ├─ ensure_tasklists：查列 → 只建缺的 1~5（不改不删）
+  │    └─ 补齐失败 → 打印项目链接 + 手动补列兜底，不阻断领任务
+  └─ 领任务 claim_id / EMPTY → 按 skill 干活
+       未完成 → 进行中 → 待回复 → 已解决
 ```
+
+</details>
 
 **读图要点**
 
