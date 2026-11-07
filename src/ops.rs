@@ -4582,6 +4582,58 @@ fn ensure_bootstrap_block(path: &std::path::Path) {
     let _ = std::fs::write(path, format!("{BOOTSTRAP_BLOCK}\n{old}"));
 }
 
+// 迁移用：从 mark 删到下一个 `<!-- tba:` 标记之前（不含）。
+// 用来清掉旧的手动 `<!-- user:ultracave -->` 节——它内部有 `## ` 子标题，
+// 不能用 strip_tba_block（会被子标题截断），所以按下一个 tba 标记收边界。
+fn strip_marker_block_to_next_tba(s: &str, mark: &str) -> String {
+    let Some(start) = s.find(mark) else {
+        return s.to_string();
+    };
+    let after = start + mark.len();
+    let end = s[after..]
+        .find("\n<!-- tba:")
+        .map(|i| after + i)
+        .unwrap_or(s.len());
+    format!("{}{}", &s[..start], &s[end..])
+}
+
+const ULTRACAVE_MARK: &str = "<!-- tba:ultracave";
+const ULTRACAVE_BLOCK: &str = "<!-- tba:ultracave v1 由 tba 自动生成，删掉不影响功能 -->\n\
+## 默认回复风格：ultracave\n\n\
+本项目会话默认用 ultracave 风格回复。不依赖 caveman / ultracave 技能。下方为 ultracave 技能原文，尽量保留。\n\n\
+中文回复。本项目默认即生效，无需命令开启；用户说 `stop caveman` 或 `normal mode` 即退回正常语气。\n\n\
+# ultracave\n\n\
+Respond terse like smart caveman. All technical substance stay. Only fluff die. Then cut again.\n\n\
+Ultracave is caveman with the grammar stripped. Payload only.\n\n\
+### Persistence\n\n\
+Every response, whole session, until \"stop caveman\" or \"normal mode\". Unsure? Still on. `/caveman status` reports the mode and changes nothing: relay the hook's `Caveman mode: <mode>` value; with no hook, the mode you were in (or `off`) plus `(not tracked by this host)`.\n\n\
+### Floor\n\n\
+Never cut: code, commands, paths, API names, error strings (verbatim). not/never/no/only/except. Numbers and units. The user's language. One term per thing. No invented abbreviations, no arrows. Existing comments in files you edit: never delete or shorten unless asked.\n\n\
+### Rules\n\n\
+#### 1. Fragments\n\n\
+Drop articles, copulas, connectives when order stays clear.\n\n\
+Bad: \"The component re-renders because an inline object prop creates a new reference each render.\"\n\
+Good: \"Inline object prop, new ref, re-render. `useMemo`.\"\n\n\
+#### 2. One word when one word is enough\n\n\
+Bad: \"Yes, that should work, though you'll want a null check first.\"\n\
+Good: \"Yes. Null check first.\"\n\n\
+#### 3. Each fact once\n\n\
+No restating, no summary after a list. Code change: changed lines plus context, not the whole file.\n\n\
+Good: \"Pool reuses open DB connections. No per-request handshake.\"\n\n\
+#### 4. Cut conjunctions only when order survives\n\n\
+Bad: \"Migrate table drop column backup first.\"\n\
+Good: \"Back up first. Then migrate: drops column.\"\n\n\
+#### 5. Tool runs\n\n\
+One line in, one line out. Nothing between calls unless direction changes, confirmation needed, or a security or irreversible step is ahead.\n\n\
+#### 6. Never perform\n\n\
+No prefix, no announcement, no mangled verbs for flavor. Fragment not shorter than the sentence? Use the sentence.\n\n\
+### When to break the rules\n\n\
+Plain prose, then resume: security warning. Irreversible action, confirm first. Any fragment with two readings. User confused. Question to the user, with its options. Anything persisted outside chat (code, comments, commits, docs, issues, PRs, tickets, memory, third-party messages; `/caveman-compress` exempt). Harness asks for a status line.\n\n\
+### Pre-send check\n\n\
+Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? Cut.\n\n\
+### 跨设备 / 其他 agent\n\n\
+本文件随 git 仓库同步，用本仓库的 WorkBuddy 自动生效。非本仓库的 agent：复制本 `## 默认回复风格：ultracave` 整节到其项目指令即可，无需安装技能。\n";
+
 fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBuf> {
     let path = dir.join("AGENTS.md");
     ensure_bootstrap_block(&path);
@@ -4642,6 +4694,11 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     );
 
     let mut old = std::fs::read_to_string(&path).unwrap_or_default();
+    let ultracave = ULTRACAVE_BLOCK.to_string();
+
+    // 迁移：清掉旧的手动 `<!-- user:ultracave -->` 节（内部有 `## ` 子标题，
+    // 不能用 strip_tba_block，按下一个 tba 标记收边界）。新块由下面的 ultracave 逻辑补。
+    old = strip_marker_block_to_next_tba(&old, "<!-- user:ultracave");
 
     // 已经是新版就不用动：入口段只有一份、带裸命令、带「交回」「流转」「通用能力」。
     // 「**工具**：`tba`」同时当版本号用——老入口里是本机绝对路径，缺这句就整段
@@ -4659,6 +4716,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         // 「前台阻塞 / 绝不结束会话」，缺这句就整段重写一次。
         && old.contains("会话窗直接回");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
+    let ultracave_ok = old.matches(ULTRACAVE_MARK).count() == 1;
 
     // 转发脚本只写 `tba.exe`，不带本机绝对路径，换设备一样能用。
     // 带 .exe 后缀是必须的：只写 `tba` 的话 cmd 会先匹配到当前目录的 tba.cmd，
@@ -4669,7 +4727,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         let _ = std::fs::write(&shim, shim_text);
     }
 
-    if entry_ok && rules_ok {
+    if entry_ok && rules_ok && ultracave_ok {
         return None;
     }
 
@@ -4681,6 +4739,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     // 实测把一份 100 多行的 AGENTS.md 删到只剩两个块。
     old = strip_tba_block(&old, ENTRY_MARK);
     old = strip_tba_block(&old, RULES_MARK);
+    old = strip_tba_block(&old, ULTRACAVE_MARK);
     // 删块会留下连续空行，收一下。
     while old.contains("\n\n\n") {
         old = old.replace("\n\n\n", "\n\n");
@@ -4688,7 +4747,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
 
     // 绝不覆盖用户自己的内容：只在末尾追加。
     let mut s = old.trim_end().to_string();
-    for block in [&rules, &entry] {
+    for block in [&rules, &ultracave, &entry] {
         if !s.is_empty() {
             s.push_str("\n\n");
         }

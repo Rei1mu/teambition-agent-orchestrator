@@ -1,6 +1,6 @@
 # TBA
 
-![version](https://img.shields.io/badge/version-0.2.31-blue) ![platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20arm64-lightgrey) ![license](https://img.shields.io/badge/license-Apache--2.0-green) ![rust](https://img.shields.io/badge/rust-2021-orange)
+![version](https://img.shields.io/badge/version-0.2.32-blue) ![platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20arm64-lightgrey) ![license](https://img.shields.io/badge/license-Apache--2.0-green) ![rust](https://img.shields.io/badge/rust-2021-orange)
 
 **Teambition Agent Orchestrator** —— 让 AI agent 在 Teambition 上排队领任务、把过程写进任务备注，交回后由**后台常驻监听**等你在邮件 / 评论 / 会话窗回复，回复一到自动唤起会话继续，不用前台干等 10 分钟。
 
@@ -285,7 +285,7 @@ tba raw teambition.project.sfc-field-upsert --args '{"projectId":"<项目ID>","s
 | 查看 | `tba status` · `tba inbox` · `tba show <链接>` · `tba doctor` | 台账 / 待回复 / 单任务 / 自检 |
 | 邮件 | `tba mail status` · `tba mail test` · `tba mail check` · `tba mail resend <claim>` | 配置 / 发测试信 / 收一次 / 重发通知 |
 | 收尾 | `tba done <claim>` · `tba close <claim>` · `tba release <claim> --reason "..."` | 已解决 / 作废 / 退回队列（**仅用户授权后**） |
-| 发版 | `tba publish --tag v0.2.31 --watch` | 打 tag → 推 → 等 CI → 列产物 |
+| 发版 | `tba publish --tag v0.2.32 --watch` | 打 tag → 推 → 等 CI → 列产物 |
 
 > `tba mail check` 是诊断命令：会全量扫未读并把命中的信标记为已读，平时别拿它当常驻链路用。
 
@@ -359,7 +359,7 @@ cargo build --release --offline --locked
 **发版**：`Cargo.toml` 改版本号 → 提交 → 打 `v*` tag 推上去，`.github/workflows/release.yml` 在 `windows-latest` 上构建 x64 + arm64，用 `installer/tba.iss` 出两个 setup.exe 并挂到 Release：
 
 ```powershell
-tba publish --tag v0.2.31 --watch
+tba publish --tag v0.2.32 --watch
 ```
 
 手动触发 workflow 只构建、不上传 Release。安装脚本默认取 `releases/latest`，所以其他设备一句话安装就能拿到这一版。
