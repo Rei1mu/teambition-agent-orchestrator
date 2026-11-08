@@ -320,6 +320,53 @@ fn run_wait_block(
     }
 }
 
+// ask 把轮询监听 spawn 成独立 detached 子进程（`tba wait`），自己等着它退出。
+//
+// 为什么脱离 ask 进程：以前监听跑在 ask 同一个进程里，ask 被 SIGTERM / 关窗口 /
+// 沙箱回收一杀，监听就死，人类几小时后的回信没法唤醒会话（见 tba-cli 问题记录）。
+// 现在子进程用新进程组 + DETACHED 创建：ask 死了它照常每轮轮询，回信不丢。
+//
+// 正常情况：子进程收到回复退出 → ask 跟着退出（退出码透传）→ 唤醒会话，语义不变。
+// 被杀情况：ask 死了，子进程（新进程组）不受影响，继续监听，回信落 events / 状态。
+//
+// out_path：子进程把回复摘要（含 reply=N action=... 标记）写到这里，父进程退出前
+// 读出来打印给 agent 看。用文件而非继承管道，是为了父进程被杀时子进程不会因
+// 断管（broken pipe）panic 而跟着死——那样就失去 detached 的意义了。
+fn spawn_detached_watcher(
+    claim_id: &str,
+    out_path: &std::path::Path,
+) -> Result<std::process::Child, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("取当前 exe 路径失败: {e}"))?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("wait").arg(claim_id).stdin(std::process::Stdio::null());
+    // stdout → 回复摘要文件；打不开就退而求其次丢到 null（不影响监听）。
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_path)
+    {
+        cmd.stdout(std::process::Stdio::from(f));
+    } else {
+        cmd.stdout(std::process::Stdio::null());
+    }
+    // stderr → null：轮询期间每 300s 的「已等 N 秒」心跳打这里，不污染回复摘要。
+    cmd.stderr(std::process::Stdio::null());
+    // 新进程组：脱离 ask 的进程组，ask 被 SIGTERM 不会连带杀到它。
+    // DETACHED_PROCESS：不共享 ask 的控制台，关窗口也不死。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0200 | 0x0000_0008); // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // 新会话 / 进程组，脱离父进程，父进程被杀仍存活。
+        let _ = cmd.process_group(0);
+    }
+    cmd.spawn().map_err(|e| format!("spawn detached watcher 失败: {e}"))
+}
+
 // 通用能力的命令行入口。全是本地文件操作，不联网、不需要 token。
 //
 // 输出原则跟项目 skill 一致：list 只给「名字 + 一句话」，正文靠 show 或直接给名字
@@ -1689,12 +1736,28 @@ pub fn run() -> Result<(), String> {
                     );
                 } else {
                     println!(
-                        "\n开始常驻监听（每 {} 秒查一次评论/邮件，不设单轮上限）。\n\
-                         收到你的回复才返回，会话随即被唤起；执行中发来的话也会先记进 `tba events`。\n\
-                         不会因为等太久自己退出；agent 本轮回复可以正常结束，别重跑 ask（会重复发邮件）。",
+                        "\n已 spawn detached 常驻监听（每 {} 秒查一次评论/邮件，不设单轮上限）。\n\
+                         监听跑在独立子进程里，ask 被杀死也不影响它；收到你的回复子进程退出，会话随即被唤起。\n\
+                         执行中发来的话也会先记进 `tba events`；别重跑 ask（会重复发邮件）。",
                         cfg.wait_interval_secs
                     );
-                    run_wait_block(&store, &c.claim_id, None, None, true)?;
+                    // 监听交给 detached 子进程，ask 等着它退出：
+                    // 正常收到回复 → 子进程退出 → ask 透传退出码 → 唤醒会话（语义不变）。
+                    // ask 自己被杀 → 子进程（新进程组）存活，继续监听。
+                    let out_path = store.waits_dir().join(format!("{}.out", c.claim_id));
+                    let mut child = spawn_detached_watcher(&c.claim_id, &out_path)?;
+                    let status = child
+                        .wait()
+                        .map_err(|e| format!("等 watcher 退出失败: {e}"))?;
+                    // 子进程的回复摘要（含 reply=N action=... 标记）落到 out 文件，打印给 agent。
+                    if let Ok(s) = std::fs::read_to_string(&out_path) {
+                        let s = s.trim();
+                        if !s.is_empty() {
+                            println!("{s}");
+                        }
+                    }
+                    let _ = std::fs::remove_file(&out_path);
+                    std::process::exit(status.code().unwrap_or(0));
                 }
             }
         }

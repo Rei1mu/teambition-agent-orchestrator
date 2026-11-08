@@ -4655,11 +4655,10 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **交回**：做完两步，不许省：\n\
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
-         `ask` 发邮件后**后台常驻监听**评论和邮件（0=收尾 1=写记忆 2=有问题）。\
-         退出码：0=收到回复 / 3=已收尾；常驻模式不会因超时退出。\n\
-         **调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。\
-         前台窗口到点自动转后台（不杀进程），不用在前台干等 10 分钟；\
-         收到回复后监听退出，task-notification 唤醒 agent 续接。\n\
+         `ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（0=收尾 1=写记忆 2=有问题），\
+         父进程被杀监听不亡；收到回复子进程退出并唤醒会话。\n\
+         **调用**：直接 `tba ask <claim_id> --done`（关沙箱 / timeout 都不用管；监听已 detached 自愈）。\
+         收到回复自动唤起会话；会话窗直接回就先 `tba reply <claim_id>`。\n\
          **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、\
          看不到它，所以先跑 `{exe} reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。\n\
          禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
@@ -4711,7 +4710,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         && old.contains("**流转**")
         && old.contains("**通用能力**")
         && old.contains("git create")
-        && old.contains("dangerouslyDisableSandbox")
+        && old.contains("监听已 detached 自愈")
         // 「会话窗直接回」是 v0.2.29 后台挂起文案的版本号：老入口还写着
         // 「前台阻塞 / 绝不结束会话」，缺这句就整段重写一次。
         && old.contains("会话窗直接回");

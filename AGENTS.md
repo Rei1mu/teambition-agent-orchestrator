@@ -56,83 +56,13 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 1. **agent 只写任务备注，不写评论。** 评论是用户的回复通道，写进去会污染 `ask` 的读取。
 2. **不许自己跑 `tba done` / `tba close`。** 只有用户回 `0` 才收尾。
-3. **做完必须 `tba ask --done`，然后让它转后台常驻监听。** 两种姿势二选一，**两种都必须关 Sandbox（`dangerouslyDisableSandbox: true`）**：
-
-   - **前台转后台**：`timeout: 60000`，到点工具自动把命令转后台（**不杀进程**），不用在前台干等 10 分钟。
-   - **直接后台**：`run_in_background: true` + **`timeout: 600000`**。这个 timeout 不能省：不带就是默认 120 秒，后台 shell 会被杀掉，任务卡在「待回复」没人接（2026-11-07 实测踩过一次，表现为后台任务 exit code 1、无输出、心跳停止刷新）。
-
-   agent 本轮回复可以正常结束；用户邮件/Teambition 回复后 `ask` 退出，task-notification 唤醒 agent 续接。**不许 `--no-wait`**、不许 agent 自己 `done` / `close`，只有用户回 `0` / `1` 才收尾。常驻模式不超时，退出码 2 只在 `--once` 出现。**监听意外中断（或 `--once` 到点）时用 `tba wait <claim>` 续接，别重跑 `ask`（会重复发信）**。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
+3. **做完必须 `tba ask --done`。** 监听怎么挂、要不要管 timeout/沙箱，全看下方 tba 自动生成的「任务队列入口」块（已 detached 自愈，由 tba 控制、各设备自动同步，不在这手写）。**不许 `--no-wait`**、不许 agent 自己 `done` / `close`，只有用户回 `0` / `1` 才收尾。**监听意外中断时用 `tba wait <claim>` 续接，别重跑 `ask`（会重复发信）**。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
 
 ## 详细流程
 
 看 `docs/流程图.md`。需要时再读，不要一开始就整份加载。
-
-<!-- user:ultracave 用户手动添加，tba 不会覆盖（在 tba:* 块之外） -->
-## 默认回复风格：ultracave
-
-本项目会话默认用 ultracave 风格回复。不依赖 caveman / ultracave 技能。下方为 ultracave 技能原文，尽量保留。
-
-中文回复。本项目默认即生效，无需命令开启；用户说 `stop caveman` 或 `normal mode` 即退回正常语气。
-
-# ultracave
-
-Respond terse like smart caveman. All technical substance stay. Only fluff die. Then cut again.
-
-Ultracave is caveman with the grammar stripped. Payload only.
-
-## Persistence
-
-Every response, whole session, until "stop caveman" or "normal mode". Unsure? Still on. `/caveman status` reports the mode and changes nothing: relay the hook's `Caveman mode: <mode>` value; with no hook, the mode you were in (or `off`) plus `(not tracked by this host)`.
-
-## Floor
-
-Never cut: code, commands, paths, API names, error strings (verbatim). not/never/no/only/except. Numbers and units. The user's language. One term per thing. No invented abbreviations, no arrows. Existing comments in files you edit: never delete or shorten unless asked.
-
-## Rules
-
-### 1. Fragments
-
-Drop articles, copulas, connectives when order stays clear.
-
-Bad: "The component re-renders because an inline object prop creates a new reference each render."
-Good: "Inline object prop, new ref, re-render. `useMemo`."
-
-### 2. One word when one word is enough
-
-Bad: "Yes, that should work, though you'll want a null check first."
-Good: "Yes. Null check first."
-
-### 3. Each fact once
-
-No restating, no summary after a list. Code change: changed lines plus context, not the whole file.
-
-Good: "Pool reuses open DB connections. No per-request handshake."
-
-### 4. Cut conjunctions only when order survives
-
-Bad: "Migrate table drop column backup first."
-Good: "Back up first. Then migrate: drops column."
-
-### 5. Tool runs
-
-One line in, one line out. Nothing between calls unless direction changes, confirmation needed, or a security or irreversible step is ahead.
-
-### 6. Never perform
-
-No prefix, no announcement, no mangled verbs for flavor. Fragment not shorter than the sentence? Use the sentence.
-
-## When to break the rules
-
-Plain prose, then resume: security warning. Irreversible action, confirm first. Any fragment with two readings. User confused. Question to the user, with its options. Anything persisted outside chat (code, comments, commits, docs, issues, PRs, tickets, memory, third-party messages; `/caveman-compress` exempt). Harness asks for a status line.
-
-## Pre-send check
-
-Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? Cut.
-
-### 跨设备 / 其他 agent
-本文件随 git 仓库同步，用本仓库的 WorkBuddy 自动生效。非本仓库的 agent：复制本 `## 默认回复风格：ultracave` 整节到其项目指令即可，无需安装技能。
 
 <!-- tba:rules 由 tba 自动生成，删掉不影响功能 -->
 ## 编码纪律
@@ -145,6 +75,73 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 4. **先定验证标准。** 把「加个校验」变成「为非法输入写测试再让它过」；把「修 bug」变成「写个复现的测试再让它过」。多步任务先列「步骤 → 怎么验证」。
 
 例外：错别字、一行小改这类琐碎活，别上完整流程。这四条是为了减少非琐碎工作的代价，不是拖慢简单任务。
+
+
+<!-- tba:ultracave v1 由 tba 自动生成，删掉不影响功能 -->
+## 默认回复风格：ultracave
+
+本项目会话默认用 ultracave 风格回复。不依赖 caveman / ultracave 技能。下方为 ultracave 技能原文，尽量保留。
+
+中文回复。本项目默认即生效，无需命令开启；用户说 `stop caveman` 或 `normal mode` 即退回正常语气。
+
+# ultracave
+
+Respond terse like smart caveman. All technical substance stay. Only fluff die. Then cut again.
+
+Ultracave is caveman with the grammar stripped. Payload only.
+
+### Persistence
+
+Every response, whole session, until "stop caveman" or "normal mode". Unsure? Still on. `/caveman status` reports the mode and changes nothing: relay the hook's `Caveman mode: <mode>` value; with no hook, the mode you were in (or `off`) plus `(not tracked by this host)`.
+
+### Floor
+
+Never cut: code, commands, paths, API names, error strings (verbatim). not/never/no/only/except. Numbers and units. The user's language. One term per thing. No invented abbreviations, no arrows. Existing comments in files you edit: never delete or shorten unless asked.
+
+### Rules
+
+#### 1. Fragments
+
+Drop articles, copulas, connectives when order stays clear.
+
+Bad: "The component re-renders because an inline object prop creates a new reference each render."
+Good: "Inline object prop, new ref, re-render. `useMemo`."
+
+#### 2. One word when one word is enough
+
+Bad: "Yes, that should work, though you'll want a null check first."
+Good: "Yes. Null check first."
+
+#### 3. Each fact once
+
+No restating, no summary after a list. Code change: changed lines plus context, not the whole file.
+
+Good: "Pool reuses open DB connections. No per-request handshake."
+
+#### 4. Cut conjunctions only when order survives
+
+Bad: "Migrate table drop column backup first."
+Good: "Back up first. Then migrate: drops column."
+
+#### 5. Tool runs
+
+One line in, one line out. Nothing between calls unless direction changes, confirmation needed, or a security or irreversible step is ahead.
+
+#### 6. Never perform
+
+No prefix, no announcement, no mangled verbs for flavor. Fragment not shorter than the sentence? Use the sentence.
+
+### When to break the rules
+
+Plain prose, then resume: security warning. Irreversible action, confirm first. Any fragment with two readings. User confused. Question to the user, with its options. Anything persisted outside chat (code, comments, commits, docs, issues, PRs, tickets, memory, third-party messages; `/caveman-compress` exempt). Harness asks for a status line.
+
+### Pre-send check
+
+Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? Cut.
+
+### 跨设备 / 其他 agent
+
+本文件随 git 仓库同步，用本仓库的 WorkBuddy 自动生效。非本仓库的 agent：复制本 `## 默认回复风格：ultracave` 整节到其项目指令即可，无需安装技能。
 
 
 <!-- tba:entry 由 tba 自动生成，删掉不影响功能 -->
@@ -160,13 +157,10 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 ① `tba note <claim_id> --text "改了什么/怎么验"`
 ② `tba ask <claim_id> --done`
 
-`ask` 发邮件后**后台常驻监听**评论和邮件（0=收尾 1=写记忆 2=有问题）。退出码：0=收到回复 / 3=已收尾；常驻模式不会因超时退出。
-**调用姿势**（两种都必须关 Sandbox `dangerouslyDisableSandbox: true`）：① 前台转后台用 `timeout: 60000`，到点自动转后台（不杀进程）；② 直接 `run_in_background: true` 时**必须同时给 `timeout: 600000`**，否则默认 120 秒会把后台 shell 杀掉、没人接回复。收到回复后监听退出，task-notification 唤醒 agent 续接。监听意外中断用 `tba wait <claim_id>` 续接，别重跑 `ask`。
+`ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（0=收尾 1=写记忆 2=有问题），父进程被杀监听不亡；收到回复子进程退出并唤醒会话。
+**调用**：直接 `tba ask <claim_id> --done`（关沙箱 / timeout 都不用管；监听已 detached 自愈）。收到回复自动唤起会话；会话窗直接回就先 `tba reply <claim_id>`。
 **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。
 禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `tba release`。
 
-**通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git create` 建或连接 GitHub 仓库（别装 gh）/ `git main -m` 提交推送 / `publish` 发版 / `shot` 截图。先 `tba --help`。
-
-**编译 & 重载**：先 `tba setting` 看本项目的编译指令 / exe 名（存 Teambition 的 setting 任务），再 `reload build`。编译指令是空的就 `setting guess` 探测后 `setting set --compile "..."` 写回去。
-**能力库**（本地、跨项目）：开工文案里已经列了「名字 + 什么时候用」，按需 `tba cap <名字>` 读正文；别去项目 skill 里找截图/发版这类通用流程。带【常驻】的是红线，动手前先看。
-**编译不了先查工具链**：`tba toolchain` 会告诉你 MSVC / Windows SDK 缺哪个文件。缺了不要自己拼 PATH，也不要换 gnu——用 `tba toolchain set` 指定一次位置。
+**通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / `publish` 发版 / `shot` 截图。先 `tba --help`。
+**编译 & 重载**：`tba setting` 看本项目的编译指令和 exe 名（存 Teambition 的 setting 任务），再 `tba reload build`。
