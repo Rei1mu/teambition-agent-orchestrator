@@ -55,8 +55,8 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
    以后每次 `tba go` 都会自动再查再补一次。
 
 1. **agent 只写任务备注，不写评论。** 评论是用户的回复通道，写进去会污染 `ask` 的读取。
-2. **不许自己跑 `tba done` / `tba close`。** 只有用户回 `0` 才收尾。
-3. **做完必须 `tba ask --done`。** 监听怎么挂、要不要管 timeout/沙箱，全看下方 tba 自动生成的「任务队列入口」块（已 detached 自愈，由 tba 控制、各设备自动同步，不在这手写）。**不许 `--no-wait`**、不许 agent 自己 `done` / `close`，只有用户回 `0` / `1` 才收尾。**监听意外中断时用 `tba wait <claim>` 续接，别重跑 `ask`（会重复发信）**。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
+2. **不许自己跑 `tba done` / `tba close`。** 只有用户回 `1` 才收尾。
+3. **做完必须 `tba ask --done`。** 监听怎么挂、要不要管 timeout/沙箱，全看下方 tba 自动生成的「任务队列入口」块（已 detached 自愈，由 tba 控制、各设备自动同步，不在这手写）。**不许 `--no-wait`**、不许 agent 自己 `done` / `close`，只有用户回 `1` 才收尾（`2`=写记忆、`3+`=有问题、`0` 已废弃，都不收尾）。**监听意外中断时用 `tba wait <claim>` 续接，别重跑 `ask`（会重复发信）**。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
 
@@ -157,7 +157,9 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 ① `tba note <claim_id> --text "改了什么/怎么验"`
 ② `tba ask <claim_id> --done`
 
-`ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（0=收尾 1=写记忆 2=有问题），父进程被杀监听不亡；收到回复子进程退出并唤醒会话。
+`ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（1=收尾 2=写记忆 3+=有问题；0 已废弃按原文不收尾），父进程被杀监听不亡；收到回复子进程退出并唤醒会话。
+**自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。
+**只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，别当收尾确认。
 **调用**：直接 `tba ask <claim_id> --done`（关沙箱 / timeout 都不用管；监听已 detached 自愈）。收到回复自动唤起会话；会话窗直接回就先 `tba reply <claim_id>`。
 **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。
 禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `tba release`。

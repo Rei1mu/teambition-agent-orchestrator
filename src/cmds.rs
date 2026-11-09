@@ -249,6 +249,10 @@ fn run_wait_block(
                 }
                 ReplyAction::Custom(n) => {
                     println!("用户说有问题，选了你自定义的选项 {n}，按你在问题里写的语义执行。干完汇报。");
+                    // 选项释义只在本次问题里，回显出来免得 agent 去翻任务备注。
+                    if !c.question.trim().is_empty() {
+                        println!("\n---- 本次问题（选项 {n} 的含义） ----\n{}", c.question);
+                    }
                 }
                 ReplyAction::Free => {
                     println!("用户没回有效数字（含废弃的 0），按原文理解。干完汇报。");
@@ -1625,7 +1629,7 @@ pub fn run() -> Result<(), String> {
                 }
             }
             println!("\n接单完成。做完必须交回用户：tba ask {} --done（后台常驻监听，收到回复自动唤起会话；本轮回复可正常结束）", c.claim_id);
-            println!("自定义问题用: tba ask {} -q \"...\"  |  放弃用: tba release {}", c.claim_id, c.claim_id);
+            println!("自定义问题用: tba ask {} -q \"...\"（选项从 3 起编号，1/2 是系统保留号）  |  放弃用: tba release {}", c.claim_id, c.claim_id);
         }
         Cmd::Start {
             project,
@@ -1678,7 +1682,7 @@ pub fn run() -> Result<(), String> {
                 r.list_now
             );
             println!("\n开工完成。做完必须交回用户：tba ask {} --done（后台常驻监听，收到回复自动唤起会话）", c.claim_id);
-            println!("自定义问题用: tba ask {} -q \"...\"  |  放弃用: tba release {}", c.claim_id, c.claim_id);
+            println!("自定义问题用: tba ask {} -q \"...\"（选项从 3 起编号，1/2 是系统保留号）  |  放弃用: tba release {}", c.claim_id, c.claim_id);
         }
         Cmd::Ask {
             claim_id,
@@ -1691,7 +1695,7 @@ pub fn run() -> Result<(), String> {
                 DONE_QUESTION.to_string()
             } else {
                 question.ok_or(
-                    "要给问题：`-q \"...\"`，或者加 `--done` 用标准的「做完了请确认」三选项",
+                    "要给问题：`-q \"...\"`（自定义选项从 3 起编号，1/2 是系统保留号），或者加 `--done` 用标准的「做完了请确认」三选项",
                 )?
             };
             // 直连模式：不写任务、不发信、不阻塞。问题直接打到 stdout，

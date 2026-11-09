@@ -1824,8 +1824,31 @@ pub fn start(
 pub const DONE_QUESTION: &str = "已完成，请确认：\n\n\
 1 = 已解决，收尾（转「已解决」+ 列「已解决」）\n\
 2 = 先写项目记忆（回「进行中」，写完再问一次）\n\
-3+ = 有问题，继续改（选项见本次问题里的说明）\n\n\
+3+ = 有问题，继续改（agent 给选项时从 3 起编号；1/2 是系统保留号）\n\n\
 直接回复数字即可。会话会一直挂着等你，不会自己结束。";
+
+// 自定义问题里 1/2 是系统保留号：用户回 1 会被 tb 直接收尾、回 2 会被当成写记忆，
+// agent 写在问题里的选项语义根本到不了 agent 手上。发信前拦下来，别靠文案自觉。
+// 只认明确的编号行（1 = / 1＝ / 1. / 1、 / 1) / 1： ），
+// 正文里的「1 个窗口」「2026 年」不算，别误拒正常问题。
+pub fn validate_custom_question(q: &str) -> Result<(), String> {
+    for line in q.lines() {
+        let t = line.trim_start();
+        let rest = match t.as_bytes().first() {
+            Some(b'1') | Some(b'2') => &t[1..],
+            _ => continue,
+        };
+        let sep = rest.trim_start().chars().next();
+        if sep.map_or(false, |c| "=＝.、)）:：".contains(c)) {
+            return Err(format!(
+                "问题里用了系统保留号当选项编号：{t}\n\
+                 1 = 已解决收尾、2 = 先写项目记忆，这两个数字由 tb 直接执行，agent 不能占用。\n\
+                 自定义选项请从 3 起编号（3/4/5…），重跑 `tba ask <claim_id> -q \"...\"`。"
+            ));
+        }
+    }
+    Ok(())
+}
 
 // 手机端 Teambition 不渲染内置备注 `note`，任务详情里的备注是一片空白。
 // 所以把「本轮待回复内容」再镜像一份到文本自定义字段「待回复」。
@@ -1877,6 +1900,11 @@ pub fn ask(store: &Store, claim_id: &str, question: &str) -> Result<Claim, Strin
     let q = question.trim();
     if q.is_empty() {
         return Err("问题不能为空。用法: tba ask <claim_id> --q \"要问用户的话\"".into());
+    }
+    // 标准 --done 问题里本来就有 1 = / 2 =，那是系统动作号，不是自定义选项。
+    // 其余自定义问题一律先过编号校验，别让 agent 把 1/2 占用成自己的选项。
+    if q != DONE_QUESTION {
+        validate_custom_question(q)?;
     }
     let mut ctx = Ctx::new(store.clone(), false)?;
     let stages = ctx.ensure_stages(&claim.project_id)?;
@@ -2274,6 +2302,10 @@ pub fn tasklist_guidance(project_id: &str, r: &TasklistResult, verbose: bool) ->
 //   0 = 已废弃，按原文处理，不收尾（防旧习惯误收尾）
 //
 // **只有 1 收尾，其余一律回列2。**
+//
+// **1/2 是系统保留号，agent 自定义问题（ask -q）里不许拿它们当选项编号**，
+// 自定义选项一律从 3 起编号。否则用户回 1 会被 tb 直接收尾、回 2 会被当成
+// 写记忆，agent 写在问题里的语义根本到不了 agent 手上。
 //
 // 为什么 tb 执行而不是 agent 执行：这是**流程**不是**判断**。让 agent 解释数字
 // 再跑 done，中间有几十种出错方式（理解错、忘改列、先汇报再改导致状态错乱）。
@@ -3889,7 +3921,7 @@ fn workflow_text_zh(
     // 第 3 步：数字协议由 tb 执行（agent 不解释、不跑 done），只有 1 收尾。
     // ask 默认挂后台常驻监听，所以这里不再有单独的 wait 一步。
     s.push_str(&format!(
-        "3. 要用户输入：`{exe} ask <claim_id> -q \"问题（写清数字含义）\"`（问题进备注，转「{0}」+列「{1}」，发邮件，**问完后台常驻监听，本轮回复可正常结束**）。回复数字 tb 自动处理：1=已解决→列{3}收尾；2=先写项目记忆→列{2}，写完再ask；3+=有问题，按你在问题里自定义的选项→列{2}；非数字=按原文→列{2}；0 已废弃，按原文不收尾。只有1收尾，其余回列{2}。只等别重复问。选项用纯文本编号，禁用选择框/弹窗。\n",
+        "3. 要用户输入：`{exe} ask <claim_id> -q \"问题（写清数字含义）\"`（问题进备注，转「{0}」+列「{1}」，发邮件，**问完后台常驻监听，本轮回复可正常结束**）。回复数字 tb 自动处理：1=已解决→列{3}收尾；2=先写项目记忆→列{2}，写完再ask；3+=有问题→列{2}；非数字=按原文→列{2}；0 已废弃，按原文不收尾。只有1收尾，其余回列{2}。只等别重复问。自定义问题里选项必须从 3 起编号（3/4/5…），1/2 是系统保留号（1=收尾 2=写记忆，tb 直接执行），拿来当自己的选项会导致用户回 1 被误收尾，tba 会拒绝发这种问题。选项用纯文本编号，禁用选择框/弹窗。\n",
         STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
     ));
 
@@ -3901,12 +3933,12 @@ fn workflow_text_zh(
     let ask_posture = "**ask 调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点工具自动把命令转后台（**不杀进程**），常驻监听继续挂着，不用在前台干等 10 分钟；agent 本轮回复正常结束即可。用户回邮件/评论后监听退出 → task-notification 唤醒会话。**只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，绝不能当成收尾确认。**会话窗直接回**：用户在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。禁止 `--no-wait`。";
     if memory_on {
         s.push_str(&format!(
-            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
+            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题，自定义选项从 3 起编号；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
             STAGE_WAIT, cfg.tasklist_wait, STAGE_DONE, STAGE_CLOSED, cfg.tasklist_done, cfg.tasklist_closed, STAGE_TODO, cfg.tasklist_queue
         ));
     } else {
         s.push_str(&format!(
-            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
+            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题，自定义选项从 3 起编号；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
             STAGE_WAIT, cfg.tasklist_wait, STAGE_DONE, STAGE_CLOSED, cfg.tasklist_done, cfg.tasklist_closed, STAGE_TODO, cfg.tasklist_queue
         ));
     }
@@ -3982,12 +4014,12 @@ fn workflow_text(
     }
 
     s.push_str(&format!(
-        "3. Need user input: `{exe} ask <claim_id> -q \"question (state each number's meaning)\"` (-> {0} + column \"{1}\", mail sent; BLOCKS for the reply in place). tb handles numbers: 1=solved -> col {3}, closed; 2=write project memory first -> col {2}, then ask again; 3+=problem, agent-defined options -> col {2}; non-number=read as text -> col {2}; 0 deprecated, read as text, never closes. ONLY 1 closes; others return to col {2}. Plain numbered options; NEVER use a picker or modal dialog.\n",
+        "3. Need user input: `{exe} ask <claim_id> -q \"question (state each number's meaning)\"` (-> {0} + column \"{1}\", mail sent; BLOCKS for the reply in place). tb handles numbers: 1=solved -> col {3}, closed; 2=write project memory first -> col {2}, then ask again; 3+=problem -> col {2}; non-number=read as text -> col {2}; 0 deprecated, read as text, never closes. ONLY 1 closes; others return to col {2}. In a custom question, number your own options from 3 (3/4/5...): 1/2 are reserved system actions (1=close 2=memory, executed by tb), using them as your options would mis-close the task on reply 1, and tba rejects such questions. Plain numbered options; NEVER use a picker or modal dialog.\n",
         STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
     ));
 
     let handoff = format!(
-        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\"`; (b) `{exe} ask <claim_id> --done` (1=close/2=memory first/3+=still broken; -> {0} + column \"{1}\", mail sent; BLOCKS in foreground - NEVER run_in_background, never end session). Run ask with sandbox OFF (`dangerouslyDisableSandbox: true`) and `timeout: 600000`: sandbox SIGTERMs a blocking ask at ~78s. On foreground timeout the tool auto-backgrounds it; the user's reply ends ask and a task-notification wakes the agent. NEVER set run_in_background yourself, never `--no-wait`. NEVER stop in {2} - the user's reply would go unread. ",
+        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\"`; (b) `{exe} ask <claim_id> --done` (1=close/2=memory first/3+=still broken, custom options numbered from 3; -> {0} + column \"{1}\", mail sent; BLOCKS in foreground - NEVER run_in_background, never end session). Run ask with sandbox OFF (`dangerouslyDisableSandbox: true`) and `timeout: 600000`: sandbox SIGTERMs a blocking ask at ~78s. On foreground timeout the tool auto-backgrounds it; the user's reply ends ask and a task-notification wakes the agent. NEVER set run_in_background yourself, never `--no-wait`. NEVER stop in {2} - the user's reply would go unread. ",
         STAGE_WAIT, cfg.tasklist_wait, STAGE_DOING
     );
 
@@ -4656,6 +4688,8 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          ② `{exe} ask <claim_id> --done`\n\n\
          `ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（1=收尾 2=写记忆 3+=有问题；0 已废弃按原文不收尾），\
          父进程被杀监听不亡；收到回复子进程退出并唤醒会话。\n\
+         **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，\
+         拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。\n\
          **只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，别当收尾确认。\n\
          **调用**：直接 `tba ask <claim_id> --done`（关沙箱 / timeout 都不用管；监听已 detached 自愈）。\
          收到回复自动唤起会话；会话窗直接回就先 `tba reply <claim_id>`。\n\
@@ -4711,6 +4745,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         && old.contains("**通用能力**")
         && old.contains("git create")
         && old.contains("监听已 detached 自愈")
+        // v0.2.35 数字协议版本号：老入口还写着 0/1/2 选项或没有保留号规则，
+        // 缺这句就整段重写一次，否则 agent 一直按旧协议出题、和待回复数字打架。
+        && old.contains("1/2 是系统保留号")
         // 「会话窗直接回」是 v0.2.29 后台挂起文案的版本号：老入口还写着
         // 「前台阻塞 / 绝不结束会话」，缺这句就整段重写一次。
         && old.contains("会话窗直接回");
