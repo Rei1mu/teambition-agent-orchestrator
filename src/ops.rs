@@ -1820,11 +1820,11 @@ pub fn start(
 }
 
 // 「做完了，请确认」的标准问题。`ask --done` 用它，免得 agent 每次自己编数字选项、
-// 编漏一个（最常见是忘了 0 收尾）。
+// 编漏一个（最常见是忘了 1 收尾）。
 pub const DONE_QUESTION: &str = "已完成，请确认：\n\n\
-0 = 收尾（转「已解决」+ 列「已解决」）\n\
-1 = 先写项目记忆再收尾（回「进行中」，写完再问一次）\n\
-2 = 还有问题，继续改（回「进行中」）\n\n\
+1 = 已解决，收尾（转「已解决」+ 列「已解决」）\n\
+2 = 先写项目记忆（回「进行中」，写完再问一次）\n\
+3+ = 有问题，继续改（选项见本次问题里的说明）\n\n\
 直接回复数字即可。会话会一直挂着等你，不会自己结束。";
 
 // 手机端 Teambition 不渲染内置备注 `note`，任务详情里的备注是一片空白。
@@ -2011,7 +2011,7 @@ pub fn resend_mail(store: &Store, claim_id: &str) -> Result<String, String> {
 }
 
 // 邮件正文只放「本次处理内容」+ 问题 + 回复要求 + 链接。
-// 不放累积的整条任务备注：那边有历次会话的内容，还有 0/1/2 选项说明，
+// 不放累积的整条任务备注：那边有历次会话的内容，还有 1/2/3+ 选项说明，
 // 被客户端引用回来会干扰回信解析。
 // 第一行一律是「---」开头的标题行：客户端把原邮件平铺进回信时，
 // ops::strip_reply_noise 在这里截断，引用里的数字不会被误认成用户的选择。
@@ -2024,7 +2024,7 @@ fn mail_body(claim: &Claim, question: &str, work: &str) -> String {
     };
     format!(
         "{block}---------- 需要你回复 ----------\n\n{q}\n\n\
-         请只回一个数字 0/1/2。不要保留引用原文，不要写其它内容。\n\n\
+         请只回一个数字 1/2/3+。不要保留引用原文，不要写其它内容。\n\n\
          链接：https://www.teambition.com/task/{task}\n\n\
          直接回复本邮件即可（请保留标题里的 [TB {cid}]，否则认不出是哪条任务）。",
         block = block,
@@ -2264,31 +2264,29 @@ pub fn tasklist_guidance(project_id: &str, r: &TasklistResult, verbose: bool) ->
 //
 // 时间约束：Bash 工具单次上限 600 秒，超了会被 auto-background，agent 就拿不到
 // 结果了。所以单轮默认 540 秒**主动返回**，由 agent 文案规定「超时再跑一轮」。
-// ---- 待回复的数字协议（用户 2026-10-26 定）----
+// ---- 待回复的数字协议（用户 2026-11-09 改）----
 //
 // 用户在看板/评论里回复数字，tb 直接按数字动作，**不让 agent 解释再执行**：
-//   0 = 问题已解决 → 「已解决」+ 列4，收尾
-//   1 = 已解决，但要先把这次的经验写进项目记忆 → 列2，agent 写完再进待回复
-//   2 = 问题未解决 → 列2，agent 自查后重新给选项
-//   3+ = agent 在问题里自定义的选项 → 列2
+//   1 = 问题已解决 → 「已解决」+ 列4，收尾
+//   2 = 先写项目记忆 → 列2，agent 写完再进待回复
+//   3+ = 有问题，选项由 agent 在问题里自定义 → 列2
 //   非数字 = 按原文理解 → 列2
+//   0 = 已废弃，按原文处理，不收尾（防旧习惯误收尾）
 //
-// **只有 0 收尾，其余一律回列2。**
+// **只有 1 收尾，其余一律回列2。**
 //
 // 为什么 tb 执行而不是 agent 执行：这是**流程**不是**判断**。让 agent 解释数字
 // 再跑 done，中间有几十种出错方式（理解错、忘改列、先汇报再改导致状态错乱）。
-// 而用户回复 0 就是明确授权，tb 只是执行用户的指令，不违反「收尾权在用户」。
+// 而用户回复 1 就是明确授权，tb 只是执行用户的指令，不违反「收尾权在用户」。
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReplyAction {
-    // 0：收尾到「已解决」+ 列4
+    // 1：收尾到「已解决」+ 列4
     Closed,
-    // 1：已解决但先写项目记忆，写完再进待回复
+    // 2：先写项目记忆，写完再进待回复
     Summarize,
-    // 2：未解决，自查后重新给选项
-    Recheck,
-    // 3+：agent 自定义的选项
+    // 3+：有问题，agent 自定义的选项
     Custom(u32),
-    // 非数字或有歧义，交给 agent 读原文
+    // 非数字、废弃的 0 或有歧义，交给 agent 读原文
     Free,
 }
 
@@ -2297,18 +2295,16 @@ impl ReplyAction {
         match self {
             ReplyAction::Closed => "closed".to_string(),
             ReplyAction::Summarize => "summarize".to_string(),
-            ReplyAction::Recheck => "recheck".to_string(),
             ReplyAction::Custom(n) => format!("custom n={n}"),
             ReplyAction::Free => "free".to_string(),
         }
     }
 
-    // 对应的数字。Free 没有数字（用户没回数字）。
+    // 对应的数字。Free 没有数字（用户没回数字 / 回了废弃的 0）。
     pub fn num(&self) -> Option<u32> {
         match self {
-            ReplyAction::Closed => Some(0),
-            ReplyAction::Summarize => Some(1),
-            ReplyAction::Recheck => Some(2),
+            ReplyAction::Closed => Some(1),
+            ReplyAction::Summarize => Some(2),
             ReplyAction::Custom(n) => Some(*n),
             ReplyAction::Free => None,
         }
@@ -2317,7 +2313,7 @@ impl ReplyAction {
 
 // 剥离引用/转发/任务备注，只留用户新增文本。
 //
-// 邮件回信常带整封原始邮件（含 0/1/2 选项说明、任务备注、链接），
+// 邮件回信常带整封原始邮件（含 1/2/3+ 选项说明、任务备注、链接），
 // 不剥掉就会从引用里抽出错误的数字，把任务误收尾。
 // 两通道共用：Teambition 评论、邮件回信写成评论后的文本，都先过这里。
 pub fn strip_reply_noise(text: &str) -> String {
@@ -2423,10 +2419,13 @@ pub fn parse_reply(text: &str) -> (ReplyAction, String) {
         })
         .trim()
         .to_string();
+    // 0 已废弃：按原文处理、不收尾，原文（含 0）原样交回 agent。
+    if n == 0 {
+        return (ReplyAction::Free, added);
+    }
     let act = match n {
-        0 => ReplyAction::Closed,
-        1 => ReplyAction::Summarize,
-        2 => ReplyAction::Recheck,
+        1 => ReplyAction::Closed,
+        2 => ReplyAction::Summarize,
         _ => ReplyAction::Custom(n),
     };
     (act, body)
@@ -2707,7 +2706,7 @@ pub fn wait(
             let (action, body) = parse_reply(&last);
             // 复用 resume：推回 进行中 + 列2，并清掉 ask_at 防止下次读重。
             let (c, replies) = resume(store, claim_id)?;
-            // 回复 0 = 用户明确授权收尾 → tb 直接执行。
+            // 回复 1 = 用户明确授权收尾 → tb 直接执行。
             // （agent 自己跑 tb done 依然禁止，这里执行的是**用户**的指令。）
             if action == ReplyAction::Closed {
                 let c2 = finish(store, claim_id, STAGE_DONE)?;
@@ -3887,10 +3886,10 @@ fn workflow_text_zh(
         ));
     }
 
-    // 第 3 步：数字协议由 tb 执行（agent 不解释、不跑 done），只有 0 收尾。
+    // 第 3 步：数字协议由 tb 执行（agent 不解释、不跑 done），只有 1 收尾。
     // ask 默认挂后台常驻监听，所以这里不再有单独的 wait 一步。
     s.push_str(&format!(
-        "3. 要用户输入：`{exe} ask <claim_id> -q \"问题（写清数字含义）\"`（问题进备注，转「{0}」+列「{1}」，发邮件，**问完后台常驻监听，本轮回复可正常结束**）。回复数字 tb 自动处理：0=已解决→列{3}收尾；1=先写项目记忆→列{2}，写完再ask；2=未解决→列{2}自查再给选项；3+=自定义→列{2}；非数字=按原文。只有0收尾，其余回列{2}。只等别重复问。选项用纯文本编号，禁用选择框/弹窗。\n",
+        "3. 要用户输入：`{exe} ask <claim_id> -q \"问题（写清数字含义）\"`（问题进备注，转「{0}」+列「{1}」，发邮件，**问完后台常驻监听，本轮回复可正常结束**）。回复数字 tb 自动处理：1=已解决→列{3}收尾；2=先写项目记忆→列{2}，写完再ask；3+=有问题，按你在问题里自定义的选项→列{2}；非数字=按原文→列{2}；0 已废弃，按原文不收尾。只有1收尾，其余回列{2}。只等别重复问。选项用纯文本编号，禁用选择框/弹窗。\n",
         STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
     ));
 
@@ -3899,15 +3898,15 @@ fn workflow_text_zh(
     // 现在 ask 常驻不超时退出，前台窗口只留 60 秒让工具把进程转后台（不杀），
     // agent 本轮回复可以正常结束，收到回复时 task-notification 会把会话拉起来。
     // 调用姿势单独抽出来，两个分支共用，免得只改一处、文案分叉。
-    let ask_posture = "**ask 调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点工具自动把命令转后台（**不杀进程**），常驻监听继续挂着，不用在前台干等 10 分钟；agent 本轮回复正常结束即可。用户回邮件/评论后监听退出 → task-notification 唤醒会话。**会话窗直接回**：用户在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。禁止 `--no-wait`。";
+    let ask_posture = "**ask 调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点工具自动把命令转后台（**不杀进程**），常驻监听继续挂着，不用在前台干等 10 分钟；agent 本轮回复正常结束即可。用户回邮件/评论后监听退出 → task-notification 唤醒会话。**只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，绝不能当成收尾确认。**会话窗直接回**：用户在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。禁止 `--no-wait`。";
     if memory_on {
         s.push_str(&format!(
-            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（0=收尾/1=先写记忆/2=还有问题；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
+            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
             STAGE_WAIT, cfg.tasklist_wait, STAGE_DONE, STAGE_CLOSED, cfg.tasklist_done, cfg.tasklist_closed, STAGE_TODO, cfg.tasklist_queue
         ));
     } else {
         s.push_str(&format!(
-            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（0=收尾/1=先写记忆/2=还有问题；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
+            "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
             STAGE_WAIT, cfg.tasklist_wait, STAGE_DONE, STAGE_CLOSED, cfg.tasklist_done, cfg.tasklist_closed, STAGE_TODO, cfg.tasklist_queue
         ));
     }
@@ -3983,12 +3982,12 @@ fn workflow_text(
     }
 
     s.push_str(&format!(
-        "3. Need user input: `{exe} ask <claim_id> -q \"question (state each number's meaning)\"` (-> {0} + column \"{1}\", mail sent; BLOCKS for the reply in place). tb handles numbers: 0=solved -> col {3}, closed; 1=solved but write project memory first -> col {2}, then ask again; 2=not solved -> col {2}, recheck, offer options; 3+=your own -> col {2}; non-number=read as text. ONLY 0 closes; others return to col {2}. Plain numbered options; NEVER use a picker or modal dialog.\n",
+        "3. Need user input: `{exe} ask <claim_id> -q \"question (state each number's meaning)\"` (-> {0} + column \"{1}\", mail sent; BLOCKS for the reply in place). tb handles numbers: 1=solved -> col {3}, closed; 2=write project memory first -> col {2}, then ask again; 3+=problem, agent-defined options -> col {2}; non-number=read as text -> col {2}; 0 deprecated, read as text, never closes. ONLY 1 closes; others return to col {2}. Plain numbered options; NEVER use a picker or modal dialog.\n",
         STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
     ));
 
     let handoff = format!(
-        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\"`; (b) `{exe} ask <claim_id> --done` (0=close/1=memory then close/2=still broken; -> {0} + column \"{1}\", mail sent; BLOCKS in foreground - NEVER run_in_background, never end session). Run ask with sandbox OFF (`dangerouslyDisableSandbox: true`) and `timeout: 600000`: sandbox SIGTERMs a blocking ask at ~78s. On foreground timeout the tool auto-backgrounds it; the user's reply ends ask and a task-notification wakes the agent. NEVER set run_in_background yourself, never `--no-wait`. NEVER stop in {2} - the user's reply would go unread. ",
+        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\"`; (b) `{exe} ask <claim_id> --done` (1=close/2=memory first/3+=still broken; -> {0} + column \"{1}\", mail sent; BLOCKS in foreground - NEVER run_in_background, never end session). Run ask with sandbox OFF (`dangerouslyDisableSandbox: true`) and `timeout: 600000`: sandbox SIGTERMs a blocking ask at ~78s. On foreground timeout the tool auto-backgrounds it; the user's reply ends ask and a task-notification wakes the agent. NEVER set run_in_background yourself, never `--no-wait`. NEVER stop in {2} - the user's reply would go unread. ",
         STAGE_WAIT, cfg.tasklist_wait, STAGE_DOING
     );
 
@@ -4655,8 +4654,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **交回**：做完两步，不许省：\n\
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
-         `ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（0=收尾 1=写记忆 2=有问题），\
+         `ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（1=收尾 2=写记忆 3+=有问题；0 已废弃按原文不收尾），\
          父进程被杀监听不亡；收到回复子进程退出并唤醒会话。\n\
+         **只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，别当收尾确认。\n\
          **调用**：直接 `tba ask <claim_id> --done`（关沙箱 / timeout 都不用管；监听已 detached 自愈）。\
          收到回复自动唤起会话；会话窗直接回就先 `tba reply <claim_id>`。\n\
          **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、\
@@ -5209,38 +5209,38 @@ mod tests {
     }
 
     // 两种语言的关键不变量一条都不许丢。
-    // 数字回复协议：只有 0 收尾，其余都回列2。
+    // 数字回复协议：只有 1 收尾，其余都回列2；0 已废弃，按原文不收尾。
     // 解析必须防歧义——宁可当文本让 agent 读原文，也不猜错（猜错就是收错任务）。
     #[test]
     fn reply_numbers_map_to_actions() {
         // 干净的数字
-        assert_eq!(parse_reply("0").0, ReplyAction::Closed);
-        assert_eq!(parse_reply("1").0, ReplyAction::Summarize);
-        assert_eq!(parse_reply("2").0, ReplyAction::Recheck);
+        assert_eq!(parse_reply("0").0, ReplyAction::Free);
+        assert_eq!(parse_reply("1").0, ReplyAction::Closed);
+        assert_eq!(parse_reply("2").0, ReplyAction::Summarize);
         assert_eq!(parse_reply("3").0, ReplyAction::Custom(3));
         assert_eq!(parse_reply("9").0, ReplyAction::Custom(9));
 
         // 数字后面跟标点 / 空白 / 中文：认
-        assert_eq!(parse_reply("0.").0, ReplyAction::Closed);
-        assert_eq!(parse_reply("0 可以了").0, ReplyAction::Closed);
-        assert_eq!(parse_reply("0可以了").0, ReplyAction::Closed);
-        assert_eq!(parse_reply("  1  ").0, ReplyAction::Summarize);
+        assert_eq!(parse_reply("0.").0, ReplyAction::Free);
+        assert_eq!(parse_reply("0 可以了").0, ReplyAction::Free);
+        assert_eq!(parse_reply("0可以了").0, ReplyAction::Free);
+        assert_eq!(parse_reply("  1  ").0, ReplyAction::Closed);
 
-        // 附言要带出来，但去掉数字前缀
-        assert_eq!(parse_reply("0 可以了").1, "可以了");
+        // 附言要带出来，但去掉数字前缀；废弃的 0 原文原样保留
+        assert_eq!(parse_reply("0 可以了").1, "0 可以了");
         assert_eq!(parse_reply("2. 还是报错").1, "还是报错");
 
         // 不认：数字不在开头 / 后面跟字母 / 正文还有数字（有歧义）/ 空
-        assert_eq!(parse_reply("好的，0").0, ReplyAction::Closed);
+        assert_eq!(parse_reply("好的，0").0, ReplyAction::Free);
         assert_eq!(parse_reply("0abc").0, ReplyAction::Free);
-        assert_eq!(parse_reply("1 和 2 都做了").0, ReplyAction::Summarize);
+        assert_eq!(parse_reply("1 和 2 都做了").0, ReplyAction::Closed);
         assert_eq!(parse_reply("把那个函数也改一下").0, ReplyAction::Free);
         assert_eq!(parse_reply("").0, ReplyAction::Free);
 
         // 数字↔动作的对应写进了文案，不能错位
-        assert_eq!(ReplyAction::Closed.num(), Some(0));
-        assert_eq!(ReplyAction::Summarize.num(), Some(1));
-        assert_eq!(ReplyAction::Recheck.num(), Some(2));
+        assert_eq!(ReplyAction::Closed.num(), Some(1));
+        assert_eq!(ReplyAction::Summarize.num(), Some(2));
+        assert_eq!(ReplyAction::Custom(3).num(), Some(3));
         assert_eq!(ReplyAction::Free.num(), None);
     }
 
@@ -5688,7 +5688,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&reply_field_json(&body)).unwrap();
         let got = v[0]["title"].as_str().unwrap();
         assert_eq!(got, body, "字段内容与邮件正文不一致");
-        assert!(got.contains("0 = 收尾"), "字段里缺回复选项");
+        assert!(got.contains("1 = 已解决"), "字段里缺回复选项");
         assert!(got.contains(&c.task_id), "字段里缺任务链接");
         assert!(got.contains("长".repeat(4000).as_str()), "长正文被截断");
     }

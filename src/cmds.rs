@@ -218,7 +218,7 @@ fn run_wait_block(
         } => {
             if action == ReplyAction::Closed {
                 println!(
-                    "收到回复 0（等了 {waited_secs} 秒）。任务「{}」已收尾：「{}」+ 看板列「{}」。",
+                    "收到回复 1（等了 {waited_secs} 秒）。任务「{}」已收尾：「{}」+ 看板列「{}」。",
                     c.task_name, STAGE_DONE, cfg.tasklist_done
                 );
             } else {
@@ -227,12 +227,14 @@ fn run_wait_block(
                     c.task_name, STAGE_DOING, cfg.tasklist_claim
                 );
             }
-            // 结构化标记：agent 看 action 决定下一步，不用自己解析中文。
+            // 结构化标记：只有真收到用户回复才打这行。`ask` 前台 exit 0 只是起了监听，
+            // 绝不能当收尾确认。agent 看 action 决定下一步，不用自己解析中文。
             let num = action.num().map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+            println!("USER_REPLY=1");
             println!("reply={num} action={} text={:?}", action.tag(), body);
             println!("\n---- 你的回复 ----");
             for r in &replies {
-                println!("[{}] {}\n{}", r.created, r.author, r.text);
+                println!("[用户回复] [{}] {}\n{}", r.created, r.author, r.text);
             }
             println!();
             match &action {
@@ -245,17 +247,11 @@ fn run_wait_block(
                         c.claim_id
                     );
                 }
-                ReplyAction::Recheck => {
-                    println!(
-                        "用户说没解决。自查后重新给选项：\n  tba ask {} -q \"...\\n\\n回复数字：\\n0 = 已解决，收尾\\n1 = 已解决，先写进项目记忆\\n2 = 还没好，我再查\\n3 = <你自己的选项>\"",
-                        c.claim_id
-                    );
-                }
                 ReplyAction::Custom(n) => {
-                    println!("用户选了你自定义的选项 {n}，按你在问题里写的语义执行。干完汇报。");
+                    println!("用户说有问题，选了你自定义的选项 {n}，按你在问题里写的语义执行。干完汇报。");
                 }
                 ReplyAction::Free => {
-                    println!("用户没回数字，按原文理解。干完汇报。");
+                    println!("用户没回有效数字（含废弃的 0），按原文理解。干完汇报。");
                 }
             }
             Ok(())
@@ -276,10 +272,11 @@ fn run_wait_block(
                 .find_map(|r| parse_reply_num(r))
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "-".into());
+            println!("USER_REPLY=1");
             println!("reply={num} action=noted");
             println!("\n---- 你的回复 ----");
             for r in &replies {
-                println!("{r}\n");
+                println!("[用户回复] {r}\n");
             }
             println!("已记进 `tba events`。处理完重新跑 `tba wait {}` 继续常驻监听。", c.claim_id);
             Ok(())

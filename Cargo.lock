@@ -2803,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "tba-cli"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "chrono",
  "clap",
