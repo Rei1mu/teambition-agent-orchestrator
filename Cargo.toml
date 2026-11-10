@@ -1,6 +1,6 @@
 [package]
 name = "tba-cli"
-version = "0.2.35"
+version = "0.2.36"
 edition = "2021"
 description = "TBA - Teambition Agent (CLI + MCP + egui 窗口)"
 license = "Apache-2.0"

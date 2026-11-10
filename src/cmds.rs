@@ -182,33 +182,11 @@ fn resolve_project(project: Option<&str>) -> Result<String, String> {
     }
 }
 
-// 常驻等用户回复，直到收到回复 / 别处收尾才退出（退出即唤醒会话）。
-//
-// 抽成独立函数是因为 ask 和 wait 都要用它：ask 问完自动挂上常驻监听，
-// agent 只需要记一条命令，没有「问完忘了等」的中间态。
-// forever=true 时不因超时退出；只有 --once 老路径才会单轮到点返回。
-//
-// 退出码约定（agent 靠这个决定下一步，不要改）：
-//   正常返回 = 收到回复，正文和 action 已打印
-//   2        = --once 单轮超时（默认 540 秒），接着跑 tba wait 即可
-//   3        = 用户在网页上手动收尾了，停
-fn run_wait_block(
-    store: &Store,
-    claim_id: &str,
-    timeout: Option<u64>,
-    interval: Option<u64>,
-    forever: bool,
-) -> Result<(), String> {
-    let cfg = store.load_config();
-    // 命令行参数优先，没给就用配置里的（data/config.toml，GUI 设置页也能改）。
-    // 无论来源都夹一次下限：0 或 3 秒会让轮询变成忙等，把接口打爆。
-    let t = timeout
-        .unwrap_or(cfg.wait_timeout_secs)
-        .max(crate::config::MIN_WAIT_TIMEOUT_SECS);
-    let iv = interval
-        .unwrap_or(cfg.wait_interval_secs)
-        .max(crate::config::MIN_WAIT_INTERVAL_SECS);
-    match wait(store, claim_id, t, iv, forever)? {
+// 每条回复打印给 agent 看。常驻监听的 stdout 被重定向到 feed 文件，
+// 前台等待者按偏移读新增内容，读到就退出唤醒会话。
+// 返回 true = 用户回 1 收尾，监听到此为止。
+fn print_outcome(o: &WaitOutcome, cfg: &Config) -> bool {
+    match o {
         WaitOutcome::Replied {
             claim: c,
             replies,
@@ -216,7 +194,7 @@ fn run_wait_block(
             body,
             waited_secs,
         } => {
-            if action == ReplyAction::Closed {
+            if *action == ReplyAction::Closed {
                 println!(
                     "收到回复 1（等了 {waited_secs} 秒）。任务「{}」已收尾：「{}」+ 看板列「{}」。",
                     c.task_name, STAGE_DONE, cfg.tasklist_done
@@ -233,11 +211,11 @@ fn run_wait_block(
             println!("USER_REPLY=1");
             println!("reply={num} action={} text={:?}", action.tag(), body);
             println!("\n---- 你的回复 ----");
-            for r in &replies {
+            for r in replies {
                 println!("[用户回复] [{}] {}\n{}", r.created, r.author, r.text);
             }
             println!();
-            match &action {
+            match action {
                 ReplyAction::Closed => {
                     println!("已收尾，停。别再跑 done/close。");
                 }
@@ -249,7 +227,6 @@ fn run_wait_block(
                 }
                 ReplyAction::Custom(n) => {
                     println!("用户说有问题，选了你自定义的选项 {n}，按你在问题里写的语义执行。干完汇报。");
-                    // 选项释义只在本次问题里，回显出来免得 agent 去翻任务备注。
                     if !c.question.trim().is_empty() {
                         println!("\n---- 本次问题（选项 {n} 的含义） ----\n{}", c.question);
                     }
@@ -258,7 +235,8 @@ fn run_wait_block(
                     println!("用户没回有效数字（含废弃的 0），按原文理解。干完汇报。");
                 }
             }
-            Ok(())
+            let _ = std::io::stdout().flush();
+            *action == ReplyAction::Closed
         }
         WaitOutcome::Noted {
             claim: c,
@@ -279,12 +257,53 @@ fn run_wait_block(
             println!("USER_REPLY=1");
             println!("reply={num} action=noted");
             println!("\n---- 你的回复 ----");
-            for r in &replies {
+            for r in replies {
                 println!("[用户回复] {r}\n");
             }
-            println!("已记进 `tba events`。处理完重新跑 `tba wait {}` 继续常驻监听。", c.claim_id);
-            Ok(())
+            println!(
+                "已记进 `tba events`。常驻监听继续挂着（执行中也不停，直到你回 1）；\n\
+                 处理完这一轮再挂一条 `tba wait {}` 等下一条回复，别等干完才 ask。",
+                c.claim_id
+            );
+            let _ = std::io::stdout().flush();
+            false
         }
+        _ => true,
+    }
+}
+
+// 常驻监听本体（`--listen`）。只有用户回 1 / 别处收尾才退出；
+// 其余回复交给 emit 打印后继续轮询，执行中窗口的发言也不会漏。
+//
+// 退出码约定（agent 靠这个决定下一步，不要改）：
+//   正常返回 = 监听结束（已收尾），正文已打印
+//   2        = --once 单轮超时（默认 540 秒），接着跑 tba wait 即可
+//   3        = 用户在网页上手动收尾了，停
+fn run_wait_block(
+    store: &Store,
+    claim_id: &str,
+    timeout: Option<u64>,
+    interval: Option<u64>,
+    forever: bool,
+    listen: bool,
+) -> Result<(), String> {
+    let cfg = store.load_config();
+    // 命令行参数优先，没给就用配置里的（data/config.toml，GUI 设置页也能改）。
+    // 无论来源都夹一次下限：0 或 3 秒会让轮询变成忙等，把接口打爆。
+    let t = timeout
+        .unwrap_or(cfg.wait_timeout_secs)
+        .max(crate::config::MIN_WAIT_TIMEOUT_SECS);
+    let iv = interval
+        .unwrap_or(cfg.wait_interval_secs)
+        .max(crate::config::MIN_WAIT_INTERVAL_SECS);
+    let outcome = wait(store, claim_id, t, iv, forever, |o| {
+        let closed = print_outcome(o, &cfg);
+        // 常驻监听只有收尾才停；--once 老路径收到一条就返回。
+        !listen || closed
+    })?;
+    match outcome {
+        // 回复已由 emit 逐条打印到 feed，这里不重复打。
+        WaitOutcome::Replied { .. } | WaitOutcome::Noted { .. } => Ok(()),
         WaitOutcome::Timeout {
             claim: c,
             waited_secs,
@@ -321,36 +340,26 @@ fn run_wait_block(
     }
 }
 
-// ask 把轮询监听 spawn 成独立 detached 子进程（`tba wait`），自己等着它退出。
-//
-// 为什么脱离 ask 进程：以前监听跑在 ask 同一个进程里，ask 被 SIGTERM / 关窗口 /
-// 沙箱回收一杀，监听就死，人类几小时后的回信没法唤醒会话（见 tba-cli 问题记录）。
-// 现在子进程用新进程组 + DETACHED 创建：ask 死了它照常每轮轮询，回信不丢。
-//
-// 正常情况：子进程收到回复退出 → ask 跟着退出（退出码透传）→ 唤醒会话，语义不变。
-// 被杀情况：ask 死了，子进程（新进程组）不受影响，继续监听，回信落 events / 状态。
-//
-// out_path：子进程把回复摘要（含 reply=N action=... 标记）写到这里，父进程退出前
-// 读出来打印给 agent 看。用文件而非继承管道，是为了父进程被杀时子进程不会因
-// 断管（broken pipe）panic 而跟着死——那样就失去 detached 的意义了。
-fn spawn_detached_watcher(
+// ask / wait 拉起一个 detached 常驻监听（`tba wait <claim> --listen`）。
+// 它的 stdout 追加到 feed 文件：每条回复摘要都落盘，前台等待者按偏移读新增。
+// 监听不随回复退出，父进程被杀也不受影响（新进程组 + DETACHED）。
+fn spawn_detached_listener(
     claim_id: &str,
-    out_path: &std::path::Path,
-) -> Result<std::process::Child, String> {
+    feed_path: &std::path::Path,
+) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("取当前 exe 路径失败: {e}"))?;
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("wait").arg(claim_id).stdin(std::process::Stdio::null());
-    // stdout → 回复摘要文件；打不开就退而求其次丢到 null（不影响监听）。
+    cmd.arg("wait").arg(claim_id).arg("--listen").stdin(std::process::Stdio::null());
     if let Ok(f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(out_path)
+        .open(feed_path)
     {
         cmd.stdout(std::process::Stdio::from(f));
     } else {
         cmd.stdout(std::process::Stdio::null());
     }
-    // stderr → null：轮询期间每 300s 的「已等 N 秒」心跳打这里，不污染回复摘要。
+    // stderr → null：轮询期间每 300s 的「已等 N 秒」心跳打这里，不污染 feed。
     cmd.stderr(std::process::Stdio::null());
     // 新进程组：脱离 ask 的进程组，ask 被 SIGTERM 不会连带杀到它。
     // DETACHED_PROCESS：不共享 ask 的控制台，关窗口也不死。
@@ -362,10 +371,54 @@ fn spawn_detached_watcher(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // 新会话 / 进程组，脱离父进程，父进程被杀仍存活。
         let _ = cmd.process_group(0);
     }
-    cmd.spawn().map_err(|e| format!("spawn detached watcher 失败: {e}"))
+    cmd.spawn().map_err(|e| format!("spawn detached listener 失败: {e}"))?;
+    Ok(())
+}
+
+// 保证有且只有一个常驻监听在跑。活着的监听每轮刷 waits/<claim>.wait。
+fn ensure_listener(store: &Store, claim_id: &str) -> Result<(), String> {
+    if store.wait_age(claim_id).map_or(false, |age| (0..30).contains(&age)) {
+        return Ok(());
+    }
+    let feed = store.waits_dir().join(format!("{claim_id}.feed"));
+    spawn_detached_listener(claim_id, &feed)?;
+    // 占位：新进程还没来得及 touch 之前，别让并发的 ask/wait 再拉一个。
+    store.wait_touch(claim_id);
+    Ok(())
+}
+
+// 前台等待者：读到 feed 新增就打印并退出（退出即唤醒会话）。
+// 监听本体不退出，要靠这条命令把「有新回复」变成一次 task-notification。
+fn wait_for_feed(store: &Store, claim_id: &str) -> Result<(), String> {
+    let dir = store.waits_dir();
+    let feed = dir.join(format!("{claim_id}.feed"));
+    let cursor = dir.join(format!("{claim_id}.cursor"));
+    loop {
+        let at: usize = std::fs::read_to_string(&cursor)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        if let Ok(bytes) = std::fs::read(&feed) {
+            if bytes.len() > at {
+                print!("{}", String::from_utf8_lossy(&bytes[at..]));
+                let _ = std::io::stdout().flush();
+                let _ = std::fs::write(&cursor, bytes.len().to_string());
+                return Ok(());
+            }
+        }
+        // 任务被收尾就停，别死等一个已经没意义的回复。
+        if store.get_claim(claim_id).map_or(false, |c| !c.is_active()) {
+            println!("任务已收尾，停。");
+            return Ok(());
+        }
+        // 监听意外挂了就自愈重拉，任务还在进行中就别断。
+        if store.wait_age(claim_id).map_or(true, |age| age >= 60) {
+            let _ = ensure_listener(store, claim_id);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
 }
 
 // 通用能力的命令行入口。全是本地文件操作，不联网、不需要 token。
@@ -1724,42 +1777,15 @@ pub fn run() -> Result<(), String> {
                     c.claim_id
                 );
             } else {
-                // 默认后台常驻监听：问完立刻挂上，收到回复退出并唤醒会话。
-                // 开工时可能已经挂了一个常驻监听（它每轮刷 waits/<claim>.wait）。
-                // 再起第二个只会两个进程抢同一封邮件，所以这时 ask 只管写问题 + 发信，
-                // 等回复交给那个已经活着的监听。
-                let live = store.wait_age(&c.claim_id);
-                if live.map_or(false, |age| (0..30).contains(&age)) {
-                    println!(
-                        "\n已有常驻监听在跑（{} 秒前刷新）。本次只写问题 + 发信，不重复挂监听；\n\
-                         你的回复会由那个监听接住并唤起会话。",
-                        live.unwrap_or(0)
-                    );
-                } else {
-                    println!(
-                        "\n已 spawn detached 常驻监听（每 {} 秒查一次评论/邮件，不设单轮上限）。\n\
-                         监听跑在独立子进程里，ask 被杀死也不影响它；收到你的回复子进程退出，会话随即被唤起。\n\
-                         执行中发来的话也会先记进 `tba events`；别重跑 ask（会重复发邮件）。",
-                        cfg.wait_interval_secs
-                    );
-                    // 监听交给 detached 子进程，ask 等着它退出：
-                    // 正常收到回复 → 子进程退出 → ask 透传退出码 → 唤醒会话（语义不变）。
-                    // ask 自己被杀 → 子进程（新进程组）存活，继续监听。
-                    let out_path = store.waits_dir().join(format!("{}.out", c.claim_id));
-                    let mut child = spawn_detached_watcher(&c.claim_id, &out_path)?;
-                    let status = child
-                        .wait()
-                        .map_err(|e| format!("等 watcher 退出失败: {e}"))?;
-                    // 子进程的回复摘要（含 reply=N action=... 标记）落到 out 文件，打印给 agent。
-                    if let Ok(s) = std::fs::read_to_string(&out_path) {
-                        let s = s.trim();
-                        if !s.is_empty() {
-                            println!("{s}");
-                        }
-                    }
-                    let _ = std::fs::remove_file(&out_path);
-                    std::process::exit(status.code().unwrap_or(0));
-                }
+                // 常驻监听从这次 ask 起一直跑到用户回 1 收尾，执行中也不中断。
+                // ask 自己只是「前台等待者」：读到一条新回复就打印并退出，唤醒会话。
+                ensure_listener(&store, &c.claim_id)?;
+                println!(
+                    "\n常驻监听已挂上（每 {} 秒查一次评论/邮件，直到你回 1 才停；执行中也不中断）。\n\
+                     邮件和 Teambition 上的每条新回复都会唤醒会话；别重跑 ask（会重复发邮件）。",
+                    cfg.wait_interval_secs
+                );
+                wait_for_feed(&store, &c.claim_id)?;
             }
         }
         Cmd::Reply { claim_id } => {
@@ -1828,6 +1854,7 @@ pub fn run() -> Result<(), String> {
             interval,
             once,
             off,
+            listen,
         } => {
             // 直连模式没有「等 Teambition 回复」这回事，直接返回别让人干等。
             if off {
@@ -1837,8 +1864,17 @@ pub fn run() -> Result<(), String> {
                 return Ok(());
             }
             let claim_id = claim_id.ok_or("要给 claim id：`tba wait <claim_id>`")?;
-            // 默认常驻；只有显式 --once 才保留「单轮到点退出码 2」的老行为。
-            run_wait_block(&store, &claim_id, timeout, interval, !once)?;
+            if listen {
+                // detached 监听本体：只有用户回 1 / 别处收尾才退出。
+                run_wait_block(&store, &claim_id, timeout, interval, true, true)?;
+            } else if once {
+                // --once 老路径：单轮到点退出码 2，收到一条回复就返回。
+                run_wait_block(&store, &claim_id, timeout, interval, false, false)?;
+            } else {
+                // agent 续等：确保常驻监听在跑，读到下一条新回复就退出唤醒会话。
+                ensure_listener(&store, &claim_id)?;
+                wait_for_feed(&store, &claim_id)?;
+            }
         }
         Cmd::Events { claim, limit } => {
             let rows = crate::events::recent(

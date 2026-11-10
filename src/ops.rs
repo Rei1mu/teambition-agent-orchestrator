@@ -2474,7 +2474,7 @@ pub enum WaitOutcome {
         waited_secs: u64,
     },
     // 「执行中」期间收到用户回复：不改任务状态，只把原文交给 agent 决定。
-    // 常驻监听靠这个分支退出，shell 跑完 → task-notification → 唤醒会话。
+    // 常驻监听继续轮询，前台等待者读到这条摘要后退出并唤醒会话。
     Noted {
         claim: Claim,
         replies: Vec<String>,
@@ -2523,14 +2523,17 @@ impl WatchBaseline {
     }
 }
 
-/// `forever = true` 时永不因超时返回，只有读到回复 / 任务被收尾才退出。
-/// 一次 `tba ask` 就挂一个不会被 540 秒打断的监听，agent 不用再手动续等。
+/// `forever = true` 时永不因超时返回，只有任务被收尾才退出。
+/// `emit` 每读到一条回复调一次，打印摘要并决定是否结束监听：
+/// 常驻监听（`--listen`）只有回复 1 才返回 true，其余返回 false 继续轮询。
+/// 监听不随回复退出，执行中窗口的用户发言也不会漏。
 pub fn wait(
     store: &Store,
     claim_id: &str,
     timeout_secs: u64,
     interval_secs: u64,
     forever: bool,
+    mut emit: impl FnMut(&WaitOutcome) -> bool,
 ) -> Result<WaitOutcome, String> {
     let mut claim = store
         .get_claim(claim_id)
@@ -2577,7 +2580,9 @@ pub fn wait(
     let mut last_mail = std::time::Instant::now() - std::time::Duration::from_secs(mail_poll);
     // 时间基准随「待回复 / 进行中」状态切换而重置，见 WatchBaseline 注释。
     let mut baseline = WatchBaseline::new();
-    // 执行中态收到的回复先攒着，攒到就退出并唤醒会话。
+    // 常驻监听读到一条回复后不再退出，同一状态里连发的评论得靠这个水位去重复唤醒。
+    let mut last_comment_ts = String::new();
+    // 执行中态收到的回复先攒着，攒到就交给 emit。
     let mut noted: Vec<String> = Vec::new();
     // IMAP 扫描状态跨轮保留：ask 时记下的提问水位 + 已扫过的 UID。
     // 只抓「提问之后新到的未读信」，不碰信箱里堆积的历史未读广告。
@@ -2603,7 +2608,12 @@ pub fn wait(
             Some(c) => (!c.ask_at.is_empty(), c.ask_at),
             None => (false, String::new()),
         };
-        let comment_after = baseline.observe(has_ask, &ask_at, &chrono::Local::now().to_rfc3339());
+        let baseline_after = baseline.observe(has_ask, &ask_at, &chrono::Local::now().to_rfc3339());
+        let comment_after = if ts_after(&last_comment_ts, &baseline_after) {
+            last_comment_ts.clone()
+        } else {
+            baseline_after
+        };
 
         // 等待期间任务可能被别处 done/close/release 掉，那就别再等了。
         if let Some(c) = store.get_claim(claim_id) {
@@ -2682,14 +2692,21 @@ pub fn wait(
                                 } else {
                                     c
                                 };
-                                store.wait_drop(claim_id);
-                                return Ok(WaitOutcome::Replied {
+                                let outcome = WaitOutcome::Replied {
                                     claim,
                                     replies,
                                     action,
                                     body,
                                     waited_secs: started.elapsed().as_secs(),
-                                });
+                                };
+                                if emit(&outcome) {
+                                    store.wait_drop(claim_id);
+                                    return Ok(outcome);
+                                }
+                                // 常驻监听继续跑。留痕评论是 tba 自己写的，下面过滤掉，
+                                // 别把它当成用户新发言再唤醒一次。
+                                last_comment_ts = chrono::Local::now().to_rfc3339();
+                                continue;
                             }
                             Err(e) => {
                                 // 评论已经写过了，让下面「读评论 → resume」那条老路兜底，
@@ -2721,7 +2738,15 @@ pub fn wait(
             .unwrap_or_default()
             .into_iter()
             .filter(|c| ts_after(&c.created, &comment_after))
+            // 邮件回信由 tba 自己写进评论留痕，不是用户新发言，别重复唤醒。
+            .filter(|c| !c.text.trim_start().starts_with("（邮件回复）"))
             .collect();
+        // 常驻监听不退出，水位推到本轮最新一条，下一轮才不会把同一批评论重放。
+        if let Some(mx) = fresh.iter().map(|c| c.created.as_str()).max() {
+            if ts_after(mx, &last_comment_ts) {
+                last_comment_ts = mx.to_string();
+            }
+        }
         if !fresh.is_empty() && !has_ask {
             // 执行中态：不 resume、不改状态、不碰看板列，只记录 + 退出唤醒会话。
             // 状态流转仍由 agent 看完原话后自己决定，避免跟它手上的活打架。
@@ -2740,35 +2765,58 @@ pub fn wait(
             let (c, replies) = resume(store, claim_id)?;
             // 回复 1 = 用户明确授权收尾 → tb 直接执行。
             // （agent 自己跑 tb done 依然禁止，这里执行的是**用户**的指令。）
-            if action == ReplyAction::Closed {
-                let c2 = finish(store, claim_id, STAGE_DONE)?;
-                store.wait_drop(claim_id);
-                return Ok(WaitOutcome::Replied {
-                    claim: c2,
-                    replies,
-                    action,
-                    body,
-                    waited_secs: started.elapsed().as_secs(),
-                });
-            }
-            store.wait_drop(claim_id);
-            return Ok(WaitOutcome::Replied {
-                claim: c,
+            let claim2 = if action == ReplyAction::Closed {
+                finish(store, claim_id, STAGE_DONE)?
+            } else {
+                c
+            };
+            let outcome = WaitOutcome::Replied {
+                claim: claim2,
                 replies,
                 action,
                 body,
                 waited_secs: started.elapsed().as_secs(),
-            });
+            };
+            if emit(&outcome) {
+                store.wait_drop(claim_id);
+                return Ok(outcome);
+            }
+            // 常驻监听继续：resume 已把任务推回进行中，下一轮按执行中态接着听。
+            continue;
         }
 
-        // 执行中收到的（邮件 + 评论）一起交出去。退出 → shell 完成通知 → 唤醒会话。
+        // 执行中收到的（邮件 + 评论）一起交出去。
         if !noted.is_empty() {
-            store.wait_drop(claim_id);
-            return Ok(WaitOutcome::Noted {
+            // 执行中态也认「1」：用户发 1 就是收尾，常驻监听到此为止。
+            let closing = noted
+                .iter()
+                .rev()
+                .any(|t| parse_reply(t).0 == ReplyAction::Closed);
+            let outcome = WaitOutcome::Noted {
                 claim: claim.clone(),
                 replies: std::mem::take(&mut noted),
                 waited_secs: started.elapsed().as_secs(),
-            });
+            };
+            let stop = emit(&outcome);
+            if closing {
+                let c = finish(store, claim_id, STAGE_DONE)?;
+                let done = WaitOutcome::Replied {
+                    claim: c,
+                    replies: Vec::new(),
+                    action: ReplyAction::Closed,
+                    body: String::new(),
+                    waited_secs: started.elapsed().as_secs(),
+                };
+                emit(&done);
+                store.wait_drop(claim_id);
+                return Ok(done);
+            }
+            if stop {
+                store.wait_drop(claim_id);
+                return Ok(outcome);
+            }
+            // 常驻监听继续，不改状态、不碰看板列。
+            continue;
         }
 
         // 边等边续命：running 的 claim 靠这里保活，避免被 sweep 误判会话断开。
@@ -3930,7 +3978,7 @@ fn workflow_text_zh(
     // 现在 ask 常驻不超时退出，前台窗口只留 60 秒让工具把进程转后台（不杀），
     // agent 本轮回复可以正常结束，收到回复时 task-notification 会把会话拉起来。
     // 调用姿势单独抽出来，两个分支共用，免得只改一处、文案分叉。
-    let ask_posture = "**ask 调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点工具自动把命令转后台（**不杀进程**），常驻监听继续挂着，不用在前台干等 10 分钟；agent 本轮回复正常结束即可。用户回邮件/评论后监听退出 → task-notification 唤醒会话。**只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，绝不能当成收尾确认。**会话窗直接回**：用户在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。禁止 `--no-wait`。";
+    let ask_posture = "**ask 调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点工具自动把命令转后台（**不杀进程**）；agent 本轮回复正常结束即可。**常驻监听一直跑到用户回 1 才停，执行中也不中断**；用户回邮件/评论后前台等待者退出 → task-notification 唤醒会话，监听继续。**每轮被唤醒后继续干活前，先挂一条后台 `tba wait <claim_id>`**，下一条回复才能再唤醒会话，别等干完才 ask。**只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，绝不能当成收尾确认。**会话窗直接回**：用户在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。禁止 `--no-wait`。";
     if memory_on {
         s.push_str(&format!(
             "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题，自定义选项从 3 起编号；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
@@ -4019,7 +4067,7 @@ fn workflow_text(
     ));
 
     let handoff = format!(
-        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\"`; (b) `{exe} ask <claim_id> --done` (1=close/2=memory first/3+=still broken, custom options numbered from 3; -> {0} + column \"{1}\", mail sent; BLOCKS in foreground - NEVER run_in_background, never end session). Run ask with sandbox OFF (`dangerouslyDisableSandbox: true`) and `timeout: 600000`: sandbox SIGTERMs a blocking ask at ~78s. On foreground timeout the tool auto-backgrounds it; the user's reply ends ask and a task-notification wakes the agent. NEVER set run_in_background yourself, never `--no-wait`. NEVER stop in {2} - the user's reply would go unread. ",
+        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\"`; (b) `{exe} ask <claim_id> --done` (1=close/2=memory first/3+=still broken, custom options numbered from 3; -> {0} + column \"{1}\", mail sent; BLOCKS in foreground - NEVER run_in_background, never end session). Run ask with sandbox OFF (`dangerouslyDisableSandbox: true`) and `timeout: 600000`: sandbox SIGTERMs a blocking ask at ~78s. On foreground timeout the tool auto-backgrounds it; the user's reply ends ask and a task-notification wakes the agent. NEVER set run_in_background yourself, never `--no-wait`. NEVER stop in {2} - the user's reply would go unread. The detached listener keeps polling until reply 1 (running state included); every new reply wakes the session. After each wake-up, start a background `tba wait <claim_id>` before working. ",
         STAGE_WAIT, cfg.tasklist_wait, STAGE_DOING
     );
 
@@ -4687,7 +4735,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
          `ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（1=收尾 2=写记忆 3+=有问题；0 已废弃按原文不收尾），\
-         父进程被杀监听不亡；收到回复子进程退出并唤醒会话。\n\
+         **监听一直跑到用户回 1 才停，执行中也不中断**；父进程被杀监听不亡。\n\
+         每条回复都由前台等待者打印后退出、唤醒会话；**会话被唤醒后继续干活前，先挂一条后台 `tba wait <claim_id>`**，\
+         否则执行中窗口的发言要等下次待回复才收得到。\n\
          **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，\
          拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。\n\
          **只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，别当收尾确认。\n\
@@ -4748,6 +4798,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         // v0.2.35 数字协议版本号：老入口还写着 0/1/2 选项或没有保留号规则，
         // 缺这句就整段重写一次，否则 agent 一直按旧协议出题、和待回复数字打架。
         && old.contains("1/2 是系统保留号")
+        // v0.2.36 常驻监听版本号：老入口还写着「收到回复子进程退出」，缺这句就整段重写，
+        // 否则 agent 不知道执行中窗口还要挂 tba wait。
+        && old.contains("监听一直跑到用户回 1")
         // 「会话窗直接回」是 v0.2.29 后台挂起文案的版本号：老入口还写着
         // 「前台阻塞 / 绝不结束会话」，缺这句就整段重写一次。
         && old.contains("会话窗直接回");
@@ -4803,8 +4856,9 @@ fn claim_header(c: &Claim, exe: &str) -> String {
          ⚠ 做完必须交回，两步不许省：\n  \
          {exe} note {} --text \"改了什么/怎么验\"\n  \
          {exe} ask {} --done\n\
-         ask 发信后后台常驻等回复：关 Sandbox（dangerouslyDisableSandbox: true）+ timeout: 60000；\
-         前台窗口到点自动转后台，收到回复触发 task-notification 唤醒续接。\
+         ask 发信后常驻监听一直跑到你回 1，执行中也不停：关 Sandbox（dangerouslyDisableSandbox: true）+ timeout: 60000；\
+         前台窗口到点自动转后台，每条新回复触发 task-notification 唤醒续接；\
+         被唤醒后继续干活先挂一条后台 {exe} wait <claim_id>。\
          会话窗直接回也行，先跑 {exe} reply <claim_id> 推回「进行中」。\
          禁止 --no-wait；只有用户能收尾。\n",
         c.claim_id, c.task_id, c.task_name, c.stage_from, c.stage_to, c.claim_id, c.claim_id

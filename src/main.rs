@@ -281,7 +281,7 @@ pub enum Cmd {
         #[arg(long)]
         agent: Option<String>,
     },
-    /// 常驻等回复：一直挂着监听评论和邮件，收到回复才退出（退出即唤醒会话）
+    /// 等下一条回复：确保常驻监听在跑，读到新回复就退出（退出即唤醒会话）
     Wait {
         /// claim id（--off 时可以省略）
         claim_id: Option<String>,
@@ -294,6 +294,9 @@ pub enum Cmd {
         /// 只等一轮，到点退出码 2。默认常驻：不因超时退出，用户回一句才返回
         #[arg(long)]
         once: bool,
+        /// 内部用：常驻监听本体，由 ask / wait 自动拉起，别手敲
+        #[arg(long, hide = true)]
+        listen: bool,
         /// 直连模式：不轮询 Teambition，直接返回（直连模式下本来就不需要等）
         #[arg(long)]
         off: bool,
