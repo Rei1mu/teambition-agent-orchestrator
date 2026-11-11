@@ -163,7 +163,7 @@ fn path_lookup(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// 可以指定 but 路径的环境变量。TBA_BUT 是本项目约定（跟 TBA_MSVC_BIN 一套），
+/// 可以指定 but 路径的环境变量。TBA_BUT 是本项目约定，
 /// 另外两个是社区常见写法，认一下不亏。值可以是 exe，也可以是目录。
 pub const BUT_ENV_KEYS: &[&str] = &["TBA_BUT", "GITBUTLER_BIN", "BUT_BIN"];
 

@@ -44,9 +44,6 @@ pub const ALL_STAGES: [&str; 5] = [
 // 两个状态由 tb 自动建（taskflow-update 的 tfsJson upsert），零手动。
 pub const SKILL_STATE: &str = "skill";
 pub const MEMORY_STATE: &str = "mem";
-// 状态 setting = 这个项目的「编译 & 重载」参数（一条任务，标题固定「项目设置」，
-// 备注是 TOML）。跟 skill/mem 一样由 tb 自动建，用户不用手动加。
-pub const SETTING_STATE: &str = "setting";
 
 // 记忆任务标题：`{节名} · {正文首行摘要}`，节名靠它被识别。
 pub const MEMORY_TITLE_SEP: &str = " · ";
@@ -77,19 +74,19 @@ pub const MEMORY_SOFT_LIMIT_CHARS: usize = 6000;
 
 // 五个固定看板列（任务列表 / task list）。按「列名」引用：列名对不上就跳过移列
 // （只改状态），不阻断流程。
-// 语义：列1=队列(没人接) / 列2=agent 正在干 / 列3=球在用户那 / 列4=已解决 / 列5=关闭。
+// 语义：未完成=队列(没人接) / 进行中=agent 正在干 / 待回复=球在用户那 / 已解决 / 已完成。
 //
-// 列名统一用数字 1..5（用户拍板：不折腾中文列名）。
+// 列名直接用中文，和 5 个工作流状态名一一对应（看板上一眼能对上，不用记编号）。
 // 2026-11 复查：新版 MCP 有 `task-list-create` / `task-list-update-name` /
-// `task-list-order-update`，`ops::ensure_tasklists()` 会自动补齐缺的数字列；
-// 老服务端补不动时才降级成项目链接 + 网页手动补列引导。
-pub const DEFAULT_TASKLIST_QUEUE: &str = "1";
-pub const DEFAULT_TASKLIST_CLAIM: &str = "2";
-pub const DEFAULT_TASKLIST_WAIT: &str = "3";
-pub const DEFAULT_TASKLIST_DONE: &str = "4";
-pub const DEFAULT_TASKLIST_CLOSED: &str = "5";
+// `task-list-order-update`，`ops::ensure_tasklists()` 会自动补齐缺的中文列，
+// 并把老项目里的数字列 1~5 直接改名；老服务端补不动时才降级成项目链接 + 网页手动补列引导。
+pub const DEFAULT_TASKLIST_QUEUE: &str = STAGE_TODO;
+pub const DEFAULT_TASKLIST_CLAIM: &str = STAGE_DOING;
+pub const DEFAULT_TASKLIST_WAIT: &str = STAGE_WAIT;
+pub const DEFAULT_TASKLIST_DONE: &str = STAGE_DONE;
+pub const DEFAULT_TASKLIST_CLOSED: &str = STAGE_CLOSED;
 
-// 期望的 5 个数字列名（顺序即语义，跟上面五个 DEFAULT_ 对齐）。
+// 期望的 5 个中文列名（顺序即语义，跟上面五个 DEFAULT_ 对齐）。
 pub const TASKLIST_WANT: [&str; 5] = [
     DEFAULT_TASKLIST_QUEUE,
     DEFAULT_TASKLIST_CLAIM,
@@ -98,10 +95,28 @@ pub const TASKLIST_WANT: [&str; 5] = [
     DEFAULT_TASKLIST_CLOSED,
 ];
 
-/// 项目现有列名是否覆盖了 5 个数字列。顺序不强制，只要有这 5 个名字即可。
+// 老数字列名 -> 现在的中文列名。给本地 config 迁移和云端改名共用。
+pub const TASKLIST_LEGACY: [(&str, &str); 5] = [
+    ("1", DEFAULT_TASKLIST_QUEUE),
+    ("2", DEFAULT_TASKLIST_CLAIM),
+    ("3", DEFAULT_TASKLIST_WAIT),
+    ("4", DEFAULT_TASKLIST_DONE),
+    ("5", DEFAULT_TASKLIST_CLOSED),
+];
+
+/// 项目现有列名是否覆盖了 5 个中文列。顺序不强制，只要有这 5 个名字即可。
 /// `ensure_tasklists()` 用它判断这次要不要补列。
 pub fn tasklists_ready(names: &[&str]) -> bool {
     TASKLIST_WANT.iter().all(|w| names.contains(w))
+}
+
+// 老 config.toml 里的 tasklist_* 存的是数字列名，读时换成中文（不动用户其它字段）。
+fn upgrade_tasklist_name(name: &mut String) {
+    for (old, new) in TASKLIST_LEGACY {
+        if name == old {
+            *name = new.to_string();
+        }
+    }
 }
 
 /// Teambition 网页里的项目页前缀。任务链接是 `https://www.teambition.com/task/<id>`，
@@ -261,7 +276,7 @@ pub struct Config {
     // ---- 离线模式 ----
     //
     // 不开 Teambition 也能用：项目列表、项目能力（skill）、开工文案全部走本地缓存，
-    // 通用能力（data/caps.toml）和编译 & 重载设置本来就是本地的，照旧。
+    // 通用能力（data/caps.toml）本来就是本地的，照旧。
     // 需要云端才成立的操作（领任务、done、ask/wait、刷新项目）在离线时直接说明不可用。
     //
     // 为什么要有：项目可能在内网/断网环境，或者不想把项目结构同步到云端；
@@ -312,10 +327,16 @@ impl Default for Config {
 impl Config {
     pub fn load(root: &Path) -> Config {
         let path = root.join("config.toml");
-        match std::fs::read_to_string(&path) {
+        let mut cfg = match std::fs::read_to_string(&path) {
             Ok(s) => toml::from_str(&s).unwrap_or_default(),
             Err(_) => Config::default(),
-        }
+        };
+        upgrade_tasklist_name(&mut cfg.tasklist_queue);
+        upgrade_tasklist_name(&mut cfg.tasklist_claim);
+        upgrade_tasklist_name(&mut cfg.tasklist_wait);
+        upgrade_tasklist_name(&mut cfg.tasklist_done);
+        upgrade_tasklist_name(&mut cfg.tasklist_closed);
+        cfg
     }
 
     pub fn save(&self, root: &Path) -> Result<(), String> {
@@ -412,26 +433,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tasklists_ready_accepts_1_to_5() {
-        assert!(tasklists_ready(&["1", "2", "3", "4", "5"]));
+    fn tasklists_ready_accepts_stage_names() {
+        assert!(tasklists_ready(&["未完成", "进行中", "待回复", "已解决", "已完成"]));
     }
 
     #[test]
     fn tasklists_ready_tolerates_extra_and_order() {
-        // 顺序不强制、允许多余列：只要有这 5 个数字即可。
-        assert!(tasklists_ready(&["5", "4", "3", "2", "1", "归档"]));
+        // 顺序不强制、允许多余列：只要有这 5 个中文列即可。
+        assert!(tasklists_ready(&["已完成", "已解决", "待回复", "进行中", "未完成", "归档"]));
     }
 
     #[test]
     fn tasklists_ready_rejects_missing_column() {
-        // 旧项目只有 4 列，缺「5」→ 不齐，引导补列。
-        assert!(!tasklists_ready(&["1", "2", "3", "4"]));
+        // 旧项目只有 4 列，缺「已完成」→ 不齐，引导补列。
+        assert!(!tasklists_ready(&["未完成", "进行中", "待回复", "已解决"]));
     }
 
     #[test]
-    fn tasklists_ready_rejects_chinese_names() {
-        // 用户拍板用数字；中文列名视为不齐，引导改成数字。
-        assert!(!tasklists_ready(&["待处理", "进行中", "待回复", "已解决", "关闭"]));
+    fn tasklists_ready_rejects_legacy_numbers() {
+        // 老数字列不算齐：ensure_tasklists 会把它们改成中文名。
+        assert!(!tasklists_ready(&["1", "2", "3", "4", "5"]));
     }
 
     // 离线开关要能落盘、读回来。默认在线（不能把老配置读成离线，

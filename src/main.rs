@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
 
-mod capability;
 mod caps;
 mod cmds;
 mod config;
@@ -14,11 +13,9 @@ mod naming;
 mod oauth;
 mod ops;
 mod proc;
-mod setting;
 mod shot;
 mod store;
 mod tb;
-mod toolchain;
 mod tools;
 mod ui;
 
@@ -66,26 +63,6 @@ pub enum Cmd {
         /// set 用：but.exe 路径，或它所在的目录
         #[arg(long)]
         path: Option<String>,
-    },
-    /// 构建工具链（MSVC + Windows SDK）：status | set | guess | clear。
-    /// 只认 MSVC，不做 gnu 兜底；标准位置找不到就用 set 指定一次
-    #[command(name = "toolchain", visible_alias = "tc")]
-    Toolchain {
-        /// status | set | guess | clear
-        #[arg(default_value = "status")]
-        action: String,
-        /// MSVC 的 bin 目录（link.exe 所在）：VC/Tools/MSVC/<ver>/bin/Hostx64/x64
-        #[arg(long = "msvc-bin")]
-        msvc_bin: Option<String>,
-        /// MSVC 的 lib 目录（libcmt.lib 所在）：VC/Tools/MSVC/<ver>/lib/x64
-        #[arg(long = "msvc-lib")]
-        msvc_lib: Option<String>,
-        /// Windows SDK 的 lib 目录（kernel32.lib 所在）。多个用 ; 分隔
-        #[arg(long = "sdk-lib")]
-        sdk_lib: Option<String>,
-        /// 额外的库目录（可选）
-        #[arg(long = "extra-lib")]
-        extra_lib: Option<String>,
     },
     /// 列出企业下所有项目
     Projects,
@@ -555,72 +532,6 @@ pub enum Cmd {
     },
     /// 自检：令牌 / PATH / git / GitButler / 字体 / 轮询参数一次全列出来
     Doctor,
-    /// 编译 & 重载（参数优先读项目设置：Teambition 状态为 setting 的任务）
-    Reload {
-        /// build | restart | kill | status
-        #[arg(default_value = "build")]
-        action: String,
-        /// 项目 id。缺省读当前目录的 .tba/project 绑定
-        #[arg(long)]
-        project: Option<String>,
-        /// 目标项目根目录。缺省读项目设置，再缺省按 exe 位置推断
-        #[arg(long)]
-        root: Option<String>,
-        /// exe 基名。缺省读项目设置 / Cargo.toml
-        #[arg(long)]
-        name: Option<String>,
-        /// 运行副本路径。缺省 <root>/target/release/<name>_test.exe
-        #[arg(long)]
-        live: Option<String>,
-        /// 启动副本时传的参数。重载 tb 自己时缺省 ui
-        #[arg(long)]
-        args: Option<String>,
-        /// 模式: rename=改名直跑(缺省) / copy=副本运行
-        #[arg(long)]
-        mode: Option<String>,
-        /// 编译指令（覆盖项目设置里的）。zig/go/npm 项目用
-        #[arg(long)]
-        compile: Option<String>,
-        /// 杀旧/启动走 UAC 提权
-        #[arg(long)]
-        elevate: bool,
-    },
-    /// 项目设置：编译指令 / 项目目录 / exe 名 / 启动参数（存 Teambition 的 setting 任务）
-    Setting {
-        /// show | set | guess | text
-        #[arg(default_value = "show")]
-        action: String,
-        /// 项目 id。缺省读当前目录的 .tba/project 绑定
-        #[arg(long)]
-        project: Option<String>,
-        /// 编译指令。空串 = 清空，让 agent 重新探测
-        #[arg(long)]
-        compile: Option<String>,
-        /// 项目根目录
-        #[arg(long)]
-        root: Option<String>,
-        /// exe 基名
-        #[arg(long)]
-        name: Option<String>,
-        /// rename | copy
-        #[arg(long)]
-        mode: Option<String>,
-        /// copy 模式的运行副本路径
-        #[arg(long)]
-        live: Option<String>,
-        /// 启动参数
-        #[arg(long)]
-        args: Option<String>,
-        /// 启用「编译 & 重载」（默认就是启用）
-        #[arg(long)]
-        on: bool,
-        /// 停用「编译 & 重载」：agent 文案里不再出现
-        #[arg(long)]
-        off: bool,
-        /// text 用：zh（默认）| en
-        #[arg(long)]
-        lang: Option<String>,
-    },
 }
 
 fn main() {

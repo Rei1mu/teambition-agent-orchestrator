@@ -81,21 +81,6 @@ fn doctor(store: &Store) -> String {
             (None, false) => "没装（tba gitbutler install 可装到运行目录）".to_string(),
         }
     ));
-    // 构建工具链：编译 & 重载要靠 link.exe + SDK 的库。缺了 agent 会以为是代码问题，
-    // 其实是这台机器没配路径——这一条能直接定位，省掉一轮瞎试。
-    let tcr = crate::toolchain::resolve(store);
-    s.push_str(&format!(
-        "编译:  {}\n",
-        if tcr.ready() {
-            format!("MSVC 可用（{}）", tcr.source.label())
-        } else {
-            format!(
-                "不可用（{}）：{} —— 用 tba toolchain set 指定位置",
-                tcr.source.label(),
-                tcr.problems.join("；")
-            )
-        }
-    ));
     if let Ok(root) = crate::git::repo_root() {
         s.push_str(&format!(
             "仓库:  {}（GitButler 项目: {}）\n",
@@ -146,13 +131,6 @@ fn doctor(store: &Store) -> String {
     s.trim_end().to_string()
 }
 
-fn fail_msg(action: &str, r: &crate::capability::Outcome) -> String {
-    if r.err.is_empty() {
-        format!("reload {action} 失败 (exit {})", r.code)
-    } else {
-        r.err.clone()
-    }
-}
 
 // 从正文首个非空行推断任务标题：`# xxx` 去掉 #，普通句子取前 60 字。
 fn first_heading(body: &str) -> Option<String> {
@@ -552,16 +530,6 @@ fn cap_cmd(
     }
 }
 
-
-// 打印设置时把空值显式标出来：空字符串在终端里看不见，容易以为命令没生效。
-fn dash(s: &str) -> &str {
-    if s.trim().is_empty() {
-        "（空）"
-    } else {
-        s
-    }
-}
-
 // `ensure-project --dry-run` / `tba create --dry`：只报候选，不建、不写绑定。
 //
 // 目的很具体：建项目前得先知道这个仓库该叫什么。目录名经常不可靠
@@ -828,7 +796,7 @@ fn claim_and_print(
                 "用户点头后只跑 `tba create --name \"<选定的>\" --go`：复用/新建项目并重写本地绑定。"
             );
             eprintln!(
-                "建完会打印项目链接，并自动补齐 1、2、3、4、5 五个看板列；补不动才提示手动建。"
+                "建完会打印项目链接，并自动补齐 未完成/进行中/待回复/已解决/已完成 五个看板列（老数字列会自动改名）；补不动才提示手动建。"
             );
             let _ = std::io::stdout().flush();
             std::process::exit(4);
@@ -875,7 +843,7 @@ fn finish_bootstrap(
     if let Some(p) = &r.entry {
         println!("AGENTS.md 入口: {}", p.display());
     }
-    // 建/复用完就把项目链接和看板列结果给人。create() 已经自动补过 1~5，
+    // 建/复用完就把项目链接和看板列结果给人。create() 已经自动补过 5 个中文列，
     // 这里用它的结果，不再让 go() 查第二遍（guide_tasklists=false）。
     print!(
         "{}",
@@ -985,14 +953,13 @@ pub fn run() -> Result<(), String> {
             | Cmd::Config { .. }
             | Cmd::Login { .. }
             | Cmd::Logout { .. }
-            // 工具链和自检是「装东西之前」就要能跑的命令：没装 but 也得能查
+            // 自检是「装东西之前」就要能跑的命令：没装 but 也得能查
             // 为什么编不了，否则用户卡在一个查不了的状态里。
             // - git 通用能力（status / main / create / tag）只依赖系统 git，不依赖
             //   GitButler CLI。is_gb_project 在 but 不存在时自然返回 false 走普通 git 分支；
             //   拦住它等于「没装 GitButler 就建不了 GitHub 仓库」，纯属误伤。
             // - 项目接入链路（create / ensure-project / prompt --init）只连 Teambition，
             //   不需要 but.exe。没装 GitButler 的设备正是最需要接入的设备，拦住等于死锁。
-            | Cmd::Toolchain { .. }
             | Cmd::Doctor
             | Cmd::Git { .. }
             | Cmd::Create { .. }
@@ -1022,73 +989,6 @@ pub fn run() -> Result<(), String> {
     }
 
     match cmd {
-        Cmd::Toolchain {
-            action,
-            msvc_bin,
-            msvc_lib,
-            sdk_lib,
-            extra_lib,
-        } => {
-            use crate::toolchain as tc;
-            match action.as_str() {
-                "set" => {
-                    if msvc_bin.is_none()
-                        && msvc_lib.is_none()
-                        && sdk_lib.is_none()
-                        && extra_lib.is_none()
-                    {
-                        return Err(
-                            "至少要给一个：--msvc-bin / --msvc-lib / --sdk-lib / --extra-lib"
-                                .to_string(),
-                        );
-                    }
-                    println!(
-                        "{}",
-                        tc::set(
-                            &store,
-                            msvc_bin.as_deref(),
-                            msvc_lib.as_deref(),
-                            sdk_lib.as_deref(),
-                            extra_lib.as_deref()
-                        )?
-                    );
-                }
-                "guess" => println!("{}", tc::guess(&store)?),
-                "clear" => println!("{}", tc::clear(&store)?),
-                "path" => println!("{}", tc::path(&store).display()),
-                _ => {
-                    let r = tc::resolve(&store);
-                    println!(
-                        "构建工具链（MSVC）：{}",
-                        if r.ready() { "可用" } else { "不可用" }
-                    );
-                    println!("  来源: {}", r.source.label());
-                    println!("{}", tc::show(&r.tc));
-                    if r.ready() {
-                        println!("\n✓ link.exe / libcmt.lib / kernel32.lib 都在");
-                    } else {
-                        println!("\n✗ 还差：");
-                        for p in &r.problems {
-                            println!("  - {p}");
-                        }
-                        if r.tc.sdk_lib.trim().is_empty() {
-                            println!("\nWindows SDK 的 lib 找过这些位置：");
-                            println!("{}", tc::sdk_hints());
-                            println!("本机没装 SDK 的话装一个（免费）：");
-                            println!("  https://developer.microsoft.com/windows/downloads/windows-sdk/");
-                            println!("或者在 VS Installer 里勾「Windows 11 SDK」。");
-                        }
-                        println!("\n指定位置（换成你机器上的实际目录）：");
-                        println!("  tba toolchain set --msvc-bin <dir> --msvc-lib <dir> --sdk-lib <dir>");
-                        println!("    --msvc-bin: <VS>/VC/Tools/MSVC/<ver>/bin/Hostx64/x64");
-                        println!("    --msvc-lib: <VS>/VC/Tools/MSVC/<ver>/lib/x64");
-                        println!("    --sdk-lib : <Windows Kits>/10/Lib/<ver>/um/x64");
-                        println!("装的是标准位置就先用 `tba toolchain guess` 自动填一次。");
-                        return Err("构建工具链不可用".to_string());
-                    }
-                }
-            }
-        }
         Cmd::GitButler { action, path } => match action.as_str() {
             "set" => {
                 let p = path.ok_or("要指定 --path <but.exe 路径，或它所在目录>")?;
@@ -1231,8 +1131,8 @@ pub fn run() -> Result<(), String> {
             }
         }
         Cmd::Init { project } => {
-            // 列名统一数字 1..5：顺手把本地 config 的 tasklist_* 归一到默认值
-            // （load-modify-save，token 不动）。老 config 若是中文列名，这里纠偏。
+            // 列名统一用中文状态名：顺手把本地 config 的 tasklist_* 归一到默认值
+            // （load-modify-save，token 不动）。老 config 若是数字列名，Config::load 已归一，这里落盘。
             let mut cfg = store.load_config();
             cfg.tasklist_queue = DEFAULT_TASKLIST_QUEUE.to_string();
             cfg.tasklist_claim = DEFAULT_TASKLIST_CLAIM.to_string();
@@ -1262,7 +1162,7 @@ pub fn run() -> Result<(), String> {
                 println!("  {}\t{}{}", s.id, s.name, tag);
             }
 
-            // 看板列：新版 MCP 有 task-list-create，复用同一个 ctx 自动补齐 1~5，
+            // 看板列：新版 MCP 有 task-list-create，复用同一个 ctx 自动补齐 5 个中文列，
             // 不再让人去网页手动建。补不动（老服务端 / 没分组 / 接口拒）才降级成
             // 「项目链接 + 手动补列」引导。和 create / go 共用一份，说法不漂移。
             // 查询失败不算「一列都没有」，别拿一次接口失败误导人去重建 5 列。
@@ -1475,7 +1375,7 @@ pub fn run() -> Result<(), String> {
             println!("内置模板已移到本地能力库（跨项目共享，窗口里能改）：");
             println!("  tba cap list     看有哪些");
             println!("  tba cap <名字>   读正文");
-            println!("可选名字: shot / git-main / release / gui-notes / reload");
+            println!("可选名字: shot / git-main / release / gui-notes");
             println!("确实要把某条钉到云端某个项目时才用: tba skill-init --project <id> --name <名>");
         }
         Cmd::SkillMem { project, open } => {
@@ -2396,240 +2296,6 @@ pub fn run() -> Result<(), String> {
                         timeout
                     )?
                 );
-            }
-        }
-        Cmd::Reload {
-            action,
-            project,
-            root,
-            name,
-            live,
-            args,
-            mode,
-            compile,
-            elevate,
-        } => {
-            // 参数优先级：命令行 > 项目设置（Teambition 的 setting 任务）> 推断。
-            // 项目设置是「这个项目怎么编译/怎么起」的唯一真值，agent 不该每次
-            // 重新拼 --root/--name；命令行只用来临时覆盖。
-            let pid = project
-                .or_else(crate::ops::read_project_binding)
-                .unwrap_or_default();
-            let st = if pid.is_empty() {
-                None
-            } else {
-                // 先本地缓存（快、离线可用），没有再联网拉一次。
-                match crate::setting::ProjectSetting::load_cached(&store, &pid) {
-                    Some(s) => Some(s),
-                    None => crate::setting::fetch(&store, &pid).ok().flatten(),
-                }
-            };
-            let st = st.unwrap_or_default();
-            let root = root
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| Some(st.root.clone()).filter(|s| !s.trim().is_empty()))
-                .unwrap_or_else(crate::capability::guess_root);
-            let name = name
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| Some(st.name.clone()).filter(|s| !s.trim().is_empty()))
-                .unwrap_or_else(|| crate::capability::guess_name(&root));
-            let mode = mode
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| Some(st.mode.clone()).filter(|s| !s.trim().is_empty()))
-                .unwrap_or_else(|| "rename".to_string());
-            let live = live
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| Some(st.live.clone()).filter(|s| !s.trim().is_empty()))
-                .unwrap_or_else(|| crate::capability::default_live(&root, &name));
-            // 重载 TBHub 自己时默认把窗口开回来
-            let args = args
-                .or_else(|| Some(st.args.clone()).filter(|s| !s.trim().is_empty()))
-                .unwrap_or_else(|| {
-                    if name == "tba" {
-                        "ui".to_string()
-                    } else {
-                        String::new()
-                    }
-                });
-            let compile = compile.unwrap_or_else(|| st.compile.clone());
-            if mode != "rename" && mode != "copy" {
-                return Err(format!("未知模式: {mode}（可选 rename|copy）"));
-            }
-            let req = crate::capability::ReloadReq {
-                action: action.clone(),
-                root,
-                name,
-                live,
-                args,
-                mode,
-                compile,
-                elevate,
-                release_src: false,
-            };
-            match action.as_str() {
-                "status" | "kill" => {
-                    let r = crate::capability::run_sync(&req, &store)?;
-                    if r.code == 0 {
-                        println!("{}", r.out);
-                    } else {
-                        return Err(fail_msg(&action, &r));
-                    }
-                }
-                "build" | "restart" => {
-                    // 自己重载自己：先把 cargo 产物重命名挪开，链接器才写得进去
-                    let mut req = req;
-                    req.release_src = action == "build" && crate::capability::is_src(&req.root, &req.name);
-                    let r = crate::capability::run_sync(&req, &store)?;
-                    if r.code == 0 {
-                        println!("{}", r.out);
-                    } else {
-                        return Err(fail_msg(&action, &r));
-                    }
-                }
-                other => {
-                    return Err(format!(
-                        "未知动作: {other}（可选 build|restart|kill|status）"
-                    ))
-                }
-            }
-        }
-        Cmd::Setting {
-            action,
-            project,
-            compile,
-            root,
-            name,
-            mode,
-            live,
-            args,
-            on,
-            off,
-            lang,
-        } => {
-            let pid = project
-                .or_else(crate::ops::read_project_binding)
-                .ok_or_else(|| {
-                    "没指定项目：加 --project <id>，或在项目目录跑 `tba bind <id>` 记一次绑定"
-                        .to_string()
-                })?;
-            match action.as_str() {
-                "show" | "get" => {
-                    let st = crate::setting::fetch(&store, &pid)?;
-                    match st {
-                        Some(s) => {
-                            println!("项目设置（{pid}）");
-                            println!("  启用        {}", if s.on { "是" } else { "否" });
-                            println!("  编译指令    {}", dash(&s.compile));
-                            println!("  项目目录    {}", dash(&s.root));
-                            println!("  exe 基名    {}", dash(&s.name));
-                            println!("  启动模式    {}", dash(&s.mode));
-                            println!("  运行副本    {}", dash(&s.live));
-                            println!("  启动参数    {}", dash(&s.args));
-                            if s.compile.trim().is_empty() {
-                                println!(
-                                    "\n编译指令是空的：先 `tba setting guess` 看探测结果，\
-                                     确认后 `tba setting set --compile \"...\"`。"
-                                );
-                            }
-                        }
-                        None => {
-                            println!("这个项目还没有设置（没有 status=setting 的任务）。");
-                            println!("看探测结果: tba setting guess");
-                            println!("存一份:   tba setting set");
-                        }
-                    }
-                }
-                "text" | "prompt" => {
-                    // 和开工文案同源：agent 收到什么，这里就打印什么。
-                    let s = crate::setting::ProjectSetting::load_cached(&store, &pid)
-                        .unwrap_or_else(|| crate::setting::ProjectSetting {
-                            root: std::env::current_dir()
-                                .map(|d| d.display().to_string())
-                                .unwrap_or_default(),
-                            ..Default::default()
-                        });
-                    if !s.on {
-                        println!("「编译 & 重载」在这个项目里是关的，开工文案里不会出现这一段。");
-                        return Ok(());
-                    }
-                    let zh = lang.as_deref() != Some("en");
-                    let exe = crate::ops::prompt_exe(&store);
-                    print!("{}", s.prompt_block(&exe, zh));
-                }
-                "guess" => {
-                    let cached = crate::setting::ProjectSetting::load_cached(&store, &pid);
-                    let root = root
-                        .or_else(|| cached.as_ref().map(|s| s.root.clone()))
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| {
-                            std::env::current_dir()
-                                .map(|d| d.display().to_string())
-                                .unwrap_or_else(|_| ".".to_string())
-                        });
-                    let mut s = cached.unwrap_or_default();
-                    s.root = root;
-                    s.fill_defaults();
-                    println!("按项目文件探测（还没保存）：");
-                    println!("  编译指令    {}", dash(&s.compile));
-                    println!("  项目目录    {}", s.root);
-                    println!("  exe 基名    {}", s.name);
-                    if s.compile.trim().is_empty() {
-                        println!(
-                            "\n没认出构建文件。看一眼项目根（build.zig / package.json / Makefile / \
-                             CMakeLists.txt），确认后用 `tba setting set --compile \"...\"` 写进去。"
-                        );
-                    } else {
-                        println!("\n确认无误就 `tba setting set` 存到 Teambition（status=setting）。");
-                    }
-                }
-                "set" => {
-                    // 以云端现有值为底：只改传进来的字段，没传的保持原样。
-                    let mut s = crate::setting::fetch(&store, &pid)?
-                        .or_else(|| crate::setting::ProjectSetting::load_cached(&store, &pid))
-                        .unwrap_or_default();
-                    if let Some(v) = compile {
-                        s.compile = v;
-                    }
-                    if let Some(v) = root {
-                        s.root = v;
-                    }
-                    if let Some(v) = name {
-                        s.name = v;
-                    }
-                    if let Some(v) = mode {
-                        s.mode = v;
-                    }
-                    if let Some(v) = live {
-                        s.live = v;
-                    }
-                    if let Some(v) = args {
-                        s.args = v;
-                    }
-                    if on {
-                        s.on = true;
-                    }
-                    if off {
-                        s.on = false;
-                    }
-                    s.fill_defaults();
-                    if !s.ready() {
-                        return Err(format!(
-                            "设置不完整（项目目录「{}」/ exe 名「{}」），补 --root / --name",
-                            s.root, s.name
-                        ));
-                    }
-                    println!("{}", crate::setting::save(&store, &pid, &s)?);
-                    println!(
-                        "  编译指令 {} | 目录 {} | exe {} | 模式 {}",
-                        dash(&s.compile),
-                        s.root,
-                        s.name,
-                        s.mode
-                    );
-                }
-                other => {
-                    return Err(format!("未知动作: {other}（可选 show|set|guess）"));
-                }
             }
         }
     }

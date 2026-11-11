@@ -11,7 +11,7 @@ use serde_json::json;
 /// 顺手把本地还能用的命令列出来，省得人去翻文档。
 pub const OFFLINE_ERR: &str = "当前是离线模式（不用 Teambition），这个操作需要联网。\n\
 本地仍然可用：tba projects（读缓存）/ tba skills / tba skill（读缓存）/ \
-tba setting text / tba reload / tba caps / tba shot / tba ui。\n\
+tba caps / tba shot / tba ui。\n\
 要联网：把 data/config.toml 里的 offline 改成 false，或去掉环境变量 TBA_OFFLINE。";
 
 // 工作流状态的 kind 三态（Teambition）：start=开始 / unset=进行中 / end=结束。
@@ -1007,13 +1007,14 @@ impl Ctx {
         ))
     }
 
-    /// 自动补齐 1~5 五个数字看板列。
+    /// 自动补齐 5 个中文看板列，并把老项目的数字列 1~5 直接改名成中文名。
     ///
     /// 2026-11 实测：新版 MCP 有 `teambition.project.task-list-create`
-    /// （projectId + taskGroupId + name，不传 prevTaskListId 即追加到末尾），
+    /// （projectId + taskGroupId + name，不传 prevTaskListId 即追加到末尾）和
+    /// `task-list-update-name`（projectId + taskListId + name）。
     /// 旧版「列只能网页手动建」的结论已作废。
     ///
-    /// 幂等：先查再补，只建缺的那几个，绝不动已有列（也不删多余的列，比如用户自己的「6」）。
+    /// 幂等：先查再改再补，只动缺的和老数字列，不删多余的列（比如用户自己的「归档」）。
     /// 任何一步失败都只记进 errors，不抛错、不阻断领任务 —— 让调用方打兜底引导。
     pub fn ensure_tasklists(&mut self, project_id: &str) -> TasklistResult {
         let mut out = TasklistResult::default();
@@ -1025,6 +1026,48 @@ impl Ctx {
             }
         };
         out.names = lists.iter().map(|l| l.name.clone()).collect();
+
+        // 老数字列改名。目标中文列已经存在就跳过，免得改出两个同名列。
+        let mut renames: Vec<(String, &str, &str)> = Vec::new();
+        for (old, new) in TASKLIST_LEGACY {
+            if out.names.iter().any(|n| n.as_str() == new) {
+                continue;
+            }
+            if let Some(l) = lists.iter().find(|l| l.name == old) {
+                renames.push((l.id.clone(), old, new));
+            }
+        }
+        if !renames.is_empty() {
+            match self.find_tool_suffix("task-list-update-name") {
+                Some(tool) => {
+                    for (id, old, new) in renames {
+                        match self.tb.call_smart(
+                            &tool,
+                            &[
+                                ("projectId", json!(project_id)),
+                                ("taskListId", json!(id)),
+                                ("name", json!(new)),
+                            ],
+                        ) {
+                            Ok(_) => {
+                                out.renamed.push(format!("{old}→{new}"));
+                                if let Some(i) = out.names.iter().position(|n| n.as_str() == old) {
+                                    out.names[i] = new.to_string();
+                                }
+                            }
+                            Err(e) => {
+                                out.errors.push(format!("列「{old}」改名「{new}」失败: {e}"))
+                            }
+                        }
+                    }
+                }
+                None => out.errors.push(
+                    "这个 MCP 工具集没有 task-list-update-name（老版本服务端），数字列改不了名"
+                        .to_string(),
+                ),
+            }
+        }
+
         let missing: Vec<&str> = TASKLIST_WANT
             .iter()
             .copied()
@@ -1051,7 +1094,7 @@ impl Ctx {
                 return out;
             }
         };
-        // 按 1→5 顺序建：不传 prevTaskListId 时服务端追加到末尾。
+        // 按队列→关闭的语义顺序建：不传 prevTaskListId 时服务端追加到末尾。
         for name in missing {
             match self.tb.call_smart(
                 &create_tool,
@@ -1069,7 +1112,7 @@ impl Ctx {
             }
         }
         // 回读一次，以服务端为准（顺序/名字可能被服务端改过）。
-        if !out.created.is_empty() {
+        if !out.created.is_empty() || !out.renamed.is_empty() {
             if let Ok(v) = self.task_lists(project_id) {
                 out.names = v.into_iter().map(|l| l.name).collect();
             }
@@ -1500,7 +1543,7 @@ pub fn finish(store: &Store, claim_id: &str, to_stage: &str) -> Result<Claim, St
 // 关键：被①（用户手动收尾）完成的任务，绝不能又被②回收回列1。所以回收前必须先判定。
 
 // 纯判定：给定任务当前的工作流状态名 + 看板列名，是否已被「外部」完成。
-// 返回 Some("closed") / Some("done") / None。列名（数字 1..5）优先于状态名——
+// 返回 Some("closed") / Some("done") / None。列名（中文状态名）优先于状态名——
 // 用户可能只拖了列没改状态。可单测，不碰网络。
 pub fn external_done_by(
     stage_name: &str,
@@ -2195,6 +2238,8 @@ pub struct TasklistResult {
     pub names: Vec<String>,
     /// 这次真正新建出来的列名。
     pub created: Vec<String>,
+    /// 这次从数字列改成中文名的列，形如 `1→未完成`。
+    pub renamed: Vec<String>,
     /// 失败原因。空 = 全部搞定。
     pub errors: Vec<String>,
 }
@@ -2215,13 +2260,13 @@ impl TasklistResult {
 
 /// 项目链接 + 看板列状态，create / go / init 共用这一份，免得说法漂移、漏给链接。
 ///
-/// 新版 MCP 有 `task-list-create`，正常路径是 tba 自动补齐 1~5；
-/// 这段只在「自动补列没成功」时才给手动步骤，不再是唯一出路。
+/// 新版 MCP 有 `task-list-create` / `task-list-update-name`，正常路径是 tba
+/// 自动补齐 5 个中文列、并把老数字列改名；这段只在「没完全成功」时才给手动步骤。
 ///
 /// `verbose=false`（每次 `tba go`）：全齐且没动过就返回空串，不刷屏。
 /// `verbose=true`（create / init）：总给项目链接和状态，建完项目人需要这条链接。
 pub fn tasklist_guidance(project_id: &str, r: &TasklistResult, verbose: bool) -> String {
-    if !verbose && r.ok() && r.created.is_empty() {
+    if !verbose && r.ok() && r.created.is_empty() && r.renamed.is_empty() {
         return String::new();
     }
     let mut s = format!(
@@ -2239,8 +2284,14 @@ pub fn tasklist_guidance(project_id: &str, r: &TasklistResult, verbose: bool) ->
             r.created.len()
         ));
     }
+    if !r.renamed.is_empty() {
+        s.push_str(&format!(
+            "✓ 已把数字列改成中文状态名: {}\n",
+            r.renamed.join(", ")
+        ));
+    }
     if r.ok() {
-        s.push_str("✓ 看板列 1/2/3/4/5 已齐全，不用手动建。\n");
+        s.push_str("✓ 5 个看板列已齐全（未完成/进行中/待回复/已解决/已完成），不用手动建。\n");
         return s;
     }
 
@@ -2271,12 +2322,13 @@ pub fn tasklist_guidance(project_id: &str, r: &TasklistResult, verbose: bool) ->
     }
     s.push_str(
         "\n===== 兜底：手动补这 5 个看板列 =====\n\
-         打开上面的项目链接 → 看板 → 新建 5 个任务列表，名字就用数字 1、2、3、4、5：\n\
-           列 1 = 未完成  （队列：还没人接的任务）\n\
-           列 2 = 进行中  （agent 正在干）\n\
-           列 3 = 待回复  （等你在 Teambition 评论回复）\n\
-           列 4 = 已解决  （已完成，待确认）\n\
-           列 5 = 已完成  （关闭 / 作废）\n\
+         打开上面的项目链接 → 看板 → 新建 5 个任务列表，名字直接用这 5 个工作流状态名：\n\
+           未完成  （队列：还没人接的任务）\n\
+           进行中  （agent 正在干）\n\
+           待回复  （等你在 Teambition 评论回复）\n\
+           已解决  （已完成，待确认）\n\
+           已完成  （关闭 / 作废）\n\
+         老项目里若还叫 1、2、3、4、5，把列名直接改成对应的中文名，别另建一列。\n\
          补不齐时 tba 只改状态、移列会静默跳过，请按上面步骤手动补。\n\
          补好后重跑 `tba go` 或 `tba init --project <id>`，tba 会自动再试一次。\n",
     );
@@ -4152,7 +4204,7 @@ fn prompt_body(
     s
 }
 
-/// 开工文案的**前半段**：项目头、记忆、skill 索引、通用能力、编译 & 重载。
+/// 开工文案的**前半段**：项目头、记忆、skill 索引、通用能力。
 ///
 /// 抽出来是为了让「直连模式」（`tba go --off`，不碰 Teambition）复用同一份内容——
 /// 能力索引和编译参数是本地就能决定的东西，两种模式不该长得不一样。
@@ -4170,8 +4222,7 @@ fn prompt_head(
     let cfg = store.load_config();
     // 文案里路径要出现十几次，所以允许配一个短路径（如目录联接 D:\tb\tba.exe）。
     // 没配就用真实 exe 路径，行为跟以前一致。
-    // 逻辑收在 prompt_exe_of 里：「查看文案」和 `tba setting text` 用同一份，
-    // 否则预览出来的命令和 agent 真收到的对不上。
+    // 逻辑收在 prompt_exe_of 里，保证预览出来的命令和 agent 真收到的一致。
     let exe = prompt_exe_of(&cfg);
     let mem = store.memory_dir(project_id);
     // 共享记忆开关：开着就把「本地目录」换成「读云端记忆」的命令。
@@ -4298,18 +4349,11 @@ fn prompt_head(
         }
         s.push('\n');
     }
-    // 编译 & 重载：参数存 Teambition 的 setting 任务，每个项目一份。
-    // 编译指令空着就明说「去探测再写回来」——否则 agent 会拿默认 cargo 硬编，
-    // 遇到 zig / go 项目就白跑一轮。
-    // 文案本体在 setting::prompt_block，GUI 的「查看文案」和 `tba setting text` 读同一份。
-    if let Some(st) = crate::setting::ProjectSetting::load_cached(store, project_id) {
-        s.push_str(&st.prompt_block(&exe, zh));
-    }
     s
 }
 
 /// 直连模式文案（`tba go --off`）：不经过 Teambition 的任务/等待环节，
-/// 交流全在当前对话框里。能力索引和编译参数跟正常开工文案是同一份。
+/// 交流全在当前对话框里。能力索引跟正常开工文案是同一份。
 pub fn direct_prompt(
     store: &Store,
     project_id: &str,
@@ -4435,9 +4479,10 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
         ));
         s.push_str(&format!(
             "\n**建完项目要给用户的东西**：输出里的「项目链接」（`https://www.teambition.com/project/<id>`）。\n\
-             看板列 1~5 由 tba 用新版 MCP 自动补齐，正常不用人管；只有输出里出现\n\
-             「✗ 自动补列没完全成功」和「兜底：手动补这 5 个看板列」时，才把链接和那段\n\
-             兜底步骤原样转给用户，让他在链接里手动建缺的那几个数字列。不要自己拼接口建列。\n\
+             5 个看板列直接用中文状态名：未完成、进行中、待回复、已解决、已完成，\n\
+             由 tba 用新版 MCP 自动补齐（老项目的数字列 1~5 会自动改名），正常不用人管；\n\
+             只有输出里出现「✗ 自动补列没完全成功」和「兜底：手动补这 5 个看板列」时，\n\
+             才把链接和那段兜底步骤原样转给用户，让他在链接里补缺的列。不要自己拼接口建列。\n\
              以后每次 `{exe} go` 都会自动再查再补一次。\n"
         ));
     } else {
@@ -4488,11 +4533,13 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
         ));
         s.push_str(&format!(
             "\n**After creating a project, always hand the user the project link** \
-             (`https://www.teambition.com/project/<id>`) from the output. Board columns 1-5 are \
-             now created automatically by tba via the newer MCP `task-list-create`; no manual work \
-             is normally needed. Only when the output contains \"auto create failed\" plus the \
-             manual fallback block should you forward that block to the user so they can add the \
-             missing numeric columns in the web UI. Never call Teambition APIs by hand.\n\
+             (`https://www.teambition.com/project/<id>`) from the output. The five board columns \
+             use the Chinese status names 未完成 / 进行中 / 待回复 / 已解决 / 已完成; tba creates \
+             missing ones via the newer MCP `task-list-create` and renames legacy numeric columns \
+             1-5 via `task-list-update-name`; no manual work is normally needed. Only when the \
+             output contains \"auto create failed\" plus the manual fallback block should you \
+             forward that block to the user so they can add the missing columns in the web UI. \
+             Never call Teambition APIs by hand.\n\
              Every later `{exe} go` re-checks and tops the columns up automatically.\n"
         ));
     }
@@ -4602,10 +4649,6 @@ fn entry_cmd(store: &Store) -> String {
 /// agent 把错误原样报给用户即可，不需要预先确认文件在哪。
 ///
 /// 「查看文案」这类预览必须走这里——另算一份就会和 agent 实际收到的对不上。
-pub(crate) fn prompt_exe(store: &Store) -> String {
-    prompt_exe_of(&store.load_config())
-}
-
 fn prompt_exe_of(cfg: &crate::config::Config) -> String {
     if cfg.tool_path.trim().is_empty() {
         "tba".to_string()
@@ -4730,7 +4773,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          （建项目 + 写 MCP 配置 + 当场领任务，一条命令做完）。退出码：\
          0+claim_id=干活；0+EMPTY=队列空；3=没绑定项目；4=项目查不到，问用户。\
          别自建任务。\n\n\
-         **流转**：进行中·列2 → `ask` 后 待回复·列3 → 用户收尾 已解决·列4。\n\n\
+         **流转**：进行中 → `ask` 后 待回复 → 用户收尾 已解决。\n\n\
          **交回**：做完两步，不许省：\n\
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
@@ -4748,9 +4791,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
          **通用能力**（别自己拼脚本）：`doctor` 环境自检 / \
          `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / \
-         `publish` 发版 / `shot` 截图。先 `{exe} --help`。\n\
-         **编译 & 重载**：`{exe} setting` 看本项目的编译指令和 exe 名（存 Teambition 的 \
-         setting 任务），再 `{exe} reload build`。\n"
+         `publish` 发版 / `shot` 截图。先 `{exe} --help`。\n"
     );
 
     // 四条编码纪律。来自 Karpathy 对 LLM 编码陷阱的总结，专治三种毛病：
@@ -4865,7 +4906,7 @@ fn claim_header(c: &Claim, exe: &str) -> String {
     )
 }
 
-/// `guide_tasklists`：是否在领任务前自动补齐看板列 1~5 并打印结果。
+/// `guide_tasklists`：是否在领任务前自动补齐 5 个中文看板列并打印结果。
 /// 正常 `tba go` 传 true；自举 `create --go` 传 false —— 那一路 create 已经补过并打印过，
 /// 不重复打一整块，也不重复发一次列查询/建列。
 pub fn go(
@@ -4942,7 +4983,7 @@ pub fn go(
         let _ = write_project_binding(&proj.id);
     }
 
-    // 看板列 1~5 缺了会让「移列」静默失效。每次 tba go 都用**现有 ctx** 查一次并
+    // 5 个中文看板列缺了会让「移列」静默失效。每次 tba go 都用**现有 ctx** 查一次并
     // 自动补齐（复用已完成的握手，不额外再连一遍）。全齐且没动过就不打印，不刷屏；
     // 补不动才给项目链接 + 手动兜底步骤。
     if guide_tasklists {
@@ -5072,6 +5113,7 @@ mod tests {
         TasklistResult {
             names: names.iter().map(|s| s.to_string()).collect(),
             created: Vec::new(),
+            renamed: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -5079,18 +5121,18 @@ mod tests {
     #[test]
     fn tasklist_result_ok_requires_no_errors_and_all_five() {
         // 顺序不强制、允许多余列（真实 TBA 项目里还有测试列「6」和「未分类」）。
-        let mut r = ready_result(&["6", "5", "4", "3", "2", "1", "未分类"]);
+        let mut r = ready_result(&["6", "已完成", "已解决", "待回复", "进行中", "未完成", "未分类"]);
         assert!(r.ready());
         assert!(r.ok());
-        r.errors.push("建列「5」失败: 权限不足".into());
+        r.errors.push("建列「已完成」失败: 权限不足".into());
         assert!(!r.ok(), "有失败就不算全部搞定，得给兜底引导");
-        assert!(!ready_result(&["1", "2", "3", "4"]).ready());
-        assert!(!ready_result(&["未完成", "进行中", "待回复", "已解决", "已完成"]).ready());
+        assert!(!ready_result(&["未完成", "进行中", "待回复", "已解决"]).ready());
+        assert!(!ready_result(&["1", "2", "3", "4", "5"]).ready());
     }
 
     #[test]
     fn tasklist_guidance_is_quiet_in_go_when_all_five_exist() {
-        let r = ready_result(&["5", "3", "1", "4", "2"]);
+        let r = ready_result(&["已完成", "待回复", "未完成", "已解决", "进行中"]);
         assert_eq!(tasklist_guidance("p1", &r, false), "", "每次 go 别刷屏");
         // create / init 是「建完项目」的动作，仍要给链接。
         let s = tasklist_guidance("p1", &r, true);
@@ -5102,17 +5144,18 @@ mod tests {
     #[test]
     fn tasklist_guidance_reports_auto_created_columns() {
         let r = TasklistResult {
-            names: vec!["1", "2", "3", "4", "5"]
+            names: vec!["未完成", "进行中", "待回复", "已解决", "已完成"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
-            created: vec!["3".into(), "4".into(), "5".into()],
+            created: vec!["待回复".into(), "已解决".into(), "已完成".into()],
+            renamed: Vec::new(),
             errors: Vec::new(),
         };
         assert!(r.ok());
         let s = tasklist_guidance("p1", &r, false);
         assert!(s.contains("https://www.teambition.com/project/p1"));
-        assert!(s.contains("已自动补齐看板列: 3, 4, 5"));
+        assert!(s.contains("已自动补齐看板列: 待回复, 已解决, 已完成"));
         assert!(s.contains("新建 3 个"));
         assert!(!s.contains("兜底"), "补齐成功就别再给手动步骤");
     }
@@ -5120,8 +5163,9 @@ mod tests {
     #[test]
     fn tasklist_guidance_falls_back_to_manual_when_auto_create_failed() {
         let r = TasklistResult {
-            names: vec!["1".into(), "2".into()],
+            names: vec!["未完成".into(), "进行中".into()],
             created: Vec::new(),
+            renamed: Vec::new(),
             errors: vec!["这个 MCP 工具集没有 task-list-create（老版本服务端）".into()],
         };
         assert!(!r.ok());
@@ -5129,9 +5173,9 @@ mod tests {
         assert!(s.contains("https://www.teambition.com/project/p1"));
         assert!(s.contains("✗ 自动补列没完全成功"));
         assert!(s.contains("task-list-create"));
-        assert!(s.contains("当前看板列: 1, 2"));
-        assert!(s.contains("还缺: 3, 4, 5"));
-        for w in ["列 1", "列 2", "列 3", "列 4", "列 5"] {
+        assert!(s.contains("当前看板列: 未完成, 进行中"));
+        assert!(s.contains("还缺: 待回复, 已解决, 已完成"));
+        for w in ["未完成", "进行中", "待回复", "已解决", "已完成"] {
             assert!(s.contains(w), "兜底引导里少了 {w}");
         }
     }
@@ -5141,6 +5185,7 @@ mod tests {
         let r = TasklistResult {
             names: Vec::new(),
             created: Vec::new(),
+            renamed: Vec::new(),
             errors: vec!["查不到看板列: 超时".into()],
         };
         assert!(r.unknown());
@@ -5148,29 +5193,36 @@ mod tests {
         assert!(s.contains("查不到看板列"));
         assert!(!s.contains("还缺:"), "没拿到列清单就别谎报缺哪几列");
         assert!(!s.contains("当前看板列"));
-        assert!(s.contains("列 5"), "查不到也要给完整兜底步骤");
+        assert!(s.contains("已完成"), "查不到也要给完整兜底步骤");
     }
 
-    // 外部收尾判定：用户网页手动改状态、或拖到列4/列5，都算「已完成」。
-    // 列名用数字（1..5），列优先于状态名（可能只拖了列没改状态）。
+    // 外部收尾判定：用户网页手动改状态、或拖到「已解决」/「已完成」列，都算已完成。
+    // 列名现在用中文状态名，列优先于状态名（可能只拖了列没改状态）。
     #[test]
     fn external_done_by_detects_manual_completion() {
-        let cfg = crate::config::Config::default(); // tasklist_done="4" closed="5"
+        let cfg = crate::config::Config::default(); // done="已解决" closed="已完成"
         // 只拖列、状态还是「进行中」也算完成
-        assert_eq!(external_done_by("进行中", "4", &cfg), Some("done"));
-        assert_eq!(external_done_by("进行中", "5", &cfg), Some("closed"));
-        // 只改状态、列还在 2 也算完成
-        assert_eq!(external_done_by("已解决", "2", &cfg), Some("done"));
-        assert_eq!(external_done_by("已完成", "2", &cfg), Some("closed"));
-        // 列和状态冲突时列优先：拖到列5=关闭
-        assert_eq!(external_done_by("已解决", "5", &cfg), Some("closed"));
+        assert_eq!(external_done_by("进行中", "已解决", &cfg), Some("done"));
+        assert_eq!(external_done_by("进行中", "已完成", &cfg), Some("closed"));
+        // 只改状态、列还在「未完成」也算完成
+        assert_eq!(external_done_by("已解决", "未完成", &cfg), Some("done"));
+        assert_eq!(external_done_by("已完成", "未完成", &cfg), Some("closed"));
+        // 列和状态冲突时列优先：拖到「已完成」列=关闭
+        assert_eq!(external_done_by("已解决", "已完成", &cfg), Some("closed"));
         // 没收尾的都不算
-        assert_eq!(external_done_by("未完成", "1", &cfg), None);
-        assert_eq!(external_done_by("进行中", "2", &cfg), None);
-        assert_eq!(external_done_by("待回复", "3", &cfg), None);
+        assert_eq!(external_done_by("未完成", "未完成", &cfg), None);
+        assert_eq!(external_done_by("进行中", "进行中", &cfg), None);
+        assert_eq!(external_done_by("待回复", "待回复", &cfg), None);
         // 空列名（数据源没有看板列维度）时退化成只看状态
         assert_eq!(external_done_by("已解决", "", &cfg), Some("done"));
         assert_eq!(external_done_by("进行中", "", &cfg), None);
+
+        // 老项目还是数字列 1~5 时（config 没迁移到、或用户手改过）也不能漏判。
+        let mut legacy = crate::config::Config::default();
+        legacy.tasklist_done = "4".into();
+        legacy.tasklist_closed = "5".into();
+        assert_eq!(external_done_by("进行中", "4", &legacy), Some("done"));
+        assert_eq!(external_done_by("进行中", "5", &legacy), Some("closed"));
     }
 
     fn tmp_store(tag: &str) -> Store {

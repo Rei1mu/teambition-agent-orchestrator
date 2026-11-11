@@ -755,12 +755,47 @@ fn find_iss(root: &Path) -> Option<String> {
     None
 }
 
+// 从 Cargo.toml 猜 exe 基名。优先级：[[bin]] name > default-run > [package] name > 目录名。
+fn guess_name(root: &str) -> String {
+    let toml = std::path::Path::new(root).join("Cargo.toml");
+    if let Ok(s) = std::fs::read_to_string(&toml) {
+        let (mut pkg, mut bin, mut default_run) = (String::new(), String::new(), String::new());
+        let mut in_bin = false;
+        for line in s.lines() {
+            let t = line.trim();
+            if t.starts_with('[') {
+                in_bin = t == "[[bin]]";
+                continue;
+            }
+            if let Some((k, v)) = t.split_once('=') {
+                let k = k.trim();
+                let v = v.trim().trim_matches('"').trim_matches('\'');
+                match k {
+                    "name" if in_bin && bin.is_empty() => bin = v.to_string(),
+                    "name" if !in_bin && pkg.is_empty() => pkg = v.to_string(),
+                    "default-run" if default_run.is_empty() => default_run = v.to_string(),
+                    _ => {}
+                }
+            }
+        }
+        for cand in [bin, default_run, pkg] {
+            if !cand.is_empty() {
+                return cand;
+            }
+        }
+    }
+    std::path::Path::new(root)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "app".to_string())
+}
+
 pub fn init_workflow(exe: Option<&str>, force: bool) -> Result<String, String> {
     let root = repo_root()?;
     let exe = exe
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| crate::capability::guess_name(&root.display().to_string()));
+        .unwrap_or_else(|| guess_name(&root.display().to_string()));
     let iss = find_iss(&root);
     let yml = workflow_yaml(&exe, iss.as_deref());
     let dir = root.join(".github").join("workflows");

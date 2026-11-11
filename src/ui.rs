@@ -24,12 +24,6 @@ enum Ev {
     Skills(String, Vec<SkillItem>),
     LoggedIn(usize),
     Err(String),
-    /// 编译 & 重载的结果（项目 id, 输出）
-    ReloadDone(String, String),
-    /// 项目设置从云端读回来了（项目 id, 结果）
-    SettingLoaded(String, Result<Option<crate::setting::ProjectSetting>, String>),
-    /// 项目设置保存结果（项目 id, 结果）
-    SettingSaved(String, Result<String, String>),
     /// GitButler/git 后台检测结果
     GbChecked {
         gb: crate::gitbutler::GbStatus,
@@ -126,20 +120,6 @@ pub struct App {
     view: View,
     // 项目级：通用能力「不用」名单（本地 projects/<id>/caps-off.toml）
     cap_off: HashMap<String, Vec<String>>,
-    // 项目「编译 & 重载」的编辑态（本地缓存 + 云端设置）
-    setting: HashMap<String, crate::setting::ProjectSetting>,
-    // 「编译 & 重载」的**文本**编辑缓冲（每个项目一段 TOML 原文）。
-    // 表单拆成六个格子太碎，改一个参数得挨个找；直接编辑那段文本更顺手，
-    // 而且它就是存到 Teambition 任务备注里的东西——所见即所存。
-    compile_text: HashMap<String, String>,
-    // 已经从云端拉过一次（避免每次展开都联网）
-    setting_fetched: HashMap<String, bool>,
-    // 正在读/写哪个项目的设置
-    setting_busy: Option<String>,
-    // 重载动作按项目记：编译要几十秒，切到别的项目也不该串台
-    reload_busy: Option<String>,
-    reload_out: HashMap<String, String>,
-    reload_log: HashMap<String, String>,
     // 界面偏好（字号）
     font_size: f32,
     // 中文字体 key（空 = 自动）。改了要重装字体，所以记一份已生效的值做差异判断。
@@ -172,11 +152,6 @@ pub struct App {
     // 截图自验用：TBA_UI_OPEN=1 时所有项目卡片和折叠区默认展开
     // （GUI 没法用命令行点按钮，不展开就截不到里面的内容）。
     debug_open: bool,
-    // 构建工具链状态。None = 还没算过（resolve 会跑 vswhere，不能每帧算）。
-    // 改完路径就置 None，下一帧重算。
-    tc: Option<crate::toolchain::Resolved>,
-    // 只读文本查看窗（标题, 正文）。给「查看文案」这类「只想看一眼」的内容用。
-    text_view: Option<(String, String)>,
     // 「接入项目」页。目录可以选任意位置，不必是窗口进程的 cwd。
     create_dir: String,
     create_rows: Vec<crate::create::Row>,
@@ -241,13 +216,6 @@ impl CapEdit {
         }
     }
 }
-
-/// Windows SDK 官方下载页：本机没装 SDK 时给个能点的地方，别让人自己搜。
-const SDK_URL: &str = "https://developer.microsoft.com/windows/downloads/windows-sdk/";
-
-/// VS 生成工具（Build Tools）：只装编译器 + Windows SDK，不带 IDE。
-/// 比装完整 VS 轻，装的时候勾「使用 C++ 的桌面开发」就有 link.exe。
-const VS_BUILD_TOOLS_URL: &str = "https://visualstudio.microsoft.com/visual-cpp-build-tools/";
 
 /// 给编辑类弹窗开成一个真正的系统窗口。
 ///
@@ -477,19 +445,6 @@ impl App {
             .ok()
             .and_then(|n| caps::get(&store, &n))
             .map(|c| CapEdit::from(&c));
-        // 同一个钩子家族：TBA_UI_TEXT=<项目 id> 直接打开「编译 & 重载」的文案查看窗。
-        let text_view0 = std::env::var("TBA_UI_TEXT").ok().map(|pid| {
-            let st = crate::setting::ProjectSetting::load_cached(&store, &pid)
-                .unwrap_or_default();
-            let exe = crate::ops::prompt_exe(&store);
-            let block = st.prompt_block(&exe, true);
-            let text = if block.trim().is_empty() {
-                "「编译 & 重载」已停用：这段不会出现在开工文案里。".to_string()
-            } else {
-                block.trim_end().to_string()
-            };
-            ("编译 & 重载 · 开工文案".to_string(), text)
-        });
         let mut app = App {
             store,
             tx,
@@ -519,13 +474,6 @@ impl App {
                 _ => View::Projects,
             },
             cap_off: HashMap::new(),
-            setting: HashMap::new(),
-            compile_text: HashMap::new(),
-            setting_fetched: HashMap::new(),
-            setting_busy: None,
-            reload_busy: None,
-            reload_out: HashMap::new(),
-            reload_log: HashMap::new(),
             font_size,
             font_choice: prefs.font.clone(),
             applied_font_choice: prefs.font.clone(),
@@ -545,9 +493,6 @@ impl App {
             cap_edit: cap_edit0,
             cap_del: None,
             debug_open: std::env::var("TBA_UI_OPEN").as_deref() == Ok("1"),
-            // 懒加载：设置页第一次打开时才算（要跑 vswhere，启动时不抢时间）。
-            tc: None,
-            text_view: text_view0,
             create_dir: std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
@@ -1111,55 +1056,6 @@ impl eframe::App for App {
                         self.status = format!("错误: {e}");
                     }
                 }
-                Ev::ReloadDone(pid, text) => {
-                    self.reload_busy = None;
-                    if let Some(st) = self.setting.get(&pid) {
-                        self.reload_log
-                            .insert(pid.clone(), crate::capability::log_tail(&st.root, 15));
-                    }
-                    self.reload_out.insert(pid, text);
-                }
-                Ev::SettingLoaded(pid, r) => {
-                    self.setting_busy = None;
-                    match r {
-                        Ok(Some(st)) => {
-                            // 云端拉回来就重置文本缓冲：这是用户主动「从云端重读」，
-                            // 或者第一次展开时的自动拉取（那时还没人编辑过）。
-                            self.compile_text.insert(pid.clone(), st.to_note());
-                            self.setting.insert(pid, st);
-                        }
-                        Ok(None) => {
-                            self.status = if self.offline {
-                                "离线模式：这个项目还没有「编译 & 重载」设置。填好后保存会写本地缓存\
-                                 （data/projects/<id>/setting.toml），联网时再同步到 Teambition。"
-                                    .to_string()
-                            } else {
-                                "还没有「编译 & 重载」设置：填好点「保存到 Teambition」，\
-                                 或让 agent 跑 `tba setting set --compile ...`"
-                                    .to_string()
-                            };
-                        }
-                        Err(e) => self.status = format!("读取项目设置失败: {e}"),
-                    }
-                }
-                Ev::SettingSaved(pid, r) => {
-                    self.setting_busy = None;
-                    match r {
-                        Ok(msg) => {
-                            self.status = msg;
-                            // 保存成功顺手把内存里的值对齐（fill_defaults 可能补了字段）
-                            if let Some(st) =
-                                crate::setting::ProjectSetting::load_cached(&self.store, &pid)
-                            {
-                                // 文本也换成规范化后的版本：用户手写的引号/转义被修正，
-                                // 下次打开看到的就是「实际存下去的东西」。
-                                self.compile_text.insert(pid.clone(), st.to_note());
-                                self.setting.insert(pid, st);
-                            }
-                        }
-                        Err(e) => self.status = format!("保存项目设置失败: {e}"),
-                    }
-                }
                 Ev::GbChecked { gb, git } => {
                     self.gb = Some(gb);
                     self.git_ver = git;
@@ -1239,8 +1135,6 @@ impl eframe::App for App {
         if self.loading_projects
             || self.loading_skill.is_some()
             || self.setup_busy
-            || self.reload_busy.is_some()
-            || self.setting_busy.is_some()
             || self.skillmem_busy.is_some()
             || self.create_busy
         {
@@ -1600,7 +1494,6 @@ impl eframe::App for App {
                             // 「关掉的是这个项目的还是整台机器的」。
                             self.draw_tb_skills(ui, &pid, &rows, loading, &mut edit_req, &mut del_req);
                             self.draw_caps_for_project(ui, &pid);
-                            self.draw_compile_section(ui, &pid);
                             ui.add_space(6.0);
                             // 导出：把云端 skill / mem 拉成本地两个 md，人可以直接看
                             // 「agent 读到的到底是什么样」。下载 = 重新拉一遍覆盖本地。
@@ -1752,71 +1645,10 @@ impl eframe::App for App {
         self.draw_skill_editor(ctx);
         self.draw_cap_editor(ctx);
         self.draw_cap_delete(ctx);
-        self.draw_text_view(ctx);
     }
 }
 
 impl App {
-    /// 只读文本查看窗（独立系统窗口）。目前给「编译 & 重载 → 查看文案」用。
-    fn draw_text_view(&mut self, ctx: &egui::Context) {
-        let Some((title, text)) = self.text_view.clone() else {
-            return;
-        };
-        let mut close = false;
-        let mut copy = false;
-        let (close2, copy2) = show_editor_window(
-            ctx,
-            "tba-text-view",
-            title,
-            [820.0, 620.0],
-            [520.0, 360.0],
-            |ui| {
-                if ui.ctx().input(|i| i.viewport().close_requested()) {
-                    close = true;
-                }
-                // 按钮放在上面：ScrollArea 用 auto_shrink=false 会吃满剩余高度，
-                // 放它下面就会被挤出窗口（实测截图里根本看不见）。
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            "这就是开工文案里 agent 实际收到的那一段，不是另写的说明。",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.button("关闭").clicked() {
-                                close = true;
-                            }
-                            if ui.button("复制").clicked() {
-                                copy = true;
-                            }
-                        },
-                    );
-                });
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&text).monospace().size(13.0),
-                            )
-                            .wrap(),
-                        );
-                    });
-                (close, copy)
-            },
-        );
-        if copy2 {
-            ctx.copy_text(text.clone());
-        }
-        if close || close2 {
-            self.text_view = None;
-        }
-    }
     // 通用能力页：本地、跨项目的文本能力库。
     //
     // 和「项目列表」里的 skill 是两套东西：项目 skill 存 Teambition 云端、按项目隔离，
@@ -2211,10 +2043,9 @@ impl App {
         (text, has_task)
     }
 
-    // 通用能力：重载。编译 -> 杀旧 -> 复制校验 -> 启动。
-    // ---- 项目卡片里的三块：tb skill / 通用 skill / 编译 & 重载 ----
+    // ---- 项目卡片里的两块：tb skill / 通用 skill ----
     //
-    // 为什么都要默认收起：一个项目展开就有三个列表 + 一堆按钮，找「复制文案」
+    // 为什么都要默认收起：一个项目展开就有两个列表 + 一堆按钮，找「复制文案」
     // 得往下滚半天。默认收起后，卡片高度只跟项目数有关，扫一眼就能定位。
     fn draw_tb_skills(
         &mut self,
@@ -2356,326 +2187,6 @@ impl App {
             });
     }
 
-    // 编译 & 重载：参数存 Teambition 状态为 setting 的任务（标题「项目设置」），
-    // 本地留一份缓存好秒开。第一次展开时后台拉一次云端，之后用内存里的编辑态。
-    fn draw_compile_section(&mut self, ui: &mut egui::Ui, pid: &str) {
-        if !self.setting.contains_key(pid) {
-            let cached = crate::setting::ProjectSetting::load_cached(&self.store, pid)
-                .unwrap_or_default();
-            self.setting.insert(pid.to_string(), cached);
-        }
-        let mut ed = self.setting.get(pid).cloned().unwrap_or_default();
-        let busy = self.reload_busy.as_deref() == Some(pid);
-        // 文本缓冲：第一次进来用当前设置渲染成 TOML，之后就是用户手里的那份。
-        if !self.compile_text.contains_key(pid) {
-            self.compile_text.insert(pid.to_string(), ed.to_note());
-        }
-        // 标题按文本里解析出来的 on 走，改了 `on = false` 立刻反映到折叠标题上。
-        let parsed_now = crate::setting::ProjectSetting::parse_note(
-            self.compile_text.get(pid).map(|s| s.as_str()).unwrap_or(""),
-        );
-        let title = if parsed_now.on {
-            "编译 & 重载".to_string()
-        } else {
-            "编译 & 重载（已停用）".to_string()
-        };
-        let mut save = false;
-        let mut refetch = false;
-        let mut detect = false;
-        let mut action: Option<&'static str> = None;
-
-        egui::CollapsingHeader::new(title)
-            .id_salt(("compile", pid))
-            .default_open(self.debug_open)
-            .show(ui, |ui| {
-                // 展开过就拉一次云端：本地缓存可能是上次的，编译指令改了要能看到。
-                if self.setting_fetched.get(pid) != Some(&true) && self.setting_busy.is_none() {
-                    self.setting_fetched.insert(pid.to_string(), true);
-                    self.setting_busy = Some(pid.to_string());
-                    let store = self.store.clone();
-                    let tx = self.tx.clone();
-                    let pid2 = pid.to_string();
-                    thread::spawn(move || {
-                        let r = crate::setting::fetch(&store, &pid2);
-                        let _ = tx.send(Ev::SettingLoaded(pid2, r));
-                    });
-                }
-                ui.label(
-                    egui::RichText::new(
-                        "参数存 Teambition：状态 setting 的任务「项目设置」。下面就是那段文本，\
-                         网页上看到的也是同一份——改完点「保存到 Teambition」。",
-                    )
-                    .small()
-                    .weak(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "字段：on(true/false) · compile · root · name(exe 基名，不带 .exe) · \
-                         mode(rename 改名直跑 / copy 副本运行) · live(copy 模式的副本路径) · args(启动参数)",
-                    )
-                    .small()
-                    .weak(),
-                );
-                // 文本就是真相：这段 TOML 原样存进 Teambition 任务备注。
-                // 之前是六个输入框，改一个参数得在格子里挨个找，还看不全整体。
-                let mut text = self.compile_text.get(pid).cloned().unwrap_or_default();
-                let resp = ui.add(
-                    egui::TextEdit::multiline(&mut text)
-                        .code_editor()
-                        .desired_rows(9)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(
-                            "# 一行一个字段，例如：\n\
-                             # on = true\n\
-                             # compile = \"cargo build --release\"\n\
-                             # root = 'D:\\dev\\mcp'\n\
-                             # name = \"tba\"\n\
-                             # mode = \"rename\"\n\
-                             # args = \"ui\"",
-                        ),
-                );
-                if resp.changed() {
-                    self.compile_text.insert(pid.to_string(), text.clone());
-                }
-                // 解析结果就地反馈：语法对不对、有没有明显会跑挂的。
-                // 解析不了也照样能用（逐行扫 key = value），所以只是提示不是错误。
-                let parsed = crate::setting::ProjectSetting::parse_note(&text);
-                let mut warns: Vec<String> = Vec::new();
-                let mut hints: Vec<String> = Vec::new();
-                if !crate::setting::ProjectSetting::is_toml(&text) {
-                    warns.push(
-                        "不是合法 TOML（多半是 Windows 路径里的 \\ 或引号写错），已按行读取：\
-                         字段照样能认，但建议路径用单引号 'D:\\dev\\mcp'"
-                            .to_string(),
-                    );
-                }
-                warns.extend(parsed.problems());
-                if parsed.compile.trim().is_empty() {
-                    hints.push(
-                        "compile 空着 = 还没定：可以点「探测默认值」，或让 agent 跑 \
-                         `tba setting guess`。空着仍可「只重启」。"
-                            .to_string(),
-                    );
-                }
-                if warns.is_empty() && hints.is_empty() {
-                    ui.label(egui::RichText::new("✓ 解析正常").small().weak());
-                }
-                for w in warns {
-                    ui.label(
-                        egui::RichText::new(format!("⚠ {w}"))
-                            .small()
-                            .color(egui::Color32::from_rgb(0xE0, 0x7B, 0x39)),
-                    );
-                }
-                for h in hints {
-                    ui.label(egui::RichText::new(format!("· {h}")).small().weak());
-                }
-
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            self.setting_busy.as_deref() != Some(pid),
-                            egui::Button::new(if self.offline {
-                                "保存（离线·存本地）"
-                            } else {
-                                "保存到 Teambition"
-                            }),
-                        )
-                        .on_hover_text(if self.offline {
-                            "离线模式：写本地缓存 data/projects/<id>/setting.toml，不碰云端"
-                        } else {
-                            "写进状态 setting 的任务备注，换设备也还在"
-                        })
-                        .clicked()
-                    {
-                        save = true;
-                    }
-                    if ui
-                        .button("探测默认值")
-                        .on_hover_text(
-                            "按项目现状补 root / name / compile，**只填空着的**，填过的一律不动。\
-                             补完直接显示在文本里，还要点保存才写回云端",
-                        )
-                        .clicked()
-                    {
-                        detect = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            self.setting_busy.as_deref() != Some(pid),
-                            egui::Button::new(if self.offline {
-                                "重读本地"
-                            } else {
-                                "从云端重读"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        refetch = true;
-                    }
-                    // 文案就是开工时给 agent 的那一段（和 `tba setting text` 同源）。
-                    // 按当前文本算：改完没保存也能先看效果，保存后 agent 才真收到。
-                    if ui
-                        .button("查看文案")
-                        .on_hover_text(
-                            "看开工文案里「编译 & 重载」那一段（按当前文本内容生成；\
-                             保存到 Teambition 后 agent 才会收到）",
-                        )
-                        .clicked()
-                    {
-                        let exe = crate::ops::prompt_exe(&self.store);
-                        let block = parsed.prompt_block(&exe, true);
-                        let text = if block.trim().is_empty() {
-                            "「编译 & 重载」已停用：这段不会出现在开工文案里。".to_string()
-                        } else {
-                            block.trim_end().to_string()
-                        };
-                        self.text_view = Some(("编译 & 重载 · 开工文案".to_string(), text));
-                    }
-                    if self.setting_busy.as_deref() == Some(pid) {
-                        ui.spinner();
-                    }
-                });
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("编译 & 重载"))
-                        .on_hover_text("编译 -> 杀旧 -> 复制校验 -> 启动")
-                        .clicked()
-                    {
-                        action = Some("build");
-                    }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("只重启"))
-                        .on_hover_text("不编译，直接杀旧 + 启动")
-                        .clicked()
-                    {
-                        action = Some("restart");
-                    }
-                    if ui.add_enabled(!busy, egui::Button::new("杀掉")).clicked() {
-                        action = Some("kill");
-                    }
-                    if ui.add_enabled(!busy, egui::Button::new("状态")).clicked() {
-                        action = Some("status");
-                    }
-                    if busy {
-                        ui.spinner();
-                    }
-                });
-                if let Some(out) = self.reload_out.get(pid) {
-                    ui.label(egui::RichText::new(out).monospace());
-                }
-                if let Some(log) = self.reload_log.get(pid) {
-                    if !log.is_empty() {
-                        ui.collapsing("reload.log 末尾", |ui| {
-                            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new(log).monospace().small(),
-                                ));
-                            });
-                        });
-                    }
-                }
-            });
-
-        // 文本 -> 结构体：保存、跑「编译 & 重载」都用解析出来的值，
-        // 这样「文本里写的就是会执行的东西」，不会出现表单和文本两套真相。
-        let text_now = self.compile_text.get(pid).cloned().unwrap_or_default();
-        ed = crate::setting::ProjectSetting::parse_note(&text_now);
-        if detect {
-            // 探测默认值：只补空着的字段，然后把结果写回文本让人过目。
-            let mut st = ed.clone();
-            st.fill_defaults();
-            self.compile_text.insert(pid.to_string(), st.to_note());
-            ed = st;
-        }
-        // 编辑态写回：CollapsingHeader 收起时闭包不执行，这里只在展开时覆盖，
-        // 不会把云端刚拉回来的值冲掉（拉回来时闭包还没跑）。
-        self.setting.insert(pid.to_string(), ed.clone());
-        if refetch {
-            self.setting_fetched.insert(pid.to_string(), false);
-            self.setting_busy = Some(pid.to_string());
-            let store = self.store.clone();
-            let tx = self.tx.clone();
-            let pid2 = pid.to_string();
-            thread::spawn(move || {
-                let r = crate::setting::fetch(&store, &pid2);
-                let _ = tx.send(Ev::SettingLoaded(pid2, r));
-            });
-        }
-        if save {
-            self.setting_busy = Some(pid.to_string());
-            let store = self.store.clone();
-            let tx = self.tx.clone();
-            let pid2 = pid.to_string();
-            let mut st = ed.clone();
-            // 空字段按项目现状补齐再存，否则云端会留下一个「有任务没参数」的设置。
-            st.fill_defaults();
-            // 文本同步成规范化后的 TOML：手写的引号/转义在这里被修正，
-            // 下次打开看到的就是实际存下去的东西。
-            self.compile_text.insert(pid.to_string(), st.to_note());
-            self.setting.insert(pid.to_string(), st.clone());
-            thread::spawn(move || {
-                let r = crate::setting::save(&store, &pid2, &st);
-                let _ = tx.send(Ev::SettingSaved(pid2, r));
-            });
-        }
-        if let Some(a) = action {
-            self.start_reload(pid, a);
-        }
-    }
-
-    // 跑一次编译 & 重载。参数就是上面那张表里的值——存没存过都能跑，
-    // 存过只是让它换设备还在。
-    fn start_reload(&mut self, pid: &str, action: &str) {
-        let st = self.setting.get(pid).cloned().unwrap_or_default();
-        self.reload_busy = Some(pid.to_string());
-        self.reload_out
-            .insert(pid.to_string(), format!("正在执行 {action}..."));
-        let req = crate::capability::ReloadReq {
-            action: action.to_string(),
-            root: st.root.clone(),
-            name: st.name.clone(),
-            live: st.live.clone(),
-            args: st.args.clone(),
-            mode: st.mode.clone(),
-            compile: st.compile.clone(),
-            elevate: false,
-            release_src: false,
-        };
-        let pid2 = pid.to_string();
-        let tx = self.tx.clone();
-        // 工具链路径要从配置里读，所以 store 得跟着进线程。
-        let store = self.store.clone();
-        thread::spawn(move || {
-            let mut req = req;
-            // 自己重载自己：先把 cargo 产物重命名挪开，链接器才写得进去
-            req.release_src =
-                req.action == "build" && crate::capability::is_src(&req.root, &req.name);
-            let self_src = req.release_src;
-            match crate::capability::run_sync(&req, &store) {
-                Ok(r) => {
-                    let ok = r.code == 0;
-                    let text = if ok {
-                        r.out
-                    } else if !r.err.is_empty() {
-                        r.err
-                    } else {
-                        format!("exit {}", r.code)
-                    };
-                    let _ = tx.send(Ev::ReloadDone(pid2, text));
-                    // 重载 tba 自己：新实例已经起来，旧窗口让位
-                    if ok && self_src {
-                        thread::sleep(std::time::Duration::from_millis(1200));
-                        std::process::exit(0);
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Ev::ReloadDone(pid2, format!("ERR run:{e}")));
-                }
-            }
-        });
-    }
 
     // 没有 token 时的引导面板：打开网页 -> 粘贴 -> 保存。
     fn draw_setup(&mut self, ui: &mut egui::Ui) {
@@ -2737,163 +2248,6 @@ impl App {
 
     // 设置：字体大小等界面偏好。改动即时生效（update 里按 applied_font 差异重设样式）
     // 并写入 data/ui.toml，重启窗口也会保留。
-    // 构建工具链（MSVC + Windows SDK）。
-    //
-    // 为什么要有这块：编译 & 重载要靠 link.exe 和 SDK 的库，而每台机器的 VS
-    // 版本、SDK 位置都不一样（有的还在别的盘）。自动探测只覆盖标准位置，
-    // 探不到时让用户点三次「选择」，比让人去翻文档快得多。
-    fn draw_toolchain(&mut self, ui: &mut egui::Ui) {
-        use crate::toolchain as tc;
-        if self.tc.is_none() {
-            self.tc = Some(tc::resolve(&self.store));
-        }
-        let ready = self.tc.as_ref().map(|r| r.ready()).unwrap_or(false);
-        let mut pick: Option<u8> = None;
-        let mut do_guess = false;
-        let mut do_clear = false;
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong("构建工具链");
-                if ready {
-                    ui.colored_label(egui::Color32::from_rgb(0x2e, 0x7d, 0x32), "✓ 可用");
-                } else {
-                    ui.colored_label(egui::Color32::from_rgb(0xc6, 0x28, 0x28), "✗ 不可用");
-                }
-                if let Some(r) = &self.tc {
-                    ui.label(format!("来源: {}", r.source.label()));
-                }
-            });
-            ui.label(
-                egui::RichText::new(
-                    "编译 & 重载要用 MSVC 的 link.exe 和 Windows SDK 的库。只认 MSVC——\
-                     发布包就是它编的，GNU 编出来的东西行为不一样。",
-                )
-                .small()
-                .weak(),
-            );
-            match &self.tc {
-                Some(r) if r.ready() => {
-                    ui.label(egui::RichText::new(format!("link.exe: {}", r.tc.msvc_bin)).small());
-                    ui.label(egui::RichText::new(format!("SDK lib : {}", r.tc.sdk_lib)).small());
-                }
-                Some(r) => {
-                    for p in &r.problems {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(0xc6, 0x28, 0x28),
-                            format!("· {p}"),
-                        );
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "点下面三个「选择」指到对应目录（里面有那个文件就行）；\
-                             选完立刻验活，路径不对不会保存。",
-                        )
-                        .small(),
-                    );
-                }
-                None => {}
-            }
-            // 手动安装入口**常显**：不管当前探没探到，这两个下载地址都在。
-            // 装好了也可能是别人装的旧版、或者要装到另一台机器/另一个盘，
-            // 只在缺件时给按钮，等于逼人去搜官网。
-            ui.horizontal_wrapped(|ui| {
-                ui.label("手动安装：");
-                if ui
-                    .button("下载 VS 生成工具（含 MSVC）")
-                    .on_hover_text(format!("{VS_BUILD_TOOLS_URL}\n（已装也能用：重装/换盘/换机器）"))
-                    .clicked()
-                {
-                    crate::proc::open_url(VS_BUILD_TOOLS_URL);
-                }
-                if ui
-                    .button("下载 Windows SDK")
-                    .on_hover_text(format!("{SDK_URL}\n（已装也能用：重装/换盘/换机器）"))
-                    .clicked()
-                {
-                    crate::proc::open_url(SDK_URL);
-                }
-            });
-            ui.label(
-                egui::RichText::new(if ready {
-                    "当前这套已经能用了；上面两个地址留着重装或换机器时用。\
-                     装 VS 生成工具时勾「使用 C++ 的桌面开发」，它自带 MSVC 和 Windows SDK。"
-                } else {
-                    "装 VS 生成工具时勾「使用 C++ 的桌面开发」，它自带 MSVC 和 Windows SDK；\
-                     装完回来点「自动探测」就能填好。浏览器没弹出来，就手动打开上面悬停显示的地址。"
-                })
-                .small()
-                .weak(),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("选择 link.exe 目录").clicked() {
-                    pick = Some(0);
-                }
-                if ui.button("选择 MSVC lib 目录").clicked() {
-                    pick = Some(1);
-                }
-                if ui.button("选择 SDK lib 目录").clicked() {
-                    pick = Some(2);
-                }
-                if ui.button("自动探测").clicked() {
-                    do_guess = true;
-                }
-                if ui.button("清除").clicked() {
-                    do_clear = true;
-                }
-            });
-        });
-
-        if let Some(which) = pick {
-            let (title, hint) = match which {
-                0 => ("选择 MSVC 的 bin 目录", "里面有 link.exe"),
-                1 => ("选择 MSVC 的 lib 目录", "里面有 libcmt.lib"),
-                _ => ("选择 Windows SDK 的 lib 目录", "里面有 kernel32.lib"),
-            };
-            // 上次选的目录还在这附近的话，从那儿开始找，省得每次从头翻。
-            let start = self
-                .tc
-                .as_ref()
-                .map(|r| match which {
-                    0 => r.tc.msvc_bin.clone(),
-                    1 => r.tc.msvc_lib.clone(),
-                    _ => r.tc.sdk_lib.clone(),
-                })
-                .filter(|p| !p.trim().is_empty())
-                .map(std::path::PathBuf::from)
-                .filter(|p| p.is_dir());
-            let mut dlg = rfd::FileDialog::new().set_title(format!("{title}（{hint}）"));
-            if let Some(d) = start {
-                dlg = dlg.set_directory(d);
-            }
-            if let Some(dir) = dlg.pick_folder() {
-                let d = dir.display().to_string();
-                let res = match which {
-                    0 => tc::set(&self.store, Some(&d), None, None, None),
-                    1 => tc::set(&self.store, None, Some(&d), None, None),
-                    _ => tc::set(&self.store, None, None, Some(&d), None),
-                };
-                self.status = match res {
-                    Ok(m) => m,
-                    Err(e) => e,
-                };
-                self.tc = None;
-            }
-        }
-        if do_guess {
-            self.status = match tc::guess(&self.store) {
-                Ok(m) => m,
-                Err(e) => e,
-            };
-            self.tc = None;
-        }
-        if do_clear {
-            self.status = match tc::clear(&self.store) {
-                Ok(m) => m,
-                Err(e) => e,
-            };
-            self.tc = None;
-        }
-    }
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("设置");
@@ -2907,7 +2261,7 @@ impl App {
             )
             .on_hover_text(
                 "勾上就不连 Teambition：项目列表、项目能力、开工文案全部走本地缓存，\
-                 通用能力和编译 & 重载本来就是本地的，照旧可用。\n\
+                 通用能力本来就是本地的，照旧可用。\n\
                  需要云端才成立的操作（领任务、done、ask/wait）会提示不可用。\n\
                  缓存是联网时自动存的——所以第一次用某个项目前，先联网打开过一次。",
             );
@@ -2949,8 +2303,6 @@ impl App {
             .weak(),
         );
         ui.add_space(8.0);
-        // 工具链紧跟其后：编译不了是最容易卡住人的一件事，比字号重要。
-        self.draw_toolchain(ui);
         ui.add_space(12.0);
         // GitButler / git 也从主界面搬到这里：优先级仍然最高（缺它 TBHub 不干活），
         // 但它平时是「装好就再也不看」的东西，不该常年占着项目列表上方。
@@ -3321,7 +2673,7 @@ pub fn run(store: &Store) -> Result<(), String> {
     hide_console();
     let store = store.clone();
     // 截图自验用：窗口大小可指定（TBA_UI_SIZE=1000x1500），否则默认 920x640。
-    // 卡片展开后有 tb skill / 通用 skill / 编译 & 重载 三块，默认高度截不全。
+    // 卡片展开后有 tb skill / 通用 skill 两块，默认高度截不全。
     let size = std::env::var("TBA_UI_SIZE")
         .ok()
         .and_then(|s| {
@@ -3588,26 +2940,6 @@ mod tests {
         );
     }
 
-    // 编译 & 重载：设置里有编译指令就写进文案（agent 不用自己猜 rust/zig/go）；
-    // 停用后整段消失。
-    #[test]
-    fn setting_line_in_prompt() {
-        let app = tmp_app("settingprompt");
-        let mut st = crate::setting::ProjectSetting::default();
-        st.compile = "zig build -Doptimize=ReleaseFast".to_string();
-        st.root = r"D:\dev\z".to_string();
-        st.name = "z".to_string();
-        st.cache(&app.store, "p1").unwrap();
-
-        let text = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None, Lang::Zh);
-        assert!(text.contains("编译 & 重载"), "应有一段编译说明: {text}");
-        assert!(text.contains("zig build"), "应带编译指令: {text}");
-
-        st.on = false;
-        st.cache(&app.store, "p1").unwrap();
-        let off = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None, Lang::Zh);
-        assert!(!off.contains("编译 & 重载"), "停用后不该出现: {off}");
-    }
 
     // 项目级取消勾选 = 这个项目不用：文案里不能出现，否则 agent 还是会去读。
     #[test]

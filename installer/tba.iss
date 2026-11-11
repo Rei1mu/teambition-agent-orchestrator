@@ -5,7 +5,7 @@
 ;   1. tba.exe 装到安装目录（默认 {%USERPROFILE}\tba，安装页可改）
 ;   2. 该目录写进用户 PATH（HKCU；安装页有勾选项，默认勾上）
 ;   3. 卸载时从 PATH 移除，但不删 data/（token、台账、项目绑定都在里面）
-; reload.ps1 等资源已 include_str! 编进 exe，不用单独装。
+; 资源已编进 exe，不用单独装。
 
 #ifndef AppVersion
   #define AppVersion "0.1.0"

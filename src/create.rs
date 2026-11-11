@@ -66,7 +66,7 @@ pub struct Created {
     pub binding: PathBuf,
     pub entry: Option<PathBuf>,
     pub prompt: String,
-    /// 自动补齐 1~5 看板列的结果（含新建了哪些、失败原因）。
+    /// 自动补齐 5 个中文看板列的结果（含新建了哪些、改名了哪些、失败原因）。
     pub tasklists: ops::TasklistResult,
 }
 
@@ -119,7 +119,7 @@ pub fn create(
                 .collect::<Vec<_>>(),
         );
     }
-    // 新版 MCP 有 task-list-create：复用上面这个 ctx 自动补齐 1~5，不额外握手。
+    // 新版 MCP 有 task-list-create：复用上面这个 ctx 自动补齐 5 个中文列，不额外握手。
     // 补不动（老服务端 / 没分组 / 接口拒）时 report() 会降级成项目链接 + 手动兜底步骤。
     let tasklists = ctx.ensure_tasklists(&p.id);
     let binding = ops::write_project_binding_at(dir, &p.id)?;

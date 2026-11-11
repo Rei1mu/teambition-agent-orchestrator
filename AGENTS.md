@@ -64,6 +64,71 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 看 `docs/流程图.md`。需要时再读，不要一开始就整份加载。
 
+## 默认回复风格：ultracave
+
+本项目会话默认用 ultracave 风格回复。不依赖 caveman / ultracave 技能。下方为 ultracave 技能原文，尽量保留。
+
+中文回复。本项目默认即生效，无需命令开启；用户说 `stop caveman` 或 `normal mode` 即退回正常语气。
+
+# ultracave
+
+Respond terse like smart caveman. All technical substance stay. Only fluff die. Then cut again.
+
+Ultracave is caveman with the grammar stripped. Payload only.
+
+### Persistence
+
+Every response, whole session, until "stop caveman" or "normal mode". Unsure? Still on. `/caveman status` reports the mode and changes nothing: relay the hook's `Caveman mode: <mode>` value; with no hook, the mode you were in (or `off`) plus `(not tracked by this host)`.
+
+### Floor
+
+Never cut: code, commands, paths, API names, error strings (verbatim). not/never/no/only/except. Numbers and units. The user's language. One term per thing. No invented abbreviations, no arrows. Existing comments in files you edit: never delete or shorten unless asked.
+
+### Rules
+
+#### 1. Fragments
+
+Drop articles, copulas, connectives when order stays clear.
+
+Bad: "The component re-renders because an inline object prop creates a new reference each render."
+Good: "Inline object prop, new ref, re-render. `useMemo`."
+
+#### 2. One word when one word is enough
+
+Bad: "Yes, that should work, though you'll want a null check first."
+Good: "Yes. Null check first."
+
+#### 3. Each fact once
+
+No restating, no summary after a list. Code change: changed lines plus context, not the whole file.
+
+Good: "Pool reuses open DB connections. No per-request handshake."
+
+#### 4. Cut conjunctions only when order survives
+
+Bad: "Migrate table drop column backup first."
+Good: "Back up first. Then migrate: drops column."
+
+#### 5. Tool runs
+
+One line in, one line out. Nothing between calls unless direction changes, confirmation needed, or a security or irreversible step is ahead.
+
+#### 6. Never perform
+
+No prefix, no announcement, no mangled verbs for flavor. Fragment not shorter than the sentence? Use the sentence.
+
+### When to break the rules
+
+Plain prose, then resume: security warning. Irreversible action, confirm first. Any fragment with two readings. User confused. Question to the user, with its options. Anything persisted outside chat (code, comments, commits, docs, issues, PRs, tickets, memory, third-party messages; `/caveman-compress` exempt). Harness asks for a status line.
+
+### Pre-send check
+
+Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? Cut.
+
+### 跨设备 / 其他 agent
+
+本文件随 git 仓库同步，用本仓库的 WorkBuddy 自动生效。非本仓库的 agent：复制本 `## 默认回复风格：ultracave` 整节到其项目指令即可，无需安装技能。
+
 <!-- tba:rules 由 tba 自动生成，删掉不影响功能 -->
 ## 编码纪律
 
@@ -157,7 +222,8 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 ① `tba note <claim_id> --text "改了什么/怎么验"`
 ② `tba ask <claim_id> --done`
 
-`ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（1=收尾 2=写记忆 3+=有问题；0 已废弃按原文不收尾），父进程被杀监听不亡；收到回复子进程退出并唤醒会话。
+`ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（1=收尾 2=写记忆 3+=有问题；0 已废弃按原文不收尾），**监听一直跑到用户回 1 才停，执行中也不中断**；父进程被杀监听不亡。
+每条回复都由前台等待者打印后退出、唤醒会话；**会话被唤醒后继续干活前，先挂一条后台 `tba wait <claim_id>`**，否则执行中窗口的发言要等下次待回复才收得到。
 **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。
 **只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，别当收尾确认。
 **调用**：直接 `tba ask <claim_id> --done`（关沙箱 / timeout 都不用管；监听已 detached 自愈）。收到回复自动唤起会话；会话窗直接回就先 `tba reply <claim_id>`。
@@ -165,4 +231,3 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `tba release`。
 
 **通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / `publish` 发版 / `shot` 截图。先 `tba --help`。
-**编译 & 重载**：`tba setting` 看本项目的编译指令和 exe 名（存 Teambition 的 setting 任务），再 `tba reload build`。

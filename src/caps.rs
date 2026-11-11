@@ -9,7 +9,7 @@
 // agent 用 `tba cap list` 看目录、`tba cap <名字>` 读正文——按需读，省 token。
 // GUI 的「通用能力 → 能力」页可以直接增删改查，改完立刻落盘，不用联网。
 //
-// 为什么正文是文本而不是写死在代码里：命令（tba shot / reload / publish）负责
+// 为什么正文是文本而不是写死在代码里：命令（tba shot / publish）负责
 // 「怎么做」的确定性，正文只写「什么时候用、参数、红线」。后者会随使用习惯变，
 // 让用户自己改比每次发版改代码划算。
 
@@ -248,8 +248,7 @@ pub const BODY_NO_CONSOLE: &str = "\
 // agent 靠它判断要不要去读正文。写「截图：一条命令出 png」它看不出该在
 // 什么场合用；写「看界面/验收 UI」才是一个触发条件。
 pub const BUILTIN: &[(&str, &str, &str, bool, &str)] = &[
-    // 重载不在这里：它跟具体项目绑定（编译指令、exe 名每个项目都不同），
-    // 已经搬到「项目列表 → 编译 & 重载」，参数存 Teambition 的 setting 任务。
+    // 不放重载：编译 & 重载能力已移除。
     (
         "no-console",
         "绝不弹黑框：所有命令都隐藏窗口调用",
@@ -321,7 +320,7 @@ pub fn load(store: &Store) -> CapsFile {
         Ok(s) => {
             let mut f: CapsFile = toml::from_str(&s).unwrap_or_default();
             let mut dirty = false;
-            // v0.2.5 迁移：reload 从「通用能力」搬到「项目 → 编译 & 重载」。
+            // 兼容老文件：摘掉内置的 reload 条目（该能力已移除）。
             // 老文件里那条内置条目留着只会让 agent 读到一个已经不该用的说明，
             // 所以读的时候顺手摘掉（用户自己建的、非内置的同名条目不动）。
             let before = f.caps.len();
@@ -561,7 +560,7 @@ mod tests {
         assert!(caps.iter().any(|c| c.name == "no-console"));
         assert!(
             !caps.iter().any(|c| c.name == "reload"),
-            "reload 已搬到项目设置，不该再出现在能力库里"
+            "reload 能力已移除，不该再出现在能力库里"
         );
         assert!(caps.iter().all(|c| c.on && c.builtin));
     }

@@ -70,7 +70,7 @@
 | 设备接入（第一次会话） | agent，每台设备一次 | `install.ps1` 只自动写 WorkBuddy AI 一家 MCP；其他客户端把 `tba mcp` 的通用片段合并进**自己**的配置（MCP 协议通用，配置路径不通用，方案 C） |
 | token | 只有用户 | `TOKEN MISSING` 时 `tbagui.exe` 自动打开；agent 不代填、不改 `data/config.toml`；本次会话停在这里 |
 | 开工（第二次会话） | 不带参数的 `tba` | 有绑定就领任务；没绑定只列候选项目名，**项目名必须用户拍板**，然后 `tba create --name "<选定的>" --go` |
-| 看板列 1~5 | tba 自动 | 用 `task-group-query` + `task-list-create` 只建缺的数字列，全齐时静默；老服务端 / 接口失败才打印项目链接与手动兜底步骤 |
+| 5 个中文看板列 | tba 自动 | 用 `task-list-create` 只建缺的中文列、`task-list-update-name` 把老数字列 1~5 改名，全齐时静默；老服务端 / 接口失败才打印项目链接与手动兜底步骤 |
 | 直连 `tba go -off <任务>` | agent 本地 | 不领任务、不写任务、不发邮件、不等待 Teambition 回复，只在对话框里交互 |
 
 常驻能力：`tba serve` 是 stdio MCP server，挂到任何支持 MCP 的客户端；`tba ui` 是窗口；exe 同目录的 `data/` 放台账、skill 缓存和记忆，所有 agent 共享。
@@ -214,8 +214,6 @@ $env:PATH -split ';' -contains "$env:USERPROFILE\tba"
 | `TBA_AGENT` | 会话标识，覆盖 `.tba/session` |
 | `TBA_SKIP_GITBUTLER` | 跳过 GitButler 检查（排查用） |
 | `TBA_BUT` | 指定 `but` 路径（exe 或目录都行）；也认 `GITBUTLER_BIN` / `BUT_BIN` |
-| `TBA_MSVC_BIN` / `TBA_MSVC_LIB` / `TBA_SDK_LIB` | 构建工具链路径，覆盖 `tba toolchain` 的设置 |
-| `TBA_EXTRA_LIB` / `TBA_CARGO` | 同上，附加库目录 / cargo 路径 |
 
 安装包**不写 token**。token 由 `tba login` 写进 `data/config.toml`，属于用户数据，升级时不要覆盖。
 
@@ -254,7 +252,6 @@ tba gitbutler clear      :: 清掉手选路径，回到自动检测
 | 项目能力（tb skill） | 读缓存 `data/projects/<id>/skills.json`；勾选照常生效 |
 | 通用能力（`data/caps.toml`） | 本来就在本地，完全可用 |
 | 开工文案 / 复制文案 | **照常生成**——拼装全在本地，不依赖云端 |
-| 编译 & 重载 | 照常可用（本地）；「保存」写本地缓存 `setting.toml` |
 | 领任务 / done / ask / wait / 刷新项目 | 不可用，命令直接说明原因 |
 | 编辑/新建/删除 skill | 不可用（要写云端），按钮在窗口里置灰 |
 
@@ -267,7 +264,6 @@ tba gitbutler clear      :: 清掉手选路径，回到自动检测
 ```bat
 set TBA_OFFLINE=1 && tba projects          :: 读缓存的项目列表
 set TBA_OFFLINE=1 && tba skills --project <id>
-set TBA_OFFLINE=1 && tba setting text      :: 开工文案里的编译段（纯本地）
 ```
 
 > 离线时点需要联网的操作会直接报一句 `当前是离线模式…`，并列出本地还能用的命令，
@@ -338,22 +334,24 @@ tba config --url <地址>   :: 切换 MCP 服务地址，token 不动
 
 旧项目如果还留着改名前的那两个（「待处理」「关闭」），tba 不检测、不迁移、不提示，自己去网页处理。
 
-### 看板列 1~5：tba 自动补齐，补不动才给你链接
+### 看板列用中文状态名：tba 自动补齐 + 老数字列改名
 
 2026-11 复查：Teambition MCP 已有 `task-list-create` / `task-list-update-name` /
 `task-list-order-update`，旧结论「API 只能查、不能建列」**已作废**（真实项目里创建列 `6` 实测成功）。
-现在 tba 会自己把 1~5 五个数字列补齐，人不用去网页点：
+现在 5 个看板列直接用 5 个工作流状态名，人不用去网页点：
+未完成（队列，没人接）/ 进行中（agent 正在干）/ 待回复（球在用户那）/ 已解决 / 已完成（关闭、作废）。
+老项目里叫「1」..「5」的列，tba 用 `task-list-update-name` 直接改名成对应中文名，不另建一列。
+本地 `config.toml` 里老的数字列名在读取时自动换成中文名。
 
 | 场景 | 行为 |
 |---|---|
 | `tba create` 建/复用完（含 `--go`、窗口「接入项目」页） | 用同一个已连上的会话查列 → 只建缺的那几个 → 打印 `项目链接: https://www.teambition.com/project/<id>` + 新建了哪些列 |
-| 每次 `tba go`（领任务前） | 同样自动补一次；全齐且没动过就完全不打印，不刷屏 |
+| 每次 `tba go`（领任务前） | 同样自动查一次：改名老数字列 + 补缺的中文列；全齐且没动过就完全不打印，不刷屏 |
 | `tba init --project <id>` | 补列 + 打印项目链接和结果，供建好后复查 |
 
-只建缺的列，**绝不删/改名已有列**（你自己加的「6」「未分类」都留着）；查列失败不算「一列都没有」，不会误报。
-补列失败（老服务端没有这些工具、项目没任务分组、接口拒绝）时自动降级：打印项目链接 + 错误原因 +
+只建缺的列、只改老数字列，**绝不删已有列**（你自己加的「归档」「未分类」都留着）；查列失败不算「一列都没有」，不会误报。
+补列/改名失败（老服务端没有这些工具、项目没任务分组、接口拒绝）时自动降级：打印项目链接 + 错误原因 +
 「兜底：手动补这 5 个看板列」步骤，让你去网页补，绝不阻断领任务。
-列名语义：1=队列（没人接）/ 2=进行中 / 3=待回复 / 4=已解决 / 5=已完成（作废）。
 补不齐时 tba 只改状态、移列会静默跳过；补好后重跑 `tba go` 或 `tba init --project <id>` 会自动再试。
 任务链接是 `https://www.teambition.com/task/<任务id>`，跟项目链接不是一回事。
 
@@ -625,10 +623,10 @@ tba go -off                                  :: 不带任务也行，agent 会�
 ```
 
 这一条**完全不碰 Teambition**：不领任务、不写备注、不改状态、不发邮件、不阻塞等待。
-项目从 `.tba/project` 或 `--project` 认（认不到就用当前目录名），能力索引和编译 & 重载参数
+项目从 `.tba/project` 或 `--project` 认（认不到就用当前目录名），能力索引
 读本地缓存——所以它在没网、没 token 的机器上照样能跑。
 
-产出的文案和正常开工文案共用前半段（项目、skill 索引、通用能力、编译段），
+产出的文案和正常开工文案共用前半段（项目、skill 索引、通用能力），
 后半段换成「直连模式」规则：有疑问直接在对话里问、干完直接说结论、
 不要调用 `claim/take/start/ask/wait/beat/done/close/note`。
 
@@ -780,9 +778,6 @@ tba cap path                                   :: 打印 caps.toml 路径
 开工文案里不列、agent 也就搜不到。存在 `data/projects/<id>/caps-off.toml`，
 只记「不用的」，所以以后新增能力默认对所有项目可用。
 
-> 「重载」已经不是通用能力了：它跟具体项目绑定（编译指令、exe 名每个项目都不同），
-> 现在在项目卡片的「编译 & 重载」里，参数存 Teambition。见下面那节。
-
 ### git / GitButler
 
 ```bat
@@ -856,156 +851,6 @@ tba doctor
 一次列出：exe 路径 / 版本 / PATH 里有没有它 / 令牌有没有 / MCP 地址 / 数据目录 /
 git 版本 / `but` 版本 / 当前是不是 GitButler 项目 / 有哪些中文字体 / 三个轮询参数。
 排查「为什么跑不通」时先跑这个，别一个个试。
-
-### 编译 & 重载（每个项目一份设置）
-
-关键流程不靠文字描述，固化成一个命令：**编译 → 杀旧 → 复制校验 → 启动**。
-参数不写在代码里、也不只存本机，而是存 **Teambition 状态为 `setting` 的任务**
-（标题固定「项目设置」，备注是 TOML）——换设备还在，网页上也能看能改。
-
-```bat
-tba setting                                  :: 看本项目的设置（缺省读 .tba/project 绑定）
-tba setting guess                            :: 按项目文件猜编译指令，只打印不保存
-tba setting set --compile "zig build -Doptimize=ReleaseFast"
-tba setting set --root D:\dev\zigapp --name zigapp --mode copy --args ""
-tba setting text                             :: 打印开工文案里「编译 & 重载」那一段
-tba setting text --lang en                   :: 英文版
-tba setting off                              :: 停用：agent 文案里不再出现编译 & 重载
-```
-
-`setting text` 和窗口里的「查看文案」读的是**同一份生成函数**，不是另写的说明——
-所以看到的就是 agent 开工时真收到的那三行：
-
-```
-编译 & 重载（本项目）：`tba reload build`
-  编译: cargo build --release · 目录: D:\dev\mcp · exe: tba · 启动: 直接跑产物
-  一条命令走完 编译 → 杀旧 → 启动，成功回 `OK <pid>`；失败看 `tba reload status`。
-```
-
-`setting` 任务的备注长这样（`tba setting set` 和窗口都写它，手改也认）：
-
-```toml
-on = true
-compile = "cargo build --release"
-root = "D:\\dev\\mcp"
-name = "tba"
-mode = "rename"          # rename=改名直跑 / copy=副本运行
-live = ""
-args = "ui"
-```
-
-**编译指令空着怎么办**：不猜死。开工文案会写「编译指令未填，先探测项目类型」，
-agent 跑 `tba setting guess`（认 `Cargo.toml` / `build.zig` / `CMakeLists.txt` /
-`package.json` / `Makefile` / `go.mod`），确认后 `tba setting set --compile "..."` 写回
-Teambition。下一次谁打开这个项目都直接能用。
-
-```bat
-tba reload build                             :: 编译 + 替换 + 启动（读项目设置）
-tba reload restart                           :: 只重启，不编译
-tba reload kill  /  tba reload status        :: 杀 / 看是否在跑
-tba reload build --compile "make"            :: 临时覆盖编译指令（不写回设置）
-```
-
-窗口里在项目卡片的 **编译 & 重载** 栏（默认收起）：**直接编辑那段 TOML 文本**（就是存进
-Teambition 任务备注的那一份），下面一行实时告诉你解析结果；按钮是「保存到 Teambition」
-「探测默认值」「从云端重读」「查看文案」和「编译 & 重载 / 只重启 / 杀掉 / 状态」，
-结果和 `target/reload.log` 末尾就在下面。
-
-```toml
-on = true                                  # 关掉 = agent 文案里不出现这段
-compile = "cargo build --release"          # 空着 = 还没定，可用「探测默认值」
-root = 'D:\dev\mcp'                        # 编译在这个目录跑
-name = "tba"                               # exe 基名，不带 .exe
-mode = "rename"                            # rename 改名直跑 / copy 副本运行
-live = ""                                  # copy 模式的副本路径，空 = 自动推算
-args = "ui"                                # 启动参数
-```
-
-为什么是文本而不是一排输入框：这几个参数本来就是**一条命令的几个片段**，拆成六个格子后
-改一个得挨个找，还看不全整体；而它最终就是 Teambition 任务备注里的那段文本——直接编辑它，
-「看到的」和「存下去的」是同一份，复制给别人、贴到 issue 里也能直接用。
-
-容错：路径写进双引号里 `root = "D:\dev\mcp"` 在 TOML 里是非法转义（`\d`），解析会失败，
-此时**退化成逐行扫 `key = value`**，字段照样读得出来，界面上给一条橙色提示建议改用单引号。
-所以「不是合法 TOML」只是提示，不会让设置失效。
-
-「查看文案」按**当前文本内容**生成，所以改完还没保存也能先看效果；保存到 Teambition 后
-agent 才会真收到。
-
-约定：
-
-| 项 | 说明 |
-|---|---|
-| 退出码 | 唯一真值。`0` 成功，`1` 失败 |
-| 成功输出 | `OK <pid>` / `OK` / `RUNNING <pid>` / `STOPPED` |
-| 失败输出 | stderr 一行 `ERR <step>:<msg>`（`compile` 就是编译指令非零退出） |
-| 编译输出 | 只进 `<root>\target\reload.log`，不占 agent 上下文 |
-| 运行副本 | 缺省 `<root>\target\release\<name>_test.exe`（跟产物同目录，`data/` 只有一份） |
-| 自己重载自己 | 自动转后台：脚本等本进程退出后再编译，绕开 exe 文件锁 |
-| 弹窗 | 编译/启动全程不弹控制台（`CREATE_NO_WINDOW`） |
-
-脚本随二进制内置，运行时释放到 `data/capabilities/reload.ps1`，不用单独维护。
-编译前会 `Set-Location` 到项目目录（参数来自设置，调用方的 cwd 靠不住）。
-工具链路径不在脚本里写死，由 `tba toolchain` 解析后传进去（见下一节）。
-
-> 杀软对 `*_test.exe` 这类名字比较敏感，若误报拦截启动，用 `--live` 换个名字即可：
-> `tba reload build --live D:\dev\mcp\target\release\tb_run.exe`
-
-### 构建工具链（MSVC + Windows SDK）
-
-`reload build` 走 `cargo +stable-x86_64-pc-windows-msvc`，要 `link.exe` 和 Windows SDK
-的库（`kernel32.lib` 等）。**只认 MSVC**：发布包就是它编的，GNU 工具链产出的 exe 依赖
-mingw 运行时，窗口和路径行为都不一样，所以不做兜底——找不到就明确报错，让用户指定一次。
-
-路径按三条来源解析，优先级从高到低：
-
-1. 环境变量 `TBA_MSVC_BIN` / `TBA_MSVC_LIB` / `TBA_SDK_LIB` / `TBA_EXTRA_LIB`（CI、临时覆盖）
-2. `data/toolchain.toml`（手选一次，之后一直用）
-3. 自动探测（`vswhere` 找 VS + `Windows Kits\10\Lib\<ver>`，另外查注册表 `KitsRoot10`，
-   所以 SDK 装在 D 盘也能找到）
-
-自动探测只覆盖标准位置，**不扫盘**：装了 VS 预览版或好几个 SDK 版本时，扫盘很容易
-挑错那一份，让用户点一次「选择」更准。
-
-`guess` 探不到 SDK 时**不会把已有的配置清掉**——它会沿用 `toolchain.toml` 里那份
-`sdk_lib`，并告诉你「找过哪些位置」。只有真的一份都没有时才报错，报错里带 SDK 下载地址。
-
-```bat
-tba toolchain                     :: 状态：可用/不可用、来源、还差什么
-tba toolchain guess               :: 标准位置探测一遍并保存
-tba toolchain set --sdk-lib "D:/d/winsdk_libs"
-tba toolchain set --msvc-bin "<VS>/VC/Tools/MSVC/<ver>/bin/Hostx64/x64" ^
-                  --msvc-lib "<VS>/VC/Tools/MSVC/<ver>/lib/x64" ^
-                  --sdk-lib  "<Windows Kits>/10/Lib/<ver>/um/x64"
-tba toolchain clear               :: 清掉手选，回到自动探测
-```
-
-只给一项也行，其余字段保留原值（探测到的或上次存的）。保存前会验活：三个目录里
-分别要能找到 `link.exe` / `libcmt.lib` / `kernel32.lib`，找不到就不写，错误直接说
-缺哪个文件——比「选错了一层目录」这种猜谜强。
-
-**本机没装 Windows SDK 怎么办**：`kernel32.lib` 不一定非要来自完整安装。只要有一个
-目录里放着 `kernel32.lib`（比如从别的机器拷来的 `winsdk_libs` 平铺目录），
-`tba toolchain set --sdk-lib <那个目录>` 就能用。想装完整 SDK：
-
-- VS Installer → 修改 → 单个组件 → 勾「Windows 11 SDK」
-- 或者单独装：https://developer.microsoft.com/windows/downloads/windows-sdk/
-
-窗口里在 **设置 → 构建工具链**：状态 + 来源 + 三个「选择…目录」按钮 + 自动探测 / 清除。
-「手动安装」那一行**常显**——装好了也可能要重装、升级、换盘或换机器，
-只在缺件时给按钮等于装过的人想看下载地址都看不到：
-
-| 装什么 | 按钮 | 打开的页面 |
-|---|---|---|
-| MSVC（`link.exe`） | 下载 VS 生成工具（含 MSVC） | https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
-| Windows SDK（`kernel32.lib`） | 下载 Windows SDK | https://developer.microsoft.com/windows/downloads/windows-sdk/ |
-
-点按钮用系统默认浏览器打开，不用自己搜。装 VS 生成工具时勾「使用 C++ 的桌面开发」，
-它自带 MSVC 和 Windows SDK；装完回来点「自动探测」就填好了。浏览器没弹出来，
-把鼠标停在按钮上能看到完整地址，手动打开也行。
-
-GitButler / git 同理：设置页那张卡里的「GitButler 下载页」「git 下载页」
-「安装到运行目录」也**常显**，已装好照样能重装或升级。
 
 ## 共享记忆
 

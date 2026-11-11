@@ -536,7 +536,7 @@ pub struct StageInfo {
     pub kind: String,
 }
 
-// 任务列表（看板列）。新版 MCP 可查、可建、可改名（`ops::ensure_tasklists` 自动补 1~5）。
+// 任务列表（看板列）。新版 MCP 可查、可建、可改名（`ops::ensure_tasklists` 自动补 5 个中文列、改老数字列名）。
 #[derive(Clone)]
 pub struct ListInfo {
     pub id: String,

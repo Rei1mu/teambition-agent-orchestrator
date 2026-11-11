@@ -9,5 +9,5 @@ rustflags = ["-C", "link-arg=/STACK:8388608"]
 rustflags = ["-C", "link-arg=/STACK:8388608"]
 
 # 只认 MSVC：发布包是 msvc 目标编的，GNU 工具链的 exe 依赖 mingw 运行时，
-# 行为不一致。这里不给 gnu 兜底——本机缺 SDK 时用 `tba toolchain set` 指定
-# 位置（GUI 设置页也能点），而不是换一套工具链悄悄编出不一样的东西。
+# 行为不一致。这里不给 gnu 兜底：本机缺 SDK 的就补 SDK 的 Lib 路径，
+# 而不是换一套工具链悄悄编出不一样的东西。
