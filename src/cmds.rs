@@ -1528,6 +1528,72 @@ pub fn run() -> Result<(), String> {
             }
             claim_and_print(&store, project.as_deref(), lang, !no_entry, true)?;
         }
+        Cmd::Subagent { target, project, lang } => {
+            use std::io::Write;
+            let lang = Lang::parse(&lang)
+                .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
+            let zh = lang == Lang::Zh;
+            // target 给了：派一条「已领」的任务（claim_id 或 task id）。
+            // 没给：领一条「未完成」新任务（和 tba go 一样）。
+            let claim = if let Some(t) = &target {
+                let t = t.trim();
+                let claims = store.active_claims();
+                // 1) 直接是 claim_id
+                if let Some(c) = claims.iter().find(|c| c.claim_id == t) {
+                    c.clone()
+                } else {
+                    // 2) 任务链接 / 裸 task id：去掉链接前缀和查询串
+                    let tid = t
+                        .trim_start_matches("https://www.teambition.com/task/")
+                        .split(['?', '#'])
+                        .next()
+                        .unwrap_or(t)
+                        .to_string();
+                    claims
+                        .iter()
+                        .find(|c| c.task_id == tid)
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "找不到 claim_id 为「{t}」或 task_id 为「{tid}」的已领任务。先 `tba go` 或 `tba take <任务链接>` 领任务，再派子代理。"
+                            )
+                        })?
+                }
+            } else {
+                // 领新任务：项目解析同 Claim（--project 优先，否则本地绑定）。
+                let pid = resolve_project(project.as_deref())?;
+                // 领之前先回收死会话，别让一个已经不存在的会话占着任务。
+                for m in sweep(&store, false).unwrap_or_default() {
+                    eprintln!("{m}");
+                }
+                match claim(&store, &pid, None, &current_agent()) {
+                    Ok(c) => c,
+                    Err(e) if e.starts_with(BLOCKED_PREFIX) => {
+                        return Err(format!(
+                            "手上有在等回复但没人接的任务，先处理掉再来领：{}",
+                            e.trim_start_matches(BLOCKED_PREFIX)
+                        ));
+                    }
+                    Err(e) if e.starts_with(NO_TASK_PREFIX) => {
+                        return Err("队列（列「未完成」）为空，没有可领任务派给子代理。".to_string());
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            // 任务正文：派已领任务时走离线——台账里的 task_name 即标题，
+            // 正文由子代理按 task_id 链接自己读（见简报末尾），避免为取正文联网。
+            // 领新任务时 go() 已经联网，这里沿用同一条 claim，不二次联网。
+            let skills = cached_skills(&store, &claim.project_id);
+            print!("{}", subagent_brief(&store, &claim, &claim.task_name, &skills, lang));
+            if zh {
+                eprintln!(
+                    "已生成子代理简报。主代理读这份简报、调 subagent 工具派活；干完按末尾指引收尾（不要自己 done）。"
+                );
+            } else {
+                eprintln!("Subagent brief printed. Main agent dispatches via the subagent tool; close per the footer.");
+            }
+            let _ = std::io::stdout().flush();
+        }
         Cmd::Claim { project, name } => {
             let project = resolve_project(project.as_deref())?;
             // 领之前先回收死会话，别让一个已经不存在的会话占着任务。

@@ -1357,8 +1357,11 @@ pub fn claim(
     // 任务被拖回列1 就是用户明确说「重来」，那条等待已经作废，不该再拦。
     // 这个检查必须放在知道「列1 有谁」之后，所以从函数开头挪到了这里。
     let queue_ids: Vec<String> = candidates.iter().map(|t| t.id.clone()).collect();
+    // 孤儿拦截按项目隔离：一台机器可能跑多个项目的 agent 会话，
+    // 别的项目的「等回复但会话断了」不该拦住当前项目的领任务。
     let orphans: Vec<Claim> = orphan_waits(store)
         .into_iter()
+        .filter(|c| c.project_id == project_id)
         .filter(|c| !queue_ids.contains(&c.task_id))
         .collect();
     if !orphans.is_empty() {
@@ -5072,6 +5075,119 @@ pub fn agent_prompt_from(
 ) -> String {
     prompt_body(store, project_id, project_name, skills, draft, None, lang)
 }
+
+    /// 派子代理用的自包含简报。
+    ///
+    /// tba 本身是 CLI，调不了 DSH 的 subagent 工具，所以这里只负责：领/取一条任务，
+    /// 把任务正文 + 项目上下文 + 子代理职责 + 主代理收尾指引拼成一份简报打印出来，
+    /// 由主代理读这份简报、调 subagent 工具完成真正的派发。
+    ///
+    /// 子代理拿到简报就能独立干活并交回；收尾（done/close/ask）是主代理的职责，
+    /// 不让子代理做——红线只有用户能收尾，子代理更不行。
+    pub fn subagent_brief(
+        store: &Store,
+        claim: &Claim,
+        body: &str,
+        skills: &[SkillItem],
+        lang: Lang,
+    ) -> String {
+        let cfg = store.load_config();
+        let exe = prompt_exe_of(&cfg);
+        let zh = lang == Lang::Zh;
+        let proj_name = store
+            .load_projects_cache()
+            .into_iter()
+            .find(|(id, _)| id == &claim.project_id)
+            .map(|(_, n)| n)
+            .unwrap_or_else(|| claim.project_id.clone());
+        let mut s = String::new();
+        if zh {
+            s.push_str(r#"===== 给子代理的任务简报（自包含，直接贴给 subagent）=====
+
+"#);
+        } else {
+            s.push_str(r#"===== Subagent brief (self-contained, paste to subagent) =====
+
+"#);
+        }
+        s.push_str(&format!("## 子任务：{}
+
+", claim.task_name));
+        s.push_str(&format!(
+            "claim_id: {}
+项目:  {}
+任务链接: https://www.teambition.com/task/{}
+
+",
+            claim.claim_id, claim.project_id, claim.task_id
+        ));
+        if !body.trim().is_empty() {
+            s.push_str(if zh { "## 任务正文
+" } else { "## Task body
+" });
+            s.push_str(body.trim());
+            s.push_str("
+
+");
+        }
+        // 项目上下文（能力 + skill 索引）复用开工文案的同款内容，本地就能生成。
+        s.push_str(&prompt_head(store, &claim.project_id, &proj_name, skills, None, lang, false));
+        s.push_str(&subagent_workflow_text(&exe, &claim.claim_id, lang));
+        // 主代理收尾指引：只有主代理能 done/close/ask。
+        s.push_str("
+===== 主代理收尾指引（你来做，别让子代理做）=====
+");
+        if zh {
+            s.push_str(&format!(
+                r#"子代理回报后，按 claim_id 收尾（只有你能 done/close）：
+  {exe} note {id} --text "改了什么/怎么验"
+  {exe} ask {id} --done
+"#,
+                exe = exe, id = claim.claim_id
+            ));
+        } else {
+            s.push_str(&format!(
+                r#"After the subagent reports back, close it yourself (only you may done/close):
+  {exe} note {id} --text "what changed / how verified"
+  {exe} ask {id} --done
+"#,
+                exe = exe, id = claim.claim_id
+            ));
+        }
+        s
+    }
+
+    /// 子代理专属流程说明：任务已认领，它只需干活 + 写备注 + 回报，不碰收尾。
+    fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
+        if lang == Lang::Zh {
+            return format!(
+                r##"## 你的职责
+1. 只改完成这个任务必须改的，遵循项目编码纪律（见上方上下文）。
+2. 干完把「改了什么/怎么验」写进任务备注（不是评论）：
+  {exe} note {id} --text "改了什么/怎么验"
+3. 有拿不准的，用 `{exe} ask {id} -q "你的问题"` 进入「待回复」问用户，等回复再继续。
+   不要自己假设后硬干。
+4. 不要自己 done / close —— 收尾（done/close）由主代理/用户做，你只管干活和提问。
+
+## 交回主代理
+回报：改了什么、验证了什么、还剩什么。主代理用 claim_id（{id}）收尾。"##,
+                exe = exe, id = claim_id
+            );
+        }
+        format!(
+            r##"## Your job
+1. Change only what this task requires; follow the project coding rules above.
+2. When done, write "what changed / how verified" to the task note (not a comment):
+  {exe} note {id} --text "what changed / how verified"
+3. If unsure, use `{exe} ask {id} -q "your question"` to enter "waiting" and ask the user; continue after reply.
+   Do not guess and plow ahead.
+4. Do NOT done / close yourself - closing is the main agent's / user's job. You only work and ask.
+
+## Hand back to main agent
+Report: what changed, what you verified, what remains. Main agent closes via claim_id ({id})."##,
+            exe = exe, id = claim_id
+        )
+    }
 
 #[cfg(test)]
 mod tests {

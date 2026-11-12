@@ -191,6 +191,21 @@ pub enum Cmd {
         #[arg(num_args = 0.., value_name = "TASK")]
         task: Vec<String>,
     },
+    /// 派子代理干活：领一条新任务（或直接派当前已领的任务），生成一份自包含的子代理简报。
+    /// 真正的派发由主代理在 DSH 里读简报后调 subagent 工具完成。
+    /// 不给 target 时等同 go 领一条新任务；给 target（claim_id 或任务链接/id）则派那条已领任务。
+    #[command(visible_aliases = ["sub", "sg"])]
+    Subagent {
+        /// 任务链接 https://www.teambition.com/task/<id>、裸任务 id，或 claim_id（clm...）。
+        /// 给了就派这条已领/已存在的任务；不给就领一条「未完成」新任务。
+        target: Option<String>,
+        /// 项目 id。省略则按 .tba/project 绑定解析（领新任务时需要）
+        #[arg(long)]
+        project: Option<String>,
+        /// 文案语言：zh=中文(默认) / en=英文
+        #[arg(long, default_value = "zh")]
+        lang: String,
+    },
     /// 领一条「未完成」任务。默认取创建时间最早的一条。自动转「进行中」
     Claim {
         /// 项目 id。省略则按 .tba/project 绑定解析
