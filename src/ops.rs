@@ -5834,6 +5834,11 @@ mod tests {
         // 附言要带出来，但去掉数字前缀；废弃的 0 原文原样保留
         assert_eq!(parse_reply("0 可以了").1, "0 可以了");
 
+        // 邮件唤醒前缀与正文同一行时，整行会被当标记丢弃 → 解析成空。
+        // 所以聚合器 dispatch 必须传干净 text，不能传带前缀的 wake。
+        assert_eq!(parse_reply("（邮件回复）1").0, ReplyAction::Free);
+        assert_eq!(parse_reply("1").0, ReplyAction::Closed);
+
         // 正文带标点/汉字一律不算动作号：整条原文交回 agent
         assert_eq!(parse_reply("2. 还是报错").1, "2. 还是报错");
         assert_eq!(parse_reply("2. 还是报错").0, ReplyAction::Free);

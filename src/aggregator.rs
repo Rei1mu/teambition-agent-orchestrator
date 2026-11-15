@@ -442,7 +442,10 @@ fn handle_message(store: &Store, claim: &Claim, text: &str, source: &str) {
     let wake = wake_text(source, text);
     events::append(&store.root, &claim.claim_id, source, text);
     write_wake_request(&store.root, &claim.claim_id, &wake);
-    dispatch_reply(store, &claim.claim_id, &wake, source);
+    // parse_reply 要的是干净原文。wake 前缀「（邮件回复）」与正文同一行，
+    // strip_reply_noise 会把整行当标记丢弃，导致「1」解析成空、不收尾。
+    // 唤醒用 wake（给人看），动作判定用干净 text。
+    dispatch_reply(store, &claim.claim_id, text, source);
 }
 
 // 分发一条回复：parse_reply 判动作，回 1 才 finish；其余 resume/noted 不改终态。
