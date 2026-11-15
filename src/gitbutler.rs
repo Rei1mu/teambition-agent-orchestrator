@@ -341,7 +341,8 @@ fn probe(cands: &[(PathBuf, GbSource)]) -> Option<GbStatus> {
 
 /// git 在不在（GitButler CLI 依赖 git）。返回版本号，如 2.47.1。
 pub fn git_available() -> Option<String> {
-    let mut c = Command::new("git");
+    let prog = crate::git::git_prog();
+    let mut c = Command::new(&prog);
     c.arg("--version");
     crate::proc::hide(&mut c);
     let out = c.output().ok()?;

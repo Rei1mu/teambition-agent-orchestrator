@@ -72,6 +72,46 @@ fn doctor(store: &Store) -> String {
         Some(v) => s.push_str(&format!("git:   {v}\n")),
         None => s.push_str("git:   没装（提交推送全不可用）\n"),
     }
+    // 编译工具链（MSVC / Windows SDK）：编译 Windows 软件 / DLL 要用。
+    // 来自 toolchain.toml 的指定位置，或环境变量，都没有就自动探测（vswhere 找 VS + Windows Kits）。
+    // 这是「agent 该先去哪找」的权威答案：先查这里，别盲目扫盘。
+    {
+        let r = crate::toolchain::resolve(store);
+        let (b, _l, _s) = crate::toolchain::verify(&r.tc);
+        let mark = |ok: bool| if ok { "✓" } else { "✗" };
+        let loc = |t: &str, ok: bool| -> String {
+            if t.trim().is_empty() {
+                "自动".to_string()
+            } else {
+                format!("{} {}", t.trim(), mark(ok))
+            }
+        };
+        s.push_str(&format!(
+            "msvc:  {}  (来源: {})
+",
+            loc(&r.tc.msvc_bin, b), r.source.label()
+        ));
+        s.push_str(&format!(
+            "wsdk:  {}  (来源: {})
+",
+            if r.tc.winsdk_libs.trim().is_empty() { "自动".to_string() } else { r.tc.winsdk_libs.trim().to_string() },
+            r.source.label()
+        ));
+        if r.needs_install() {
+            s.push_str(&format!(
+                "编译:  没找到 MSVC/Windows SDK。安装：VS {} ｜ Windows SDK {}
+",
+                crate::toolchain::MSVC_URL, crate::toolchain::WINSODK_URL
+            ));
+        } else if !r.ready() {
+            s.push_str("编译:  位置已指定但不对（见上方 ✗），改设置页或重新检测
+");
+        } else {
+            s.push_str("编译:  拿到位置后把 msvc_bin 加进 PATH、msvc_lib + winsdk_libs 加进 LIB，再 cargo build / cl.exe
+");
+        }
+    }
+
     let gb = crate::gitbutler::detect(store);
     s.push_str(&format!(
         "but:   {}\n",
@@ -183,10 +223,11 @@ fn print_outcome(o: &WaitOutcome, cfg: &Config) -> bool {
                     c.task_name, STAGE_DOING, cfg.tasklist_claim
                 );
             }
-            // 结构化标记：只有真收到用户回复才打这行。`ask` 前台 exit 0 只是起了监听，
-            // 绝不能当收尾确认。agent 看 action 决定下一步，不用自己解析中文。
+            // 结构化标记：USER_REPLY=1 只在「用户回 1、任务已收尾」时打。
+            // 其余 action 只是收到一条回复、任务没动，绝不能打 1（会被 agent
+            // 误读成收尾确认）。`ask` 前台 exit 0 也只是起了监听，不是回复。
             let num = action.num().map(|n| n.to_string()).unwrap_or_else(|| "-".into());
-            println!("USER_REPLY=1");
+            println!("USER_REPLY={}", if *action == ReplyAction::Closed { "1" } else { "noted" });
             println!("reply={num} action={} text={:?}", action.tag(), body);
             println!("\n---- 你的回复 ----");
             for r in replies {
@@ -232,7 +273,7 @@ fn print_outcome(o: &WaitOutcome, cfg: &Config) -> bool {
                 .find_map(|r| parse_reply_num(r))
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "-".into());
-            println!("USER_REPLY=1");
+            println!("USER_REPLY=noted");
             println!("reply={num} action=noted");
             println!("\n---- 你的回复 ----");
             for r in replies {
@@ -318,84 +359,55 @@ fn run_wait_block(
     }
 }
 
-// ask / wait 拉起一个 detached 常驻监听（`tba wait <claim> --listen`）。
-// 它的 stdout 追加到 feed 文件：每条回复摘要都落盘，前台等待者按偏移读新增。
-// 监听不随回复退出，父进程被杀也不受影响（新进程组 + DETACHED）。
-fn spawn_detached_listener(
-    claim_id: &str,
-    feed_path: &std::path::Path,
+// 回复监听已由 tba serve 的 WatchAggregator 统一托管（见 aggregator.rs）。
+// 旧的 per-claim detached `wait --listen` 进程已退役。
+
+// 裸 `tba sub` 的常驻监听：盯看板列「未完成」，有任务就领一条、打印简报、退出唤醒主代理。
+//
+// 唤醒靠「后台 job 跑完」这条 task-notification：空队列 / 待回复没处理 / 瞬时失败
+// 都只记日志、睡一轮继续等，进程不退出；只有真领到一条才返回（job 结束 → 唤醒）。
+// tba 自己调不了 DSH 的 subagent 工具，派活和待回复交互由主代理会话做。
+fn subagent_watch(
+    store: &Store,
+    project_id: &str,
+    lang: Lang,
 ) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("取当前 exe 路径失败: {e}"))?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("wait").arg(claim_id).arg("--listen").stdin(std::process::Stdio::null());
-    if let Ok(f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(feed_path)
-    {
-        cmd.stdout(std::process::Stdio::from(f));
-    } else {
-        cmd.stdout(std::process::Stdio::null());
+    if store.load_config().offline() {
+        return Err(OFFLINE_ERR.to_string());
     }
-    // stderr → null：轮询期间每 300s 的「已等 N 秒」心跳打这里，不污染 feed。
-    cmd.stderr(std::process::Stdio::null());
-    // 新进程组：脱离 ask 的进程组，ask 被 SIGTERM 不会连带杀到它。
-    // DETACHED_PROCESS：不共享 ask 的控制台，关窗口也不死。
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0000_0200 | 0x0000_0008); // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let _ = cmd.process_group(0);
-    }
-    cmd.spawn().map_err(|e| format!("spawn detached listener 失败: {e}"))?;
-    Ok(())
-}
-
-// 保证有且只有一个常驻监听在跑。活着的监听每轮刷 waits/<claim>.wait。
-fn ensure_listener(store: &Store, claim_id: &str) -> Result<(), String> {
-    if store.wait_age(claim_id).map_or(false, |age| (0..30).contains(&age)) {
-        return Ok(());
-    }
-    let feed = store.waits_dir().join(format!("{claim_id}.feed"));
-    spawn_detached_listener(claim_id, &feed)?;
-    // 占位：新进程还没来得及 touch 之前，别让并发的 ask/wait 再拉一个。
-    store.wait_touch(claim_id);
-    Ok(())
-}
-
-// 前台等待者：读到 feed 新增就打印并退出（退出即唤醒会话）。
-// 监听本体不退出，要靠这条命令把「有新回复」变成一次 task-notification。
-fn wait_for_feed(store: &Store, claim_id: &str) -> Result<(), String> {
-    let dir = store.waits_dir();
-    let feed = dir.join(format!("{claim_id}.feed"));
-    let cursor = dir.join(format!("{claim_id}.cursor"));
+    // 固定间隔：裸命令最短，不塞轮询开关。
+    let iv = store.load_config().wait_interval_secs.max(5);
+    let agent = current_agent();
+    eprintln!(
+        "tba sub 常驻监听已挂上：项目 {project_id} · 每 {iv} 秒查一次看板列「{STAGE_TODO}」；空队列不退出，领到任务才唤醒。"
+    );
     loop {
-        let at: usize = std::fs::read_to_string(&cursor)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        if let Ok(bytes) = std::fs::read(&feed) {
-            if bytes.len() > at {
-                print!("{}", String::from_utf8_lossy(&bytes[at..]));
+        // 常驻进程不走 cmds::run 的批量续命；自己每轮刷一次，
+        // 免得空队列挂久了把同会话的 running 任务误判成死会话回收。
+        store.beat_agent(&agent);
+        // 没僵尸时 sweep 直接返回，不联网；有僵尸先退回列1，别让它占着队列。
+        for m in sweep(store, false).unwrap_or_default() {
+            eprintln!("{m}");
+        }
+        match classify_claim_result(claim(store, project_id, None, &agent)) {
+            SubPoll::Dispatch(c) => {
+                let skills = cached_skills(store, &c.project_id);
+                print!("{}", subagent_brief(store, &c, &c.task_name, &skills, lang));
+                eprintln!(
+                    "已领到一条并生成子代理简报。后台 job 结束会唤醒主代理：读简报调 subagent 工具派活；派完再挂一条 `tba sub` 继续监听。"
+                );
                 let _ = std::io::stdout().flush();
-                let _ = std::fs::write(&cursor, bytes.len().to_string());
                 return Ok(());
             }
+            SubPoll::Idle => {}
+            SubPoll::Paused(msg) => {
+                eprintln!("tba sub：有任务在等你回复，先处理待回复再领新任务。\n{msg}");
+            }
+            SubPoll::Retry(e) => {
+                eprintln!("tba sub：本轮查询失败：{e}");
+            }
         }
-        // 任务被收尾就停，别死等一个已经没意义的回复。
-        if store.get_claim(claim_id).map_or(false, |c| !c.is_active()) {
-            println!("任务已收尾，停。");
-            return Ok(());
-        }
-        // 监听意外挂了就自愈重拉，任务还在进行中就别断。
-        if store.wait_age(claim_id).map_or(true, |age| age >= 60) {
-            let _ = ensure_listener(store, claim_id);
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(iv));
     }
 }
 
@@ -1468,14 +1480,27 @@ pub fn run() -> Result<(), String> {
             use std::io::Write;
             let lang = Lang::parse(&lang)
                 .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
-            // 不带 --off 时 go 是「去队列领任务」，不认任务描述——
-            // 静默忽略会让人以为活儿已经派下去了，所以直接说清楚。
+            // 跟了文字又不带 --off：在 Teambition 新建一条任务（标题=文字），
+            // 置「进行中」+ 看板列「进行中」。多词直接写，不用引号。
+            // 例：tba go 把侧栏改窄一点
             if !off && !task.is_empty() {
-                return Err(format!(
-                    "`go` 不带 --off 是从队列领任务，不吃任务描述。\n\
-                     要直连（不领任务、直接在当前对话里交互）请写：tba go -off {}",
-                    task.join(" ")
-                ));
+                let desc = task.join(" ");
+                let pid = resolve_project(project.as_deref())?;
+                let r = start(&store, &pid, desc.trim(), "", &current_agent())?;
+                for w in &r.warnings {
+                    eprintln!("警告: {w}");
+                }
+                println!("已新建任务并开工：");
+                println!("task_id:   {}", r.claim.task_id);
+                println!("task_name: {}", r.claim.task_name);
+                println!("project:   {}", r.claim.project_id);
+                println!("链接:      {}", crate::ops::task_url(&r.claim.task_id));
+                println!("状态:      未完成 -> 进行中（看板列「进行中」）");
+                if r.existed {
+                    println!("（同名任务已开工，复用原 claim）");
+                }
+                let _ = std::io::stdout().flush();
+                return Ok(());
             }
             // 项目从本地绑定 + 项目缓存解析，能力读本地缓存，
             // `-off` 后面那句话就是本次任务。
@@ -1528,13 +1553,35 @@ pub fn run() -> Result<(), String> {
             }
             claim_and_print(&store, project.as_deref(), lang, !no_entry, true)?;
         }
-        Cmd::Subagent { target, project, lang } => {
+        Cmd::Subagent { target, project, lang, task } => {
             use std::io::Write;
             let lang = Lang::parse(&lang)
                 .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
             let zh = lang == Lang::Zh;
+            // 跟了文字：新建一条任务并开工，不再派子代理。
+            // 标题即文字，置「进行中」+ 看板列「进行中」。
+            if !task.is_empty() {
+                let desc = task.join(" ");
+                let pid = resolve_project(project.as_deref())?;
+                let r = start(&store, &pid, desc.trim(), "", &current_agent())?;
+                for w in &r.warnings {
+                    eprintln!("警告: {w}");
+                }
+                println!("已新建任务并开工：");
+                println!("task_id:   {}", r.claim.task_id);
+                println!("task_name: {}", r.claim.task_name);
+                println!("project:   {}", r.claim.project_id);
+                println!("链接:      {}", crate::ops::task_url(&r.claim.task_id));
+                println!("状态:      未完成 -> 进行中（看板列「进行中」）");
+                if r.existed {
+                    println!("（同名任务已开工，复用原 claim）");
+                }
+                eprintln!("（建任务模式：没派子代理、没挂监听。要派子代理给已有任务就 `tba sub <claim/链接>`，或裸 `tba sub` 常驻监听领新任务。）");
+                let _ = std::io::stdout().flush();
+                return Ok(());
+            }
             // target 给了：派一条「已领」的任务（claim_id 或 task id）。
-            // 没给：领一条「未完成」新任务（和 tba go 一样）。
+            // 没给：裸命令常驻监听「未完成」列，有任务才领。
             let claim = if let Some(t) = &target {
                 let t = t.trim();
                 let claims = store.active_claims();
@@ -1560,25 +1607,11 @@ pub fn run() -> Result<(), String> {
                         })?
                 }
             } else {
-                // 领新任务：项目解析同 Claim（--project 优先，否则本地绑定）。
+                // 裸 `tba sub`：常驻监听「未完成」列。空队列继续等，领到才退出唤醒。
+                // 简报由 subagent_watch 打印后返回，不走下面单次派发的打印。
                 let pid = resolve_project(project.as_deref())?;
-                // 领之前先回收死会话，别让一个已经不存在的会话占着任务。
-                for m in sweep(&store, false).unwrap_or_default() {
-                    eprintln!("{m}");
-                }
-                match claim(&store, &pid, None, &current_agent()) {
-                    Ok(c) => c,
-                    Err(e) if e.starts_with(BLOCKED_PREFIX) => {
-                        return Err(format!(
-                            "手上有在等回复但没人接的任务，先处理掉再来领：{}",
-                            e.trim_start_matches(BLOCKED_PREFIX)
-                        ));
-                    }
-                    Err(e) if e.starts_with(NO_TASK_PREFIX) => {
-                        return Err("队列（列「未完成」）为空，没有可领任务派给子代理。".to_string());
-                    }
-                    Err(e) => return Err(e),
-                }
+                subagent_watch(&store, &pid, lang)?;
+                return Ok(());
             };
             // 任务正文：派已领任务时走离线——台账里的 task_name 即标题，
             // 正文由子代理按 task_id 链接自己读（见简报末尾），避免为取正文联网。
@@ -1743,15 +1776,11 @@ pub fn run() -> Result<(), String> {
                     c.claim_id
                 );
             } else {
-                // 常驻监听从这次 ask 起一直跑到用户回 1 收尾，执行中也不中断。
-                // ask 自己只是「前台等待者」：读到一条新回复就打印并退出，唤醒会话。
-                ensure_listener(&store, &c.claim_id)?;
+                // 监听由 tba serve 的 WatchAggregator 统一托管，ask 不再 spawn 独立进程。
                 println!(
-                    "\n常驻监听已挂上（每 {} 秒查一次评论/邮件，直到你回 1 才停；执行中也不中断）。\n\
-                     邮件和 Teambition 上的每条新回复都会唤醒会话；别重跑 ask（会重复发邮件）。",
-                    cfg.wait_interval_secs
+                    "\n回复监听由 tba serve 的聚合器统一托管（邮件/Teambition 新回复写 wakes/ 并由 bridge 插队唤醒）。\n\
+                     别重跑 ask（会重复发邮件）。"
                 );
-                wait_for_feed(&store, &c.claim_id)?;
             }
         }
         Cmd::Reply { claim_id } => {
@@ -1837,9 +1866,7 @@ pub fn run() -> Result<(), String> {
                 // --once 老路径：单轮到点退出码 2，收到一条回复就返回。
                 run_wait_block(&store, &claim_id, timeout, interval, false, false)?;
             } else {
-                // agent 续等：确保常驻监听在跑，读到下一条新回复就退出唤醒会话。
-                ensure_listener(&store, &claim_id)?;
-                wait_for_feed(&store, &claim_id)?;
+                // 监听由 tba serve 的 WatchAggregator 统一托管，wait 不再 spawn 独立进程。
             }
         }
         Cmd::Events { claim, limit } => {
@@ -2308,6 +2335,48 @@ pub fn run() -> Result<(), String> {
         Cmd::Doctor => {
             println!("{}", doctor(&store));
         }
+
+        // where / paths：报本机已配好的工具路径 + 来源。
+        // 复用 toolchain::resolve / git::git_prog / gitbutler::detect，不重新扫盘。
+        Cmd::Where => {
+            let tc = crate::toolchain::resolve(&store);
+            let mark = |ok: bool| if ok { "✓" } else { "✗" };
+            let (bin_ok, lib_ok, sdk_ok) = crate::toolchain::verify(&tc.tc);
+            let bin = if tc.tc.msvc_bin.trim().is_empty() {
+                "(未指定)".to_string()
+            } else {
+                format!("{} {}", tc.tc.msvc_bin.trim(), mark(bin_ok))
+            };
+            let lib = if tc.tc.msvc_lib.trim().is_empty() {
+                "(未指定)".to_string()
+            } else {
+                format!("{} {}", tc.tc.msvc_lib.trim(), mark(lib_ok))
+            };
+            let sdk = if tc.tc.winsdk_libs.trim().is_empty() {
+                "(未指定)".to_string()
+            } else {
+                format!("{} {}", tc.tc.winsdk_libs.trim(), mark(sdk_ok))
+            };
+            println!("MSVC  bin:    {}  (来源: {})", bin, tc.source.label());
+            println!("MSVC  lib:    {}  (来源: {})", lib, tc.source.label());
+            println!("WinSDK lib:  {}  (来源: {})", sdk, tc.source.label());
+            let prog = crate::git::git_prog();
+            let gsrc = crate::git::git_source();
+            match crate::gitbutler::git_available() {
+                Some(v) => println!("git:        {} ({})  (来源: {})", prog, v, gsrc),
+                None => println!("git:        {} (未检测到版本)  (来源: {})", prog, gsrc),
+            }
+            let gb = crate::gitbutler::detect(&store);
+            match &gb.path {
+                Some(p) => println!(
+                    "GitButler: {}  (来源: {})",
+                    p.display(),
+                    gb.source.map(|s| s.label()).unwrap_or("?")
+                ),
+                None => println!("GitButler: (未检测到)"),
+            }
+        }
+
         Cmd::Git {
             action,
             message,

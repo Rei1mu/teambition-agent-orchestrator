@@ -56,6 +56,41 @@ fn but_prog() -> &'static str {
         "but"
     }
 }
+/// git 程序名 / 路径。优先级：环境变量 TBA_GIT > config.toml 的 git_path > PATH 里的 git。
+///
+/// 装了多个 git（Git for Windows / GitButler 自带 / scoop 版）时，PATH 里挑错版本会出
+/// 稀奇古怪的问题，指定一次最稳。和 GitButler 的 but_path 同一思路：**不扫盘**。
+pub fn git_prog() -> String {
+    if let Ok(v) = std::env::var("TBA_GIT") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let cfg = crate::config::Config::load(&crate::config::data_dir());
+    if !cfg.git_path.trim().is_empty() {
+        cfg.git_path.trim().to_string()
+    } else {
+        "git".to_string()
+    }
+}
+
+/// git 路径来源（和 git_prog 同优先级，只报来源不报路径）。
+/// 用于 `tba where` 告诉用户这份 git 是从哪来的。
+pub fn git_source() -> &'static str {
+    if let Ok(v) = std::env::var("TBA_GIT") {
+        if !v.trim().is_empty() {
+            return "环境变量";
+        }
+    }
+    let cfg = crate::config::Config::load(&crate::config::data_dir());
+    if !cfg.git_path.trim().is_empty() {
+        "手动指定"
+    } else {
+        "PATH"
+    }
+}
+
 
 // 仓库根。不在 git 仓库里就直接报错，别让后面的命令在错的目录里跑。
 pub fn repo_root() -> Result<PathBuf, String> {

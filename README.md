@@ -280,6 +280,7 @@ tba raw teambition.project.sfc-field-upsert --args '{"projectId":"<项目ID>","s
 | 接入 | `tba onboard` · `tba mcp` · `tba login --token <...>` | 本地自检 / 打印 MCP 片段 / 登录 |
 | 项目 | `tba projects` · `tba create --name <名字> --go` · `tba ensure-project --project <id>` | 列项目 / 接入 / 复用已有项目 |
 | 开工 | `tba` · `tba go` · `tba claim` · `tba take <链接>` · `tba start --file <md>` | 领任务 / 接单 / 新建任务 |
+| 子代理 | `tba sub` | 裸命令即常驻监听「未完成」：空队列后台挂机等，领到一条就打印简报并唤醒主代理去派子代理 |
 | 干活 | `tba note <claim> --file <md>` · `tba beat <claim>` · `tba skill <名字> --project <id>` | 写本次处理内容 / 续命 / 读 skill |
 | 交回 | `tba ask <claim> --done` · `tba ask <claim> -q "..."` | 转「待回复」+ 发信 + 挂后台常驻监听 |
 | 继续 | `tba reply <claim>` · `tba wait <claim>` · `tba events` | 会话窗直回先 reply / 单独常驻监听 / 看落盘回复 |

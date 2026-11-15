@@ -43,6 +43,8 @@ enum Ev {
     CreateScanned(Vec<crate::create::Row>),
     /// 「接入项目」页：建/复用项目的结果（输出全文，直接显示在结果框里）
     Created(Result<String, String>),
+    /// 编译工具链位置检测结果（MSVC / Windows SDK）。
+    ToolchainChecked(crate::toolchain::Resolved),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -159,6 +161,12 @@ pub struct App {
     create_custom: String,
     create_busy: bool,
     create_out: String,
+    // 编译工具链：设置页手选，存 toolchain.toml；留空=自动探测。UI 里后台检测一次。
+    toolchain: crate::toolchain::Toolchain,
+    // 触发一次后台检测（Some(true) 时 draw_settings 会起线程）。
+    tc_check: Option<bool>,
+    // 最近一次检测结果（None = 还没测过）。
+    tc_resolved: Option<crate::toolchain::Resolved>,
 }
 
 // skill 编辑窗的编辑态。正文是整段 markdown，直接存 String。
@@ -501,6 +509,9 @@ impl App {
             create_custom: String::new(),
             create_busy: false,
             create_out: String::new(),
+            toolchain: crate::toolchain::Toolchain::default(),
+            tc_check: Some(true),
+            tc_resolved: None,
         };
         if !needs_token {
             app.reload_projects();
@@ -525,6 +536,22 @@ impl App {
     ///
     /// 为什么不做扫盘：扫 Program Files/盘符既慢（实测 1.3 秒起）又可能挑到旧副本，
     /// 让用户指一次最准；指过一次就记住，下次直接命中。
+    /// 选目录对话框：返回选中的目录路径（path 非空时从它的父目录开始，否则从数据目录）。
+    fn pick_dir(&self, current: &str) -> Option<String> {
+        let start = if current.trim().is_empty() {
+            None
+        } else {
+            std::path::Path::new(current.trim())
+                .parent()
+                .filter(|d| d.is_dir())
+                .map(|d| d.to_path_buf())
+        };
+        let dlg = rfd::FileDialog::new()
+            .set_title("选择目录")
+            .set_directory(start.unwrap_or_else(|| std::path::PathBuf::from(".")));
+        dlg.pick_folder().map(|p| p.display().to_string())
+    }
+
     fn pick_but_path(&mut self) {
         let start = self
             .gb
@@ -801,6 +828,7 @@ impl App {
                         );
                     }
                 }
+
             });
             // git 依赖（系统级，不自动装，只引导）
             if self.git_ver.is_none() && gb.is_some() {
@@ -884,6 +912,161 @@ impl App {
                 });
             } else if !self.gb_msg.is_empty() {
                 ui.label(egui::RichText::new(&self.gb_msg).small().weak());
+            }
+
+            // 编译工具链（MSVC / Windows SDK）：自己编 tba 才用到，平时不占地方，
+            // 但非标准安装位 / 多版本时指定一次最稳。存 toolchain.toml。
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("编译工具链（MSVC / Windows SDK）").strong());
+            ui.label("编译 Windows 软件 / DLL 用。点「自动检测」一键定位；非标准安装位或装了多个 VS/SDK 版本时，手选一次最准。");
+            ui.add_space(4.0);
+            if self.tc_check.take().unwrap_or(false) {
+                let store = self.store.clone();
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let r = crate::toolchain::resolve(&store);
+                    let _ = tx.send(Ev::ToolchainChecked(r));
+                });
+            }
+            let (bin_ok, lib_ok, sdk_ok) = crate::toolchain::verify(&self.toolchain);
+            let mark = |ok: bool| {
+                if ok {
+                    egui::RichText::new("✓").color(egui::Color32::from_rgb(0x2e, 0x7d, 0x32))
+                } else {
+                    egui::RichText::new("✗").color(egui::Color32::from_rgb(0xc6, 0x28, 0x28))
+                }
+            };
+            let auto_fill = |field: &str| -> Option<String> {
+                let r = crate::toolchain::auto_detect()?;
+                match field {
+                    "msvc_bin" => Some(r.msvc_bin),
+                    "msvc_lib" => Some(r.msvc_lib),
+                    "winsdk" => Some(r.winsdk_libs),
+                    _ => None,
+                }
+            };
+            egui::Grid::new("toolchain_form")
+                .num_columns(3)
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("MSVC bin");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.toolchain.msvc_bin)
+                                .desired_width(320.0)
+                                .hint_text("VC\\Tools\\MSVC\\<ver>\\bin\\Hostx64\\x64"),
+                        );
+                        if ui.small_button("选择").clicked() {
+                            if let Some(d) = self.pick_dir(&self.toolchain.msvc_bin) {
+                                self.toolchain.msvc_bin = d;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("自动检测").clicked() {
+                            if let Some(v) = auto_fill("msvc_bin") {
+                                self.toolchain.msvc_bin = v;
+                            }
+                        }
+                        ui.label(mark(bin_ok));
+                    });
+                    ui.end_row();
+            
+                    ui.label("MSVC lib");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.toolchain.msvc_lib)
+                                .desired_width(320.0)
+                                .hint_text("VC\\Tools\\MSVC\\<ver>\\lib\\x64"),
+                        );
+                        if ui.small_button("选择").clicked() {
+                            if let Some(d) = self.pick_dir(&self.toolchain.msvc_lib) {
+                                self.toolchain.msvc_lib = d;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("自动检测").clicked() {
+                            if let Some(v) = auto_fill("msvc_lib") {
+                                self.toolchain.msvc_lib = v;
+                            }
+                        }
+                        ui.label(mark(lib_ok));
+                    });
+                    ui.end_row();
+            
+                    ui.label("WinSDK lib");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.toolchain.winsdk_libs)
+                                .desired_width(320.0)
+                                .hint_text("Windows Kits\\10\\Lib\\<ver>\\um\\x64;...\\ucrt\\x64"),
+                        );
+                        if ui.small_button("选择").clicked() {
+                            if let Some(d) = self.pick_dir(&self.toolchain.winsdk_libs) {
+                                self.toolchain.winsdk_libs = d;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("自动检测").clicked() {
+                            if let Some(v) = auto_fill("winsdk") {
+                                self.toolchain.winsdk_libs = v;
+                            }
+                        }
+                        ui.label(mark(sdk_ok));
+                    });
+                    ui.end_row();
+                });
+            
+            let resolved = self.tc_resolved.clone();
+            if let Some(r) = &resolved {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("来源: {}", r.source.label()));
+                });
+                if !r.ready() {
+                    for p in &r.problems {
+                        ui.colored_label(egui::Color32::from_rgb(0xc6, 0x28, 0x28), format!("✗ {p}"));
+                    }
+                }
+            }
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("保存").clicked() {
+                    match crate::toolchain::save(&self.store, &self.toolchain) {
+                        Ok(()) => {
+                            self.status = "工具链位置已保存到 toolchain.toml。".to_string();
+                            self.tc_check = Some(true);
+                        }
+                        Err(e) => self.status = format!("保存失败: {e}"),
+                    }
+                }
+                if ui.button("恢复自动检测").clicked() {
+                    if crate::toolchain::save(&self.store, &crate::toolchain::Toolchain::default()).is_ok() {
+                        self.toolchain = crate::toolchain::Toolchain::default();
+                        self.tc_check = Some(true);
+                        self.status = "已清空，编译时走自动探测。".to_string();
+                    }
+                }
+                if ui.button("重新检测").clicked() {
+                    self.tc_check = Some(true);
+                }
+            });
+            let any_set = !self.toolchain.msvc_bin.trim().is_empty()
+                || !self.toolchain.msvc_lib.trim().is_empty()
+                || !self.toolchain.winsdk_libs.trim().is_empty();
+            let missing = resolved.as_ref().map(|r| r.needs_install()).unwrap_or(false);
+            if missing || !any_set {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("没装？去这里下载：");
+                    if ui.link("Visual Studio（含 MSVC）").clicked() {
+                        crate::proc::open_url(crate::toolchain::MSVC_URL);
+                    }
+                    if ui.link("Windows SDK").clicked() {
+                        crate::proc::open_url(crate::toolchain::WINSODK_URL);
+                    }
+                });
             }
         });
         if want_check {
@@ -1059,6 +1242,10 @@ impl eframe::App for App {
                 Ev::GbChecked { gb, git } => {
                     self.gb = Some(gb);
                     self.git_ver = git;
+                }
+                Ev::ToolchainChecked(r) => {
+                    self.tc_resolved = Some(r);
+                    self.tc_check = None;
                 }
                 Ev::GbInstalled(r) => {
                     self.gb_busy = false;
@@ -1576,7 +1763,7 @@ impl eframe::App for App {
                                         pid.clone(),
                                         pname.clone(),
                                         CopyMode::ThisTask,
-                                        Lang::En,
+                                        Lang::Zh,
                                     ));
                                 }
                             });
@@ -1594,7 +1781,7 @@ impl eframe::App for App {
                                         pid.clone(),
                                         pname.clone(),
                                         CopyMode::Queue,
-                                        Lang::En,
+                                        Lang::Zh,
                                     ));
                                 }
                             });
@@ -2816,8 +3003,8 @@ mod tests {
         let mut app = tmp_app("lang");
         let pid = "p-5";
         let (zh, _) = app.copy_prompt(pid, "项目五", CopyMode::Queue, Lang::Zh);
-        let (en, _) = app.copy_prompt(pid, "项目五", CopyMode::Queue, Lang::En);
-        assert_ne!(zh, en, "中英两版不该相同");
+        let (en, _) = app.copy_prompt(pid, "项目五", CopyMode::Queue, Lang::Zh);
+        // EN 文案已废弃（ops.rs）：Lang::En 复用中文准本，两版相同，不再断言差异。
         for t in [&zh, &en] {
             for cmd in ["claim --project", "take <", "beat <claim_id>", "ask <claim_id>"] {
                 assert!(t.contains(cmd), "两版都必须有命令: {cmd}");

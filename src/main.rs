@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod aggregator;
 mod caps;
 mod cmds;
 mod config;
@@ -16,6 +17,7 @@ mod proc;
 mod shot;
 mod store;
 mod tb;
+mod toolchain;
 mod tools;
 mod ui;
 
@@ -171,7 +173,8 @@ pub enum Cmd {
         target: String,
     },
     /// 一句话开工：按当前目录绑定的项目领一条「未完成」任务，打印正文和流程。
-    /// 退出码 3=目录未绑定项目 / 4=项目查不到 / 0=已领到或队列空(EMPTY)
+    /// 跟一段文字（不带 --off）则在 Teambition 新建一条任务并置「进行中」+ 看板列「进行中」。
+    /// 退出码 3=目录未绑定项目 / 4=项目查不到 / 0=已领到或队列空(EMPTY) / 建任务时 0=成功
     #[command(visible_aliases = ["g", "r", "run"])]
     Go {
         /// 项目 id。省略则按 .tba/project 绑定解析
@@ -186,25 +189,35 @@ pub enum Cmd {
         /// 直连模式：不领任务、不碰 Teambition，直接在当前对话框里交互
         #[arg(long)]
         off: bool,
-        /// 这次要做的事。直连模式下就是「本次任务」，多个词直接写，不用引号。
-        /// 例：tba go -off 把侧栏改窄一点
+        /// 任务文字。两种用法：
+        /// 1) 跟 --off：直连模式，这段文字就是本次任务（不领任务、不碰 Teambition）。
+        ///    例：tba go -off 把侧栏改窄一点
+        /// 2) 不跟 --off：在 Teambition 新建一条任务，标题=这段文字，置「进行中」+ 看板列「进行中」。
+        ///    例：tba go 把侧栏改窄一点
         #[arg(num_args = 0.., value_name = "TASK")]
         task: Vec<String>,
     },
-    /// 派子代理干活：领一条新任务（或直接派当前已领的任务），生成一份自包含的子代理简报。
-    /// 真正的派发由主代理在 DSH 里读简报后调 subagent 工具完成。
-    /// 不给 target 时等同 go 领一条新任务；给 target（claim_id 或任务链接/id）则派那条已领任务。
+    /// 派子代理接任务：裸 `tba sub` 是常驻监听，盯看板列「未完成」。
+    /// 空队列一直后台挂机等；领到一条就生成自包含子代理简报并退出，后台 job 结束唤醒主代理去派活。
+    /// 主代理只处理待回复等交互，派完子代理再挂一条 `tba sub` 继续监听。
+    /// 给 target 派已领任务 / 跟一段文字则新建任务，这两种仍是单次动作。
     #[command(visible_aliases = ["sub", "sg"])]
     Subagent {
-        /// 任务链接 https://www.teambition.com/task/<id>、裸任务 id，或 claim_id（clm...）。
-        /// 给了就派这条已领/已存在的任务；不给就领一条「未完成」新任务。
+        /// 派子代理时：任务链接 https://www.teambition.com/task/<id>、裸任务 id，或 claim_id（clm...）。
+        /// 给了就派这条已领/已存在的任务；不给就走裸命令常驻监听。
+        /// 跟了后面的文字（建任务模式）时本字段忽略。
         target: Option<String>,
-        /// 项目 id。省略则按 .tba/project 绑定解析（领新任务时需要）
+        /// 派子代理的项目 id，或建任务时指定项目 id（默认按 .tba/project 绑定解析）。
         #[arg(long)]
         project: Option<String>,
         /// 文案语言：zh=中文(默认) / en=英文
         #[arg(long, default_value = "zh")]
         lang: String,
+        /// 新建一条任务并置「进行中」+ 看板列「进行中」：标题即后面的文字（多词直接写，不用引号）。
+        /// 例：tba sub 把侧栏改窄一点
+        /// 给了文字就走「建任务」分支，不再派子代理、不再领任务。
+        #[arg(num_args = 0.., value_name = "TASK")]
+        task: Vec<String>,
     },
     /// 领一条「未完成」任务。默认取创建时间最早的一条。自动转「进行中」
     Claim {
@@ -545,6 +558,11 @@ pub enum Cmd {
         #[arg(long = "no-always")]
         no_always: bool,
     },
+    /// 报本机已配好的工具路径：MSVC / Windows SDK / git / GitButler，含来源(环境变量/手动指定/自动探测)。
+    /// agent 接手一台新设备时先跑这个，知道去哪调用这些工具，不用自己扫盘或问。
+    #[command(name = "where", visible_aliases = ["paths"])]
+    Where,
+
     /// 自检：令牌 / PATH / git / GitButler / 字体 / 轮询参数一次全列出来
     Doctor,
 }

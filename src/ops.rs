@@ -14,6 +14,53 @@ pub const OFFLINE_ERR: &str = "当前是离线模式（不用 Teambition），�
 tba caps / tba shot / tba ui。\n\
 要联网：把 data/config.toml 里的 offline 改成 false，或去掉环境变量 TBA_OFFLINE。";
 
+// tba <-> DSH 唤醒桥的手写握手文件。
+//
+// DSH 只认「后台 job 退出」这一条 agent 唤醒通道；本机监听（wait --listen）收到
+// 非「回 1」的回复不退出，于是 DSH 不会唤醒，只能靠用户去聊天框打字。这个函数把
+// 「收到了一条回复」写成 <root>/wakes/<sessionId>.json，由 dsh-tba-bridge 插件
+// （跑在 DSH 进程内、持有 agents 服务）轮询并 agent.steer(msg) 插队到当前轮、
+// 立刻唤醒——不必等 job 退出，也不必让用户手动去聊天框打字。
+//
+// sessionId 优先读 <root>/waits/<claim_id>.session：那是发起 ask 的 agent shell
+// 落盘的（它才有 DSH_SESSION_ID）。监听进程被 MCP server 自愈重拉时继承的是
+// 主进程环境、拿不到 DSH_SESSION_ID，必须靠这个文件，否则唤醒静默失效。
+// 文件不存在时回退读 env（直接由 agent shell 拉起的监听走这条）。
+// 两者都没有 = 非 DSH 唤起，桥无意义，静默跳过。
+pub fn write_wake_request(root: &std::path::Path, claim_id: &str, text: &str) {
+    let session_file = root.join("waits").join(format!("{claim_id}.session"));
+    let from_file = std::fs::read_to_string(&session_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let session_id = match from_file.or_else(|| {
+        std::env::var("DSH_SESSION_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }) {
+        Some(s) => s,
+        None => return,
+    };
+    let dir = root.join("wakes");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("wake: 创建 wakes 目录失败（{e}），跳过唤醒握手");
+        return;
+    }
+    let payload = serde_json::json!({
+        "sessionId": session_id,
+        "text": text,
+        "ts": chrono::Local::now().to_rfc3339(),
+    });
+    let tmp = dir.join(format!("{session_id}.{}.tmp", std::process::id()));
+    let final_path = dir.join(format!("{session_id}.json"));
+    if let Ok(s) = serde_json::to_string_pretty(&payload) {
+        if std::fs::write(&tmp, s).is_ok() {
+            let _ = std::fs::rename(&tmp, &final_path); // 原子落盘，避免插件读到半写文件
+        }
+    }
+}
+
 // 工作流状态的 kind 三态（Teambition）：start=开始 / unset=进行中 / end=结束。
 // 只有 kind=end 的任务才算「已完成」(isDone=true)。按 TBHub 的阶段名固定分配：
 //   未完成=start（新任务落这里）、进行中=unset、已解决/已完成=end。
@@ -1320,6 +1367,36 @@ pub const NO_TASK_PREFIX: &str = "「未完成」里没有可领的任务。";
 // 「等待中断，先处理」的错误前缀。go 靠它把这种错误转成 BLOCKED（退出码 5）。
 pub const BLOCKED_PREFIX: &str = "BLOCKED: ";
 
+/// `tba sub` 常驻监听对一轮 claim 结果的判定。
+/// 只有真领到一条才 Dispatch（打印简报并退出唤醒主代理）；其余一律继续等，不崩、不退出。
+pub enum SubPoll {
+    Dispatch(Claim),
+    Idle,
+    Paused(String),
+    Retry(String),
+}
+
+#[cfg(test)]
+impl SubPoll {
+    /// 是否结束这一轮常驻监听：只有 Dispatch 才让后台 job 退出并触发唤醒。
+    pub fn should_stop(&self) -> bool {
+        matches!(self, SubPoll::Dispatch(_))
+    }
+}
+
+/// 把 claim() 的结果翻译成常驻监听的一轮决策。
+/// 抽成纯函数是为了不联网就能单测「空队列 / 待回复 / 瞬时失败都不退出」。
+pub fn classify_claim_result(r: Result<Claim, String>) -> SubPoll {
+    match r {
+        Ok(c) => SubPoll::Dispatch(c),
+        Err(e) if e.starts_with(NO_TASK_PREFIX) => SubPoll::Idle,
+        Err(e) if e.starts_with(BLOCKED_PREFIX) => {
+            SubPoll::Paused(e.trim_start_matches(BLOCKED_PREFIX).to_string())
+        }
+        Err(e) => SubPoll::Retry(e),
+    }
+}
+
 pub fn claim(
     store: &Store,
     project_id: &str,
@@ -1644,7 +1721,7 @@ fn comment_text(v: &serde_json::Value) -> String {
 }
 
 // 比较两个 ISO 时间戳，a 是否晚于 b。解析不了就当不晚（宁可漏读也不误判）。
-fn ts_after(a: &str, b: &str) -> bool {
+pub fn ts_after(a: &str, b: &str) -> bool {
     fn epoch(s: &str) -> Option<i64> {
         chrono::DateTime::parse_from_rfc3339(s)
             .ok()
@@ -1972,6 +2049,20 @@ pub fn ask(store: &Store, claim_id: &str, question: &str) -> Result<Claim, Strin
     // 时间戳基准：wait 用它过滤「提问之后的评论」。
     // 以前取评论的 createTime，现在 agent 不写评论了，直接取本地时间。
     let asked_at = chrono::Local::now().to_rfc3339();
+
+    // 落盘本会话 id：聚合器读它写 wakes/ 文件，才能唤醒「当前」这个会话。
+    // tmp+rename 原子写，避免聚合器读到半写；只有 DSH 注入过 DSH_SESSION_ID 时才写。
+    if let Ok(sid) = std::env::var("DSH_SESSION_ID") {
+        let sid = sid.trim().to_string();
+        if !sid.is_empty() {
+            let session_file = store.waits_dir().join(format!("{claim_id}.session"));
+            let _ = std::fs::create_dir_all(session_file.parent().unwrap());
+            let tmp = store.waits_dir().join(format!("{claim_id}.session.{}.tmp", std::process::id()));
+            if std::fs::write(&tmp, &sid).is_ok() {
+                let _ = std::fs::rename(&tmp, &session_file);
+            }
+        }
+    }
 
     let cur = ctx
         .task_info(&claim.task_id)
@@ -2414,6 +2505,18 @@ pub fn strip_reply_noise(text: &str) -> String {
         if t.starts_with("（邮件回复）") || t.starts_with("[TB ") {
             continue;
         }
+        // 邮件落款：QQ 邮箱客户端回信常带 `RR` + 自己的邮箱地址两行，
+        // 不是用户回复内容，必须剥掉，否则会带进 feed / events 误导。
+        if t == "RR" || t.eq_ignore_ascii_case("rr") {
+            continue;
+        }
+        if t.contains('@')
+            && (t.contains(".com") || t.contains(".cn") || t.contains(".net") || t.contains(".org"))
+            && t.chars().filter(|c| *c == '@').count() == 1
+            && t.len() <= 60
+        {
+            continue;
+        }
         let low = t.to_ascii_lowercase();
         // 引用/转发边界。命中就截断，后面全部丢掉。
         // 通知邮件第一行特意用「--- 问题 ---」：客户端把原邮件平铺进回信时，
@@ -2455,54 +2558,53 @@ pub fn strip_reply_noise(text: &str) -> String {
     out.join("\n")
 }
 
-// 找第一个「独立的单个数字」。前后是 ASCII 字母数字的跳过，
-// 连续多位数字（年份、任务号、日期）也跳过，避免从噪声里抽错。
-fn first_reply_digit(text: &str) -> Option<(u32, std::ops::Range<usize>)> {
-    let b = text.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() {
-        if !b[i].is_ascii_digit() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-        let end = i;
-        if end - start != 1 {
-            continue;
-        }
-        let before = start.checked_sub(1).map(|j| b[j]);
-        let after = b.get(end).copied();
-        if before.map_or(false, |c| c.is_ascii_alphanumeric())
-            || after.map_or(false, |c| c.is_ascii_alphanumeric())
-        {
-            continue;
-        }
-        return Some(((b[start] - b'0') as u32, start..end));
+// 动作号只在「整条回复恰好一个数字字符」时成立。
+// strip_reply_noise 已剥掉引用/落款/标记；之后 trim 掉空白，剩下必须是
+// 恰好一个数字（半角 0-9 或全角 ０-９），别的字符一律不算。
+// 不兼容旧习惯：1. / 1、 / （1） / 1 和 2 都做了 / 测试中途唤醒1 / 2026
+// 全部按自由文本处理——只有干净的单个 1 / 2 / 3 才是动作号。
+// 返回 (数字, 数字在 added 中的字节范围)。
+fn pure_reply_digit(added: &str) -> Option<(u32, std::ops::Range<usize>)> {
+    let t = added.trim();
+    if t.is_empty() {
+        return None;
     }
-    None
+    let mut cs = t.chars();
+    let c = cs.next()?;
+    if cs.next().is_some() {
+        return None; // 不止一个字符
+    }
+    let n = if c.is_ascii_digit() {
+        (c as u32) - ('0' as u32)
+    } else if ('０'..='９').contains(&c) {
+        (c as u32) - ('０' as u32)
+    } else {
+        return None;
+    };
+    // range 回到 added 的字节下标：parse_reply 用它切 &str
+    let start = added.find(t)?;
+    Some((n, start..start + t.len()))
 }
 
-// 两通道共用的数字解析。评论、邮件回信都走这里。
+// 两通道共用的数字解析。只有整条回复是单个数字时才返回 Some。
 pub fn parse_reply_num(text: &str) -> Option<u32> {
-    first_reply_digit(&strip_reply_noise(text)).map(|(n, _)| n)
+    pure_reply_digit(&strip_reply_noise(text)).map(|(n, _)| n)
 }
 
 // 解析用户回复。返回 (动作, 去掉数字后的正文)。
-// 宽松规则：剥离引用后，从用户新增文本里抽第一个独立数字。
+// 严格规则：整条回复恰好一个数字（可带首尾标点/落款）才判动作号；
+// 其余一律自由文本，原文交回 agent，绝不因正文带数字而误收尾。
 pub fn parse_reply(text: &str) -> (ReplyAction, String) {
     let added = strip_reply_noise(text);
-    let Some((n, range)) = first_reply_digit(&added) else {
+    let Some((n, range)) = pure_reply_digit(&added) else {
         return (ReplyAction::Free, added);
     };
     let mut body = String::with_capacity(added.len());
     body.push_str(&added[..range.start]);
     body.push_str(&added[range.end..]);
     let body = body
-        .trim_start_matches(|c: char| {
-            c.is_whitespace() || ".,。，、:：;；)）]】".contains(c)
+        .trim_matches(|c: char| {
+            c.is_whitespace() || ".,。，、:：;；)）]】(((【「『".contains(c)
         })
         .trim()
         .to_string();
@@ -2578,6 +2680,111 @@ impl WatchBaseline {
     }
 }
 
+pub fn subagent_brief(
+    store: &Store,
+    claim: &Claim,
+    body: &str,
+    skills: &[SkillItem],
+    lang: Lang,
+) -> String {
+    let cfg = store.load_config();
+    let exe = prompt_exe_of(&cfg);
+    let zh = lang == Lang::Zh;
+    let proj_name = store
+        .load_projects_cache()
+        .into_iter()
+        .find(|(id, _)| id == &claim.project_id)
+        .map(|(_, n)| n)
+        .unwrap_or_else(|| claim.project_id.clone());
+    let mut s = String::new();
+    if zh {
+        s.push_str(r#"===== 给子代理的任务简报（自包含，直接贴给 subagent）=====
+
+"#);
+    } else {
+        s.push_str(r#"===== Subagent brief (self-contained, paste to subagent) =====
+
+"#);
+    }
+    s.push_str(&format!("## 子任务：{}
+
+", claim.task_name));
+    s.push_str(&format!(
+        "claim_id: {}
+项目:  {}
+任务链接: https://www.teambition.com/task/{}
+
+",
+        claim.claim_id, claim.project_id, claim.task_id
+    ));
+    if !body.trim().is_empty() {
+        s.push_str(if zh { "## 任务正文
+" } else { "## Task body
+" });
+        s.push_str(body.trim());
+        s.push_str("
+
+");
+    }
+    // 项目上下文（能力 + skill 索引）复用开工文案的同款内容，本地就能生成。
+    s.push_str(&prompt_head(store, &claim.project_id, &proj_name, skills, None, lang, false));
+    s.push_str(&subagent_workflow_text(&exe, &claim.claim_id, lang));
+    // 主代理收尾指引：只有主代理能 done/close/ask。
+    s.push_str("
+===== 主代理收尾指引（你来做，别让子代理做）=====
+");
+    if zh {
+        s.push_str(&format!(
+            r#"子代理回报后，按 claim_id 收尾（只有你能 done/close）：
+  {exe} note {id} --text "改了什么/怎么验"
+  {exe} ask {id} --done
+"#,
+            exe = exe, id = claim.claim_id
+        ));
+    } else {
+        s.push_str(&format!(
+            r#"After the subagent reports back, close it yourself (only you may done/close):
+  {exe} note {id} --text "what changed / how verified"
+  {exe} ask {id} --done
+"#,
+            exe = exe, id = claim.claim_id
+        ));
+    }
+    // 常驻监听唤醒主代理后就退出了；派完子代理得再挂一条，否则队列没人盯。
+    s.push_str("\n===== 主代理：派完子代理再挂一条 `tba sub` 后台监听继续等新任务（裸命令即可，不用开关）=====\n");
+    s
+}
+
+/// 子代理专属流程说明：任务已认领，它只需干活 + 写备注 + 回报，不碰收尾。
+fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
+    if lang == Lang::Zh {
+        return format!(
+            r##"## 你的职责
+1. 只改完成这个任务必须改的，遵循项目编码纪律（见上方上下文）。
+2. 干完把「改了什么/怎么验」写进任务备注（不是评论）：
+  {exe} note {id} --text "改了什么/怎么验"
+3. 不要自己 done / close，也不要自己 ask —— 收尾和提问都归主代理（你调不了 DSH 的回复交互）。
+4. 有拿不准的，把疑问写进备注并回报主代理，由主代理去问用户；不要自己假设后硬干。
+
+## 交回主代理
+回报：改了什么、验证了什么、还剩什么、有什么疑问。主代理用 claim_id（{id}）收尾并视情况提问。"##,
+            exe = exe, id = claim_id
+        );
+    }
+    format!(
+        r##"## Your job
+1. Change only what this task requires; follow the project coding rules above.
+2. When done, write "what changed / how verified" to the task note (not a comment):
+  {exe} note {id} --text "what changed / how verified"
+3. Do NOT done / close yourself, and do NOT ask - closing and asking are the main agent's job (you can't drive DSH's reply loop).
+4. If unsure, write the question into the note and report back to the main agent; the main agent asks the user. Do not guess and plow ahead.
+
+## Hand back to main agent
+Report: what changed, what you verified, what remains, and any open questions. Main agent closes via claim_id ({id}) and asks the user if needed."##,
+        exe = exe, id = claim_id
+    )
+}
+
 /// `forever = true` 时永不因超时返回，只有任务被收尾才退出。
 /// `emit` 每读到一条回复调一次，打印摘要并决定是否结束监听：
 /// 常驻监听（`--listen`）只有回复 1 才返回 true，其余返回 false 继续轮询。
@@ -2639,17 +2846,25 @@ pub fn wait(
     let mut last_comment_ts = String::new();
     // 执行中态收到的回复先攒着，攒到就交给 emit。
     let mut noted: Vec<String> = Vec::new();
-    // IMAP 扫描状态跨轮保留：ask 时记下的提问水位 + 已扫过的 UID。
-    // 只抓「提问之后新到的未读信」，不碰信箱里堆积的历史未读广告。
-    let mut mail_scan = crate::mail::MailScan::with_watermark(crate::mail::load_watermark(
-        &store.root,
-        claim_id,
-    ));
+    // IMAP 长连接：扫描状态（提问水位 + 已扫 UID）和 TLS 连接都跨轮保留。
+    // 旧版每轮 connect+LOGIN+SELECT（实测十几到三十秒），是邮件慢的主因。
+    let mut imap = crate::mail::ImapSession::new(
+        ctx.tb.cfg.clone(),
+        crate::mail::MailScan::with_watermark(crate::mail::load_watermark(
+            &store.root,
+            claim_id,
+        )),
+    );
     // 这两个都是 Teambition MCP 往返，同步串行跑会把主循环拖到几十秒一轮，
     // 8 秒的邮件轮询就跟着变成 30 秒以上。它们本来也不需要 5 秒一次：
     // 手动收尾是低频动作，心跳超时阈值是 300 秒。
     let mut last_external = std::time::Instant::now() - std::time::Duration::from_secs(30);
     let mut last_beat = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    // 评论也是 MCP 往返，但比邮件低频得多：每 10 秒读一次即可，独立计时，
+    // 别让它和邮件串到同一轮把邮件轮询拖慢。节流窗口内的新评论下次读时
+    // 按 created 过滤一次性补回，不会漏。
+    let mut last_comment_poll = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    const COMMENT_POLL_SECS: u64 = 10;
     loop {
         let loop_started = std::time::Instant::now();
         // 每轮刷新「我在等」的标记。进程被杀就停更，别的命令据此判断
@@ -2670,32 +2885,38 @@ pub fn wait(
             baseline_after
         };
 
-        // 等待期间任务可能被别处 done/close/release 掉，那就别再等了。
-        if let Some(c) = store.get_claim(claim_id) {
-            if !c.is_active() {
-                store.wait_drop(claim_id);
-                return Ok(WaitOutcome::Gone {
-                    state: c.state.clone(),
-                    claim: c,
-                    waited_secs: started.elapsed().as_secs(),
-                });
+        // 常驻（forever）监听「只认用户回 1」：哪怕任务在别处被 done/close/release，
+        // 或被用户在网页手动拖到列4/列5、改状态为 已解决/已完成，也继续轮询等用户回 1。
+        // 不主动停——回 1 才是唯一收尾信号，中途任务被动了不该让监听静默结束。
+        // 非 forever 的老路径（--once）保留短路：agent 明确只想等一轮外部收尾。
+        if !forever {
+            // 等待期间任务可能被别处 done/close/release 掉，那就别再等了。
+            if let Some(c) = store.get_claim(claim_id) {
+                if !c.is_active() {
+                    store.wait_drop(claim_id);
+                    return Ok(WaitOutcome::Gone {
+                        state: c.state.clone(),
+                        claim: c,
+                        waited_secs: started.elapsed().as_secs(),
+                    });
+                }
             }
-        }
 
-        // 用户在网页手动收尾（改状态为 已解决/已完成，或拖到列4/列5）→ 任务已完成，
-        // 标记本地 claim 收尾并停止等待，别再傻等评论。
-        // 30 秒查一次就够：这是一次 MCP 往返，每 5 秒查会把邮件轮询一起拖慢。
-        if last_external.elapsed().as_secs() >= 30 {
-            last_external = std::time::Instant::now();
-            if let Some(st) = external_done_state(&mut ctx, &claim.project_id, &claim.task_id) {
-                let _ = store.update_claim(claim_id, st, "用户手动收尾（改状态/拖到列4-5）");
-                let c = store.get_claim(claim_id).unwrap_or_else(|| claim.clone());
-                store.wait_drop(claim_id);
-                return Ok(WaitOutcome::Gone {
-                    state: st.to_string(),
-                    claim: c,
-                    waited_secs: started.elapsed().as_secs(),
-                });
+            // 用户在网页手动收尾（改状态为 已解决/已完成，或拖到列4/列5）→ 任务已完成，
+            // 标记本地 claim 收尾并停止等待，别再傻等评论。
+            // 30 秒查一次就够：这是一次 MCP 往返，每 5 秒查会把邮件轮询一起拖慢。
+            if last_external.elapsed().as_secs() >= 30 {
+                last_external = std::time::Instant::now();
+                if let Some(st) = external_done_state(&mut ctx, &claim.project_id, &claim.task_id) {
+                    let _ = store.update_claim(claim_id, st, "用户手动收尾（改状态/拖到列4-5）");
+                    let c = store.get_claim(claim_id).unwrap_or_else(|| claim.clone());
+                    store.wait_drop(claim_id);
+                    return Ok(WaitOutcome::Gone {
+                        state: st.to_string(),
+                        claim: c,
+                        waited_secs: started.elapsed().as_secs(),
+                    });
+                }
             }
         }
 
@@ -2706,7 +2927,7 @@ pub fn wait(
             last_mail = std::time::Instant::now();
             let imap_started = std::time::Instant::now();
             let marker = format!("[TB {claim_id}]");
-            match crate::mail::fetch_replies_since(&ctx.tb.cfg, &marker, &mut mail_scan) {
+            match imap.poll(&marker) {
                 Ok(msgs) => {
                     // 自己发出的澄清信偶尔会回到 INBOX：跳过，别当成用户回复。
                     let mails: Vec<String> = msgs
@@ -2716,6 +2937,11 @@ pub fn wait(
                     for m in &mails {
                         // 先落盘：会话还没被唤起、监听被重启，原话也还在。
                         crate::events::append(&store.root, claim_id, "mail", m);
+                    }
+                    // 收到邮件回信：无论待回复/执行中，都写唤醒握手文件，让 dsh-tba-bridge
+                    // 注入会话立刻唤醒。收尾仍由 action==Closed 走 finish 决定，互不干扰。
+                    if let Some(last) = mails.last() {
+                        write_wake_request(&store.root, claim_id, &format!("（邮件回复）\\n\\n{last}"));
                     }
                     if has_ask && !mails.is_empty() {
                         // ① 留痕：用户还是能在 Teambition 动态里看到自己回过什么。
@@ -2772,8 +2998,12 @@ pub fn wait(
                     } else if !mails.is_empty() {
                         // 执行中态不往评论里写（那是用户的回复通道，会污染下一次 ask
                         // 的时间基准），只交给 agent 看。
-                        for m in mails {
+                        for m in &mails {
                             noted.push(format!("（邮件回复）\n\n{m}"));
+                        }
+                        // 收到邮件回信：写唤醒握手，让 dsh-tba-bridge 注入会话。
+                        if let Some(last) = mails.last() {
+                            write_wake_request(&store.root, claim_id, &format!("（邮件回复）\n\n{last}"));
                         }
                     }
                 }
@@ -2788,19 +3018,34 @@ pub fn wait(
         // 只看「监听基准之后」的评论。waiting 用 ask_at（提问时刻），
         // running 用本次监听启动时刻。以前 running 干脆不读评论，那段窗口的
         // 回复全丢了——这正是「执行中也能后台更新」要补的洞。
-        let fresh: Vec<CommentInfo> = ctx
-            .read_comments(&claim.task_id)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| ts_after(&c.created, &comment_after))
-            // 邮件回信由 tba 自己写进评论留痕，不是用户新发言，别重复唤醒。
-            .filter(|c| !c.text.trim_start().starts_with("（邮件回复）"))
-            .collect();
+        // 独立节流：评论 MCP 往返 10 秒一次，不跟邮件挤同一轮，避免拖慢邮件。
+        // 节流轮 fresh 为空，后续水位/唤醒逻辑天然跳过，下次读按 created 补回。
+        let fresh: Vec<CommentInfo> = if last_comment_poll.elapsed().as_secs() >= COMMENT_POLL_SECS {
+            last_comment_poll = std::time::Instant::now();
+            ctx.read_comments(&claim.task_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| ts_after(&c.created, &comment_after))
+                // 邮件回信由 tba 自己写进评论留痕，不是用户新发言，别重复唤醒。
+                .filter(|c| !c.text.trim_start().starts_with("（邮件回复）"))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // 常驻监听不退出，水位推到本轮最新一条，下一轮才不会把同一批评论重放。
         if let Some(mx) = fresh.iter().map(|c| c.created.as_str()).max() {
             if ts_after(mx, &last_comment_ts) {
                 last_comment_ts = mx.to_string();
             }
+        }
+        if !fresh.is_empty() {
+            // 收到评论：先写唤醒握手文件（dsh-tba-bridge 插件会据此注入会话）。
+            // 以最后一条为准——用户可能先打错再改口。
+            let last_text = fresh
+                .last()
+                .map(|c| c.text.clone())
+                .unwrap_or_default();
+            write_wake_request(&store.root, claim_id, &last_text);
         }
         if !fresh.is_empty() && !has_ask {
             // 执行中态：不 resume、不改状态、不碰看板列，只记录 + 退出唤醒会话。
@@ -2817,11 +3062,26 @@ pub fn wait(
                 .unwrap_or_default();
             let (action, body) = parse_reply(&last);
             // 复用 resume：推回 进行中 + 列2，并清掉 ask_at 防止下次读重。
-            let (c, replies) = resume(store, claim_id)?;
+            // 任务已被外部收尾时 resume 会报错——但 forever 监听只认用户回 1，
+            // 不该因此崩掉：本地把 claim 拉回 running 继续听，等用户回 1 再收尾。
+            let (c, replies) = match resume(store, claim_id) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("… 回复到达时任务已被外部收尾（{e}），继续监听等用户回 1");
+                    let _ = store.patch_claim(claim_id, |c| {
+                        c.state = "running".to_string();
+                        c.ask_at = String::new();
+                    });
+                    (store.get_claim(claim_id).unwrap_or_else(|| claim.clone()), Vec::new())
+                }
+            };
             // 回复 1 = 用户明确授权收尾 → tb 直接执行。
             // （agent 自己跑 tb done 依然禁止，这里执行的是**用户**的指令。）
             let claim2 = if action == ReplyAction::Closed {
-                finish(store, claim_id, STAGE_DONE)?
+                finish(store, claim_id, STAGE_DONE).unwrap_or_else(|e| {
+                    eprintln!("… 收尾时任务已是终态（{e}），沿用当前 claim");
+                    store.get_claim(claim_id).unwrap_or(c.clone())
+                })
             } else {
                 c
             };
@@ -2854,7 +3114,10 @@ pub fn wait(
             };
             let stop = emit(&outcome);
             if closing {
-                let c = finish(store, claim_id, STAGE_DONE)?;
+                let c = finish(store, claim_id, STAGE_DONE).unwrap_or_else(|e| {
+                    eprintln!("… 收尾时任务已是终态（{e}），沿用当前 claim");
+                    store.get_claim(claim_id).unwrap_or(claim.clone())
+                });
                 let done = WaitOutcome::Replied {
                     claim: c,
                     replies: Vec::new(),
@@ -4029,11 +4292,11 @@ fn workflow_text_zh(
     ));
 
     // 第 4 步：做完必须交回用户。ask 自带等待，所以是两步不是三步。
-    // 旧文案要求「前台阻塞 10 分钟、绝不结束会话」，那是当年兜 78s SIGTERM 的土办法。
-    // 现在 ask 常驻不超时退出，前台窗口只留 60 秒让工具把进程转后台（不杀），
-    // agent 本轮回复可以正常结束，收到回复时 task-notification 会把会话拉起来。
+    // DSH 等 harness 的唤醒机制是「后台 job 退出 → task-notification 唤醒会话」，
+    // 所以 ask / wait 都用 run_in_background 跑：前台等待者活在 DSH job 里，
+    // 它退出 = job 完成 = 唤醒。别前台阻塞跑（等信期间 agent 卡死，超时被杀就收不到唤醒）。
     // 调用姿势单独抽出来，两个分支共用，免得只改一处、文案分叉。
-    let ask_posture = "**ask 调用姿势**：关 Sandbox（`dangerouslyDisableSandbox: true`）+ `timeout: 60000`。前台窗口到点工具自动把命令转后台（**不杀进程**）；agent 本轮回复正常结束即可。**常驻监听一直跑到用户回 1 才停，执行中也不中断**；用户回邮件/评论后前台等待者退出 → task-notification 唤醒会话，监听继续。**每轮被唤醒后继续干活前，先挂一条后台 `tba wait <claim_id>`**，下一条回复才能再唤醒会话，别等干完才 ask。**只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，绝不能当成收尾确认。**会话窗直接回**：用户在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。禁止 `--no-wait`。";
+    let ask_posture = "**ask 调用姿势（DSH 等 harness）**：`tba ask <claim_id> --done` 和 `tba wait <claim_id>` 都必须用 `run_in_background` 跑——让前台等待者活在后台 job 里，它退出 = job 完成 = 唤醒会话。**常驻监听一直跑到用户回 1 才停，执行中也不中断**；用户回邮件/评论后前台等待者退出 → task-notification 唤醒会话，监听继续。**每轮被唤醒后继续干活前，先挂一条后台 `tba wait <claim_id>`**，下一条回复才能再唤醒会话，别等干完才 ask。**只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，绝不能当成收尾确认。会话窗直接回：用户在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。禁止 `--no-wait`；禁止前台阻塞跑 ask/wait（等信期间 agent 卡死）。详见 AGENTS.md 入口块的「DSH 后台唤醒配方」。";
     if memory_on {
         s.push_str(&format!(
             "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题，自定义选项从 3 起编号；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
@@ -4122,8 +4385,8 @@ fn workflow_text(
     ));
 
     let handoff = format!(
-        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\"`; (b) `{exe} ask <claim_id> --done` (1=close/2=memory first/3+=still broken, custom options numbered from 3; -> {0} + column \"{1}\", mail sent; BLOCKS in foreground - NEVER run_in_background, never end session). Run ask with sandbox OFF (`dangerouslyDisableSandbox: true`) and `timeout: 600000`: sandbox SIGTERMs a blocking ask at ~78s. On foreground timeout the tool auto-backgrounds it; the user's reply ends ask and a task-notification wakes the agent. NEVER set run_in_background yourself, never `--no-wait`. NEVER stop in {2} - the user's reply would go unread. The detached listener keeps polling until reply 1 (running state included); every new reply wakes the session. After each wake-up, start a background `tba wait <claim_id>` before working. ",
-        STAGE_WAIT, cfg.tasklist_wait, STAGE_DOING
+        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\")`; (b) `{exe} ask <claim_id> --done` (1=close/2=memory first/3+=still broken, custom options numbered from 3; -> {0} + column \"{1}\", mail sent). On DSH-style harnesses run BOTH `tba ask <claim_id> --done` and `tba wait <claim_id>` with `run_in_background`: the foreground waiter lives inside the background job, and its exit = job done = task-notification wakes the session. NEVER block in foreground (the agent hangs waiting and gets killed on timeout, so no wake fires). NEVER `--no-wait`. The detached listener keeps polling until reply 1 (running state included); every new reply wakes the session. After each wake-up, start a background `tba wait <claim_id>` before working. See the AGENTS.md entry block 'DSH 后台唤醒配方' for the exact recipe. ",
+        STAGE_WAIT, cfg.tasklist_wait
     );
 
     let close_rule = format!(
@@ -4787,13 +5050,19 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，\
          拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。\n\
          **只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，别当收尾确认。\n\
-         **调用**：直接 `tba ask <claim_id> --done`（关沙箱 / timeout 都不用管；监听已 detached 自愈）。\
+         **调用**：`tba ask <claim_id> --done` 用 `run_in_background` 跑（监听已 detached 自愈；不要前台阻塞跑）。\
          收到回复自动唤起会话；会话窗直接回就先 `tba reply <claim_id>`。\n\
          **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、\
          看不到它，所以先跑 `{exe} reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。\n\
          禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
-         **通用能力**（别自己拼脚本）：`doctor` 环境自检 / \
-         `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / \
+          **DSH 后台唤醒配方（重要）**：DSH 只有「后台 job 退出 -> task-notification 唤醒会话」一条唤醒通道。\n\
+          所以下面的命令都必须用 `run_in_background` 跑，让前台等待者活在 DSH job 里——它退出 = job 完成 = 唤醒。\n\
+          ① 领完任务、要问用户：`{exe} ask <claim_id> --done`（**run_in_background**），spawn detached 监听 + 挂前台等待者。\n\
+          ② 被唤醒、干完活、还要等下一条回复：`{exe} wait <claim_id>`（**run_in_background**，不发信），续接等待者。\n\
+          ③ 用户回 1：监听自己 finish + 退出 -> 最后唤醒，你按输出收尾。\n\
+          禁忌：`ask` 重跑（重复发信）；`--no-wait`（不挂等待者，永不唤醒）；前台阻塞跑 ask/wait（等信期间 agent 卡死）。\n\n\
+          **通用能力**（别自己拼脚本）：`doctor` 环境自检 / \
+          `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / \
          `publish` 发版 / `shot` 截图。先 `{exe} --help`。\n"
     );
 
@@ -4847,7 +5116,10 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         && old.contains("监听一直跑到用户回 1")
         // 「会话窗直接回」是 v0.2.29 后台挂起文案的版本号：老入口还写着
         // 「前台阻塞 / 绝不结束会话」，缺这句就整段重写一次。
-        && old.contains("会话窗直接回");
+        && old.contains("会话窗直接回")
+        // v0.2.39 DSH 唤醒配方版本号：老入口没写「run_in_background 跑 ask/wait」，
+        // 缺这句就整段重写，否则 agent 在 DSH 里前台阻塞跑 ask/wait，回信后收不到唤醒。
+        && old.contains("DSH 后台唤醒配方");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
     let ultracave_ok = old.matches(ULTRACAVE_MARK).count() == 1;
 
@@ -4900,8 +5172,8 @@ fn claim_header(c: &Claim, exe: &str) -> String {
          ⚠ 做完必须交回，两步不许省：\n  \
          {exe} note {} --text \"改了什么/怎么验\"\n  \
          {exe} ask {} --done\n\
-         ask 发信后常驻监听一直跑到你回 1，执行中也不停：关 Sandbox（dangerouslyDisableSandbox: true）+ timeout: 60000；\
-         前台窗口到点自动转后台，每条新回复触发 task-notification 唤醒续接；\
+           ask 发信后常驻监听一直跑到你回 1，执行中也不停，每条新回复触发 task-notification 唤醒续接；\n\
+          领完任务要问用户用 `run_in_background` 跑 `{exe} ask`；被唤醒后继续干活前先挂一条后台 `{exe} wait`（不发信）。\n\
          被唤醒后继续干活先挂一条后台 {exe} wait <claim_id>。\
          会话窗直接回也行，先跑 {exe} reply <claim_id> 推回「进行中」。\
          禁止 --no-wait；只有用户能收尾。\n",
@@ -5075,119 +5347,6 @@ pub fn agent_prompt_from(
 ) -> String {
     prompt_body(store, project_id, project_name, skills, draft, None, lang)
 }
-
-    /// 派子代理用的自包含简报。
-    ///
-    /// tba 本身是 CLI，调不了 DSH 的 subagent 工具，所以这里只负责：领/取一条任务，
-    /// 把任务正文 + 项目上下文 + 子代理职责 + 主代理收尾指引拼成一份简报打印出来，
-    /// 由主代理读这份简报、调 subagent 工具完成真正的派发。
-    ///
-    /// 子代理拿到简报就能独立干活并交回；收尾（done/close/ask）是主代理的职责，
-    /// 不让子代理做——红线只有用户能收尾，子代理更不行。
-    pub fn subagent_brief(
-        store: &Store,
-        claim: &Claim,
-        body: &str,
-        skills: &[SkillItem],
-        lang: Lang,
-    ) -> String {
-        let cfg = store.load_config();
-        let exe = prompt_exe_of(&cfg);
-        let zh = lang == Lang::Zh;
-        let proj_name = store
-            .load_projects_cache()
-            .into_iter()
-            .find(|(id, _)| id == &claim.project_id)
-            .map(|(_, n)| n)
-            .unwrap_or_else(|| claim.project_id.clone());
-        let mut s = String::new();
-        if zh {
-            s.push_str(r#"===== 给子代理的任务简报（自包含，直接贴给 subagent）=====
-
-"#);
-        } else {
-            s.push_str(r#"===== Subagent brief (self-contained, paste to subagent) =====
-
-"#);
-        }
-        s.push_str(&format!("## 子任务：{}
-
-", claim.task_name));
-        s.push_str(&format!(
-            "claim_id: {}
-项目:  {}
-任务链接: https://www.teambition.com/task/{}
-
-",
-            claim.claim_id, claim.project_id, claim.task_id
-        ));
-        if !body.trim().is_empty() {
-            s.push_str(if zh { "## 任务正文
-" } else { "## Task body
-" });
-            s.push_str(body.trim());
-            s.push_str("
-
-");
-        }
-        // 项目上下文（能力 + skill 索引）复用开工文案的同款内容，本地就能生成。
-        s.push_str(&prompt_head(store, &claim.project_id, &proj_name, skills, None, lang, false));
-        s.push_str(&subagent_workflow_text(&exe, &claim.claim_id, lang));
-        // 主代理收尾指引：只有主代理能 done/close/ask。
-        s.push_str("
-===== 主代理收尾指引（你来做，别让子代理做）=====
-");
-        if zh {
-            s.push_str(&format!(
-                r#"子代理回报后，按 claim_id 收尾（只有你能 done/close）：
-  {exe} note {id} --text "改了什么/怎么验"
-  {exe} ask {id} --done
-"#,
-                exe = exe, id = claim.claim_id
-            ));
-        } else {
-            s.push_str(&format!(
-                r#"After the subagent reports back, close it yourself (only you may done/close):
-  {exe} note {id} --text "what changed / how verified"
-  {exe} ask {id} --done
-"#,
-                exe = exe, id = claim.claim_id
-            ));
-        }
-        s
-    }
-
-    /// 子代理专属流程说明：任务已认领，它只需干活 + 写备注 + 回报，不碰收尾。
-    fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
-        if lang == Lang::Zh {
-            return format!(
-                r##"## 你的职责
-1. 只改完成这个任务必须改的，遵循项目编码纪律（见上方上下文）。
-2. 干完把「改了什么/怎么验」写进任务备注（不是评论）：
-  {exe} note {id} --text "改了什么/怎么验"
-3. 有拿不准的，用 `{exe} ask {id} -q "你的问题"` 进入「待回复」问用户，等回复再继续。
-   不要自己假设后硬干。
-4. 不要自己 done / close —— 收尾（done/close）由主代理/用户做，你只管干活和提问。
-
-## 交回主代理
-回报：改了什么、验证了什么、还剩什么。主代理用 claim_id（{id}）收尾。"##,
-                exe = exe, id = claim_id
-            );
-        }
-        format!(
-            r##"## Your job
-1. Change only what this task requires; follow the project coding rules above.
-2. When done, write "what changed / how verified" to the task note (not a comment):
-  {exe} note {id} --text "what changed / how verified"
-3. If unsure, use `{exe} ask {id} -q "your question"` to enter "waiting" and ask the user; continue after reply.
-   Do not guess and plow ahead.
-4. Do NOT done / close yourself - closing is the main agent's / user's job. You only work and ask.
-
-## Hand back to main agent
-Report: what changed, what you verified, what remains. Main agent closes via claim_id ({id})."##,
-            exe = exe, id = claim_id
-        )
-    }
 
 #[cfg(test)]
 mod tests {
@@ -5487,12 +5646,16 @@ mod tests {
 
         // 附言要带出来，但去掉数字前缀；废弃的 0 原文原样保留
         assert_eq!(parse_reply("0 可以了").1, "0 可以了");
-        assert_eq!(parse_reply("2. 还是报错").1, "还是报错");
+
+        // 正文带标点/汉字一律不算动作号：整条原文交回 agent
+        assert_eq!(parse_reply("2. 还是报错").1, "2. 还是报错");
+        assert_eq!(parse_reply("2. 还是报错").0, ReplyAction::Free);
 
         // 不认：数字不在开头 / 后面跟字母 / 正文还有数字（有歧义）/ 空
         assert_eq!(parse_reply("好的，0").0, ReplyAction::Free);
         assert_eq!(parse_reply("0abc").0, ReplyAction::Free);
-        assert_eq!(parse_reply("1 和 2 都做了").0, ReplyAction::Closed);
+        assert_eq!(parse_reply("1 和 2 都做了").0, ReplyAction::Free);
+        assert_eq!(parse_reply("测试中途唤醒1").0, ReplyAction::Free);
         assert_eq!(parse_reply("把那个函数也改一下").0, ReplyAction::Free);
         assert_eq!(parse_reply("").0, ReplyAction::Free);
 
@@ -5829,8 +5992,8 @@ mod tests {
         assert!(h.contains("tba note clm-x --text"), "缺 note 命令: {h}");
         assert!(h.contains("tba ask clm-x --done"), "缺 ask 命令: {h}");
         assert!(
-            h.contains("会话窗直接回也行") && h.contains("timeout: 60000"),
-            "缺后台挂起 + 会话窗回复的新姿势: {h}"
+            h.contains("会话窗直接回也行") && h.contains("run_in_background"),
+            "缺后台挂起（run_in_background）+ 会话窗回复的新姿势: {h}"
         );
 
         // 提示必须在 claim_id 之后、紧跟其后——不能沉到正文后面去。
@@ -5950,5 +6113,83 @@ mod tests {
         assert!(got.contains("1 = 已解决"), "字段里缺回复选项");
         assert!(got.contains(&c.task_id), "字段里缺任务链接");
         assert!(got.contains("长".repeat(4000).as_str()), "长正文被截断");
+    }
+
+    // 全角数字 １ 与邮件落款 RR / 邮箱地址：实测用户回信里带这两样，
+    // 旧版会把 １ 判成 Free、把落款带进 feed，导致不收尾且误导 agent。
+    #[test]
+    fn reply_fullwidth_digit_and_mail_signature() {
+        // 半角 1
+        let (a, body) = parse_reply("1\nRR\n1729128196@qq.com");
+        assert_eq!(a, ReplyAction::Closed);
+        assert!(body.trim().is_empty(), "落款不该留在正文: {body:?}");
+
+        // 全角 １
+        let (a, body) = parse_reply("１\nRR\n1729128196@qq.com");
+        assert_eq!(a, ReplyAction::Closed, "全角 １ 应识别为收尾");
+        assert!(body.trim().is_empty(), "全角场景落款不该留在正文: {body:?}");
+
+        // 全角 ２ / ３
+        assert_eq!(parse_reply("２").0, ReplyAction::Summarize);
+        assert_eq!(parse_reply("３").0, ReplyAction::Custom(3));
+
+        // 落款单独剥离
+        let stripped = strip_reply_noise("（邮件回复）\n1\nRR\n1729128196@qq.com");
+        assert!(!stripped.contains("RR"));
+        assert!(!stripped.contains("1729128196@qq.com"));
+        assert!(stripped.contains('1'));
+
+        // 连续多位数字仍跳过，别误判
+        assert_eq!(parse_reply("2026").0, ReplyAction::Free);
+
+        // 邮件通道真实格式：tba 用 （邮件回复）\n\n{body} 包一层，
+        // body 只写 1 时，strip 掉标记行后恰好是 1 → 收尾
+        assert_eq!(parse_reply("（邮件回复）\n\n1").0, ReplyAction::Closed);
+        assert_eq!(parse_reply("（邮件回复）\n\n１").0, ReplyAction::Closed);
+        // 但正文带了别的字（哪怕只是标点）就不是动作号
+        assert_eq!(parse_reply("（邮件回复）\n\n1.").0, ReplyAction::Free);
+        assert_eq!(parse_reply("（1）").0, ReplyAction::Free);
+        assert_eq!(parse_reply("1.").0, ReplyAction::Free);
+        assert_eq!(parse_reply("测试中途唤醒1").0, ReplyAction::Free);
+    }
+
+    // 自愈重拉的监听继承不到 DSH_SESSION_ID，必须靠 asks 落盘的 .session 文件。
+    // 这条是「无 env、有 .session 文件」路径的回归测试：session 取自文件而非 env。
+    #[test]
+    fn wake_session_id_from_session_file_not_env() {
+        let tmp = std::env::temp_dir().join(format!("tba-wake-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let root = tmp.join("data");
+        let _ = std::fs::create_dir_all(&root);
+        // 模拟 ask 落盘：waits/<claim>.session
+        let waits = root.join("waits");
+        let _ = std::fs::create_dir_all(&waits);
+        std::fs::write(waits.join("clm-x.session"), "session-from-file").unwrap();
+        // 关键：清空 env，模拟自愈监听进程；测完还原，避免污染并行测试。
+        let prev_sid = std::env::var("DSH_SESSION_ID").ok();
+        std::env::remove_var("DSH_SESSION_ID");
+
+        write_wake_request(&root, "clm-x", "hi");
+        let wake = root.join("wakes").join("session-from-file.json");
+        let got = std::fs::read_to_string(&wake).unwrap();
+        assert!(
+            got.contains("session-from-file"),
+            "无 env 时应从 .session 文件取 session id, 实际: {got}"
+        );
+
+        // 文件也没、env 也没：不该写任何 wake 文件
+        let root2 = tmp.join("data2");
+        let _ = std::fs::create_dir_all(&root2);
+        write_wake_request(&root2, "clm-y", "hi");
+        assert!(
+            !root2.join("wakes").exists(),
+            "既无 env 又无 .session 文件时不应写 wake"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // 还原 env，避免污染并行测试
+        if let Some(v) = prev_sid {
+            std::env::set_var("DSH_SESSION_ID", v);
+        }
     }
 }

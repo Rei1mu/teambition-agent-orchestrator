@@ -224,6 +224,14 @@ pub struct Config {
     #[serde(default)]
     pub but_path: String,
 
+    // ---- git 位置（可选）----
+    //
+    // 留空 = 用 PATH 里的 git。装了多个 git（Git for Windows / GitButler 自带 / scoop 版）
+    // 挑错版本会出稀奇古怪的问题，指定一次最稳。环境变量 TBA_GIT 仍可临时覆盖。
+    #[serde(default)]
+    pub git_path: String,
+
+
     // 会话心跳阈值（秒）。running 超时未续命 -> 判定会话断开 -> 回滚到 未完成+列1。
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout_secs: u64,
@@ -305,6 +313,7 @@ impl Default for Config {
             tasklist_closed: default_tasklist_closed(),
             tool_path: String::new(),
             but_path: String::new(),
+            git_path: String::new(),
             heartbeat_timeout_secs: default_heartbeat_timeout(),
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
@@ -363,6 +372,8 @@ impl Config {
             _ => self.offline,
         }
     }
+    
+
 }
 
 // 本地 skill 开关。project_id -> (skill 名 -> 开关)。只存本地。

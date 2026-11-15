@@ -614,6 +614,129 @@ pub fn fetch_replies_since(
     Ok(out)
 }
 
+// 常驻监听用的 IMAP 长连接。
+//
+// fetch_replies_since 每轮都 connect + TLS 握手 + LOGIN + SELECT + LOGOUT，
+// QQ IMAP 这一串实测十几到三十秒，是「回邮件后等半分钟」的主因。
+// ImapSession 把连接提到 wait() 循环外层：建连一次，之后每轮只发
+// UID SEARCH（+ 命中时 FETCH），通常 1 秒内。连接断开时自动重连。
+pub struct ImapSession {
+    cfg: Config,
+    s: Option<BufReader<Box<dyn Stream>>>,
+    scan: MailScan,
+    validity: String,
+}
+
+impl ImapSession {
+    /// 用已有的去重水位初始化（ask 时记下的提问水位要带过来）。
+    pub fn new(cfg: Config, scan: MailScan) -> Self {
+        ImapSession { cfg, s: None, scan, validity: "-".to_string() }
+    }
+
+    fn open(&mut self) -> Result<(), String> {
+        let host = self.cfg.imap_host.trim();
+        if host.is_empty() {
+            return Err("没配 IMAP 服务器（收邮件必需，SMTP 收不到回信）".to_string());
+        }
+        let stream = connect(host, self.cfg.imap_port, true)?;
+        let mut s = BufReader::new(stream);
+        expect_ok(&mut s, "*")?; // 问候语
+        imap_cmd(
+            &mut s,
+            "a1",
+            &format!(
+                "LOGIN {} {}",
+                quote(self.cfg.smtp_user.trim()),
+                quote(&self.cfg.smtp_pass)
+            ),
+        )?;
+        let select = imap_cmd(&mut s, "a2", "SELECT INBOX")?;
+        self.validity = bracket_value(&select, "UIDVALIDITY").unwrap_or_else(|| "-".to_string());
+        self.s = Some(s);
+        Ok(())
+    }
+
+    /// 轮询一轮：返回带 marker 的用户回复原话（已剥落款/引用）。
+    /// 任何一步 I/O 失败都丢弃连接，下一轮重连；去重水位在 scan 里保留。
+    pub fn poll(&mut self, marker: &str) -> Result<Vec<String>, String> {
+        let all = self.poll_all()?;
+        Ok(all
+            .into_iter()
+            .filter(|(subject, body, _)| marker_hit(subject, marker) || marker_hit(body, marker))
+            .map(|(_, body, _)| clean_reply(&body, marker))
+            .collect())
+    }
+
+    /// 聚合器用：一轮取回所有新信的 (主题, 原始正文, uid)，不过滤 marker。
+    /// 由调用方按各 claim 的 `[TB <claim_id>]` 分发。
+    pub fn poll_all(&mut self) -> Result<Vec<(String, String, String)>, String> {
+        if self.s.is_none() {
+            self.open()?;
+        }
+        let mut s = self.s.take().unwrap();
+        let res = poll_stream_all(&mut s, &self.validity, &mut self.scan);
+        match res {
+            Ok(out) => {
+                self.s = Some(s);
+                Ok(out)
+            }
+            Err((e, retry)) => {
+                for uid in retry {
+                    self.scan.scanned.remove(&uid);
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+// 在一条已登录/已 SELECT 的连接上跑一轮 SEARCH + FETCH。
+// 返回所有新信的 (主题, 原始正文, uid)，marker 过滤交给调用方（聚合器要按各 claim 分发）。
+// 返回 Err 时附带「取信失败需下轮重试的 UID」，外层据此从去重表摘掉。
+fn poll_stream_all(
+    s: &mut BufReader<Box<dyn Stream>>,
+    validity: &str,
+    scan: &mut MailScan,
+) -> Result<Vec<(String, String, String)>, (String, Vec<String>)> {
+    let search = imap_cmd(s, "a3", "UID SEARCH UNSEEN")
+        .map_err(|e| (e, Vec::new()))?;
+    let min_uid = scan.begin_round(validity);
+    let uids: Vec<String> = search
+        .lines()
+        .find(|l| l.starts_with("* SEARCH"))
+        .map(|l| {
+            l.trim_start_matches("* SEARCH")
+                .split_whitespace()
+                .map(|x| x.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let candidates = only_after_watermark(&uids, min_uid);
+    let batch = take_new_uids(&candidates, scan);
+
+    let mut out = Vec::new();
+    let mut retry = Vec::new();
+    for (i, uid) in batch.iter().enumerate() {
+        let raw = match imap_fetch(s, &format!("b{}", i + 1), uid) {
+            Ok(r) => r,
+            Err(e) => {
+                retry.push(uid.clone());
+                eprintln!("IMAP 取信 {uid} 失败（下一轮重试）: {e}");
+                return Err((e, retry));
+            }
+        };
+        let (subject, body) = parse_message(&raw);
+        out.push((subject, body, uid.clone()));
+        // 取到就标已读，避免下轮重扫；失败不致命，scan.scanned 已经去重。
+        let _ = imap_cmd(
+            s,
+            &format!("c{i}"),
+            &format!("UID STORE {uid} +FLAGS (\\Seen)"),
+        );
+    }
+    Ok(out)
+}
+
 fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -710,7 +833,7 @@ fn imap_fetch(s: &mut BufReader<Box<dyn Stream>>, tag: &str, uid: &str) -> Resul
 // fetch_replies 用完整 claim_id 做精确 contains，一断就永远匹配不上，
 // 邮件回复全被静默丢在 INBOX，wait 只能等 Teambition 评论 —— 表现就是
 // 「后台任务没监听到邮件，也没有重新唤起」。
-fn marker_hit(text: &str, marker: &str) -> bool {
+pub fn marker_hit(text: &str, marker: &str) -> bool {
     if text.contains(marker) {
         return true;
     }
@@ -721,7 +844,7 @@ fn marker_hit(text: &str, marker: &str) -> bool {
 
 // 把回信正文清理成用户新增的话：去掉 marker 行，再剥掉引用/转发/任务备注。
 // 剥离规则与评论通道共用，见 ops::strip_reply_noise。
-fn clean_reply(body: &str, marker: &str) -> String {
+pub fn clean_reply(body: &str, marker: &str) -> String {
     let kept: Vec<&str> = body
         .lines()
         .filter(|l| !marker_hit(l, marker) && !l.trim().is_empty())
@@ -1100,7 +1223,8 @@ mod tests {
     fn folded_marker_reply_still_yields_digit() {
         let marker = "[TB clm-18e572b5cd938980-0]";
         let body = "[TB clm-18e572b5cd938 980-0] 收到\n2\nRR\n1729128196@qq.com\n\n> 引用原文";
-        assert_eq!(clean_reply(body, marker), "2\nRR\n1729128196@qq.com");
+        // 落款 RR / 邮箱行已被 strip_reply_noise 剥掉（去尾注），只剩用户回的 2
+        assert_eq!(clean_reply(body, marker), "2");
         assert_eq!(
             crate::ops::parse_reply_num(&clean_reply(body, marker)),
             Some(2),

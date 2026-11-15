@@ -479,6 +479,16 @@ pub fn serve(store: &Store) -> Result<(), String> {
             }
         });
     }
+    // 聚合监听：单线程 + 1 条 IMAP 长连接，管所有 active claim 的邮件/评论/状态流转。
+    // 取代旧的 per-claim detached `wait --listen`（N 条连接互相挤、慢且被限流）。
+    // 与心跳共用 alive：serve 退出（stdin 关闭）时两个线程一起停。
+    {
+        let aggr_store = store.clone();
+        let aggr_alive = alive.clone();
+        std::thread::spawn(move || {
+            crate::aggregator::run_aggregator(aggr_store, aggr_alive);
+        });
+    }
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

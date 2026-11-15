@@ -123,6 +123,10 @@ pub const BODY_GIT: &str = "\
 ## 仓库还不存在 / 没连到 GitHub
 先 `tba git create`，别自己拼 `git remote add`，也别去装 `gh`。
 详见 `tba cap git-create`。
+
+## 这些工具的指定位置
+- git：设置页没单独字段，但 `git` 本身挑错版本会出怪问题。config.toml 的 `git_path` 可写死 git 路径（环境变量 TBA_GIT 也可临时覆盖）。
+- GitButler CLI：设置页「GitButler」卡可「选择 but.exe 位置」；或用 `tba gitbutler set --path`。
 ";
 
 pub const BODY_GIT_CREATE: &str = "\
@@ -194,6 +198,14 @@ CI 绿了再给用户地址：`https://github.com/<owner>/<repo>/releases/tag/vX
 - CI 没绿不许说「已发布」。
 - 版本号只升不降；已有 tag 默认拒绝重打。
 - 打包脚本改了，先本地打一次包再打 tag。
+
+## 编译环境（编 Windows 软件 / DLL 用）
+- 编 Windows 原生程序 / DLL 必须 **MSVC** 工具链（link.exe + Windows SDK 的库）。
+- 位置在**设置页「编译工具链（MSVC / Windows SDK）」**管理：默认自动探测（vswhere 找 VS + Windows Kits），
+  也能手动指定；没装会在卡片和 `tba doctor` 里给安装地址。
+- 设定后位置存 `data/toolchain.toml`，`tba doctor` 的 msvc / wsdk 行能看到实际生效值。
+- **编译前先查这些位置**（agent 别盲目扫盘）：把 `msvc_bin` 加进 PATH、`msvc_lib` + `winsdk_libs` 加进 LIB，
+  再 `cargo build` / `cl.exe`。装了多个 VS/SDK 版本或装在非标准位置时，扫盘必挑错。
 ";
 
 pub const BODY_GUI: &str = "\
