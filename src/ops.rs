@@ -2749,7 +2749,7 @@ pub enum WaitOutcome {
         waited_secs: u64,
     },
     // 「执行中」期间收到用户回复：不改任务状态，只把原文交给 agent 决定。
-    // 常驻监听继续轮询，前台等待者读到这条摘要后退出并唤醒会话。
+    // 常驻监听继续轮询，聚合器写 wakes/ 并让 bridge 唤醒会话。
     Noted {
         claim: Claim,
         replies: Vec<String>,
@@ -2847,23 +2847,19 @@ pub fn subagent_brief(
     // 项目上下文（能力 + skill 索引）复用开工文案的同款内容，本地就能生成。
     s.push_str(&prompt_head(store, &claim.project_id, &proj_name, skills, None, lang, false));
     s.push_str(&subagent_workflow_text(&exe, &claim.claim_id, lang));
-    // 主代理收尾指引：只有主代理能 done/close/ask。
+    // 主代理收尾指引：子代理自己 note+ask，主代理只做最终确认。
     s.push_str("
 ===== 主代理收尾指引（你来做，别让子代理做）=====
 ");
     if zh {
         s.push_str(&format!(
-            r#"子代理回报后，按 claim_id 收尾（只有你能 done/close）：
-  {exe} note {id} --text "改了什么/怎么验"
-  {exe} ask {id} --done
+            r#"子代理已用 CLI `tba ask`/`tba reply`/`tba events` 走完待回复交互并把结论写进任务备注。你只做最终确认：读回备注与回复，核对产物。done/close 仍只由用户回 1 触发聚合器 finish，主代理不自己 done/close。{exe} note {id} --text "最终确认" 可选。
 "#,
             exe = exe, id = claim.claim_id
         ));
     } else {
         s.push_str(&format!(
-            r#"After the subagent reports back, close it yourself (only you may done/close):
-  {exe} note {id} --text "what changed / how verified"
-  {exe} ask {id} --done
+            r#"The subagent drives the waiting-reply loop via CLI `tba ask`/`tba reply`/`tba events` and writes results into the task note. You only confirm: read the note and replies, check artifacts. done/close still happens only when the user replies 1 (aggregator finish); main agent never runs done/close itself. Optional: {exe} note {id} --text "final confirmation".
 "#,
             exe = exe, id = claim.claim_id
         ));
@@ -2873,7 +2869,7 @@ pub fn subagent_brief(
     s
 }
 
-/// 子代理专属流程说明：任务已认领，它只需干活 + 写备注 + 回报，不碰收尾。
+/// 子代理专属流程说明：任务已认领，它自己用 CLI 走待回复交互 + 写备注 + 回报，不碰 done/close。
 fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
     if lang == Lang::Zh {
         return format!(
@@ -2881,8 +2877,9 @@ fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
 1. 只改完成这个任务必须改的，遵循项目编码纪律（见上方上下文）。
 2. 干完把「改了什么/怎么验」写进任务备注（不是评论）：
   {exe} note {id} --text "改了什么/怎么验"
-3. 不要自己 done / close，也不要自己 ask —— 收尾和提问都归主代理（你调不了 DSH 的回复交互）。
-4. 有拿不准的，把疑问写进备注并回报主代理，由主代理去问用户；不要自己假设后硬干。
+3. 自己用 CLI 走待回复交互：要问用户就 `{exe} ask {id} -q "问题（纯文本选项，从 3 起编号；1/2 系统保留）"`，收尾确认可 `{exe} ask {id} --done`；收到回复先 `{exe} reply {id}` 推回「进行中」，再看 `{exe} events --claim {id}` 读回原话。**禁用 DSH 的 ask_user_question 选择框/弹窗（禁用 DSH 选择框/ask_user），禁止 MCP `{exe} ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧主代理）。只用 CLI，回复会唤醒你自己的会话。
+4. 不要自己 done / close —— 用户回 1 后由 tba serve 聚合器自动 finish，不放给子代理；主代理保留重挂 `tba sub`、派活和最终确认。
+5. 有拿不准的，自己用上面的 `tba ask -q` 问用户（纯文本选项从 3 起），别假设后硬干；同时把疑问写进备注并回报主代理。
 
 ## 提交推送 / 上传 GitHub：只走 tba
 - 提交推送只跑 `{exe} git main -m "改了什么"`，推之前 `{exe} git status`；要看会跑什么加 `--dry`。
@@ -2901,8 +2898,9 @@ fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
 1. Change only what this task requires; follow the project coding rules above.
 2. When done, write "what changed / how verified" to the task note (not a comment):
   {exe} note {id} --text "what changed / how verified"
-3. Do NOT done / close yourself, and do NOT ask - closing and asking are the main agent's job (you can't drive DSH's reply loop).
-4. If unsure, write the question into the note and report back to the main agent; the main agent asks the user. Do not guess and plow ahead.
+3. Drive the waiting-reply loop yourself via CLI: `{exe} ask {id} -q "question (plain-text options numbered from 3; 1/2 reserved)"` or `{exe} ask {id} --done` for the final check; on a reply run `{exe} reply {id}` (back to in-progress) then `{exe} events --claim {id}` to read it. NEVER use DSH's ask_user_question picker/modal (禁用 DSH 选择框/ask_user), NEVER use MCP `{exe} ask_user` (serve has no DSH_SESSION_ID and may wake the old main session). CLI only; the reply wakes your own session.
+4. Do NOT done / close yourself - user reply 1 makes the tba serve aggregator finish it; closing is not delegated to subagents. Main agent keeps re-hanging `tba sub`, dispatching, and final confirmation.
+5. If unsure, ask the user yourself with `tba ask -q` (plain-text options from 3), and also write the question into the note and report back to the main agent. Do not guess and plow ahead.
 
 ## Commit / push / upload to GitHub: tba only
 - To commit & push run only `{exe} git main -m "what changed"`; check `{exe} git status` first; add `--dry` to preview.
@@ -4419,16 +4417,13 @@ fn workflow_text_zh(
     // 第 3 步：数字协议由 tb 执行（agent 不解释、不跑 done），只有 1 收尾。
     // ask 默认挂后台常驻监听，所以这里不再有单独的 wait 一步。
     s.push_str(&format!(
-        "3. 要用户输入：`{exe} ask <claim_id> -q \"问题（写清数字含义）\"`（问题进备注，转「{0}」+列「{1}」，发邮件，**问完后台常驻监听，本轮回复可正常结束**）。回复数字 tb 自动处理：1=已解决→列{3}收尾；2=先写项目记忆→列{2}，写完再ask；3+=有问题→列{2}；非数字=按原文→列{2}；0 已废弃，按原文不收尾。只有1收尾，其余回列{2}。只等别重复问。自定义问题里选项必须从 3 起编号（3/4/5…），1/2 是系统保留号（1=收尾 2=写记忆，tb 直接执行），拿来当自己的选项会导致用户回 1 被误收尾，tba 会拒绝发这种问题。选项用纯文本编号，禁用选择框/弹窗。\n",
+        "3. 要用户输入：`{exe} ask <claim_id> -q \"问题（纯文本选项，从 3 起编号）\"`（问题进备注，转「{0}」+列「{1}」，发邮件，立即返回；回复监听由 tba serve 聚合器统一托管）。回复数字 tb 自动处理：1=已解决→列{3}收尾；2=先写项目记忆→列{2}，写完再ask；3+=有问题→列{2}；非数字=按原文→列{2}；0 已废弃，按原文不收尾。只有1收尾，其余回列{2}。只等别重复问。自定义问题里选项必须从 3 起编号（3/4/5…），1/2 是系统保留号（1=收尾 2=写记忆，tb 直接执行），拿来当自己的选项会导致用户回 1 被误收尾，tba 会拒绝发这种问题。选项用纯文本编号，禁用选择框/弹窗，禁用 DSH ask_user_question。\n",
         STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
     ));
 
-    // 第 4 步：做完必须交回用户。ask 自带等待，所以是两步不是三步。
-    // DSH 等 harness 的唤醒机制是「后台 job 退出 → task-notification 唤醒会话」，
-    // 所以 ask / wait 都用 run_in_background 跑：前台等待者活在 DSH job 里，
-    // 它退出 = job 完成 = 唤醒。别前台阻塞跑（等信期间 agent 卡死，超时被杀就收不到唤醒）。
+    // 第 4 步：做完必须交回用户。ask 立即返回，回复由聚合器握手唤醒会话。
     // 调用姿势单独抽出来，两个分支共用，免得只改一处、文案分叉。
-    let ask_posture = "**ask 调用姿势（DSH 等 harness）**：`tba ask <claim_id> --done` 和 `tba wait <claim_id>` 都必须用 `run_in_background` 跑——让前台等待者活在后台 job 里，它退出 = job 完成 = 唤醒会话。**常驻监听一直跑到用户回 1 才停，执行中也不中断**；用户回邮件/评论后前台等待者退出 → task-notification 唤醒会话，监听继续。**每轮被唤醒后继续干活前，先挂一条后台 `tba wait <claim_id>`**，下一条回复才能再唤醒会话，别等干完才 ask。**只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，绝不能当成收尾确认。会话窗直接回：用户在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。禁止 `--no-wait`；禁止前台阻塞跑 ask/wait（等信期间 agent 卡死）。详见 AGENTS.md 入口块的「DSH 后台唤醒配方」。";
+    let ask_posture = "**ask 调用姿势（tba serve 聚合器统一托管）**：`tba ask <claim_id> --done` 写备注+待回复+发信后立即返回；回复监听由 tba serve 聚合器统一托管，邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 注入会话、立刻唤醒。不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 ask（重复发信）。查看执行中收到的回复用 `tba events --claim <claim_id>`；会话窗直接回话要先把任务推回「进行中」再干活：`tba reply <claim_id>`。只有回复 1 才收尾（聚合器 finish）；不许 agent 自己 done/close。";
     if memory_on {
         s.push_str(&format!(
             "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题，自定义选项从 3 起编号；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
@@ -4512,12 +4507,12 @@ fn workflow_text(
     }
 
     s.push_str(&format!(
-        "3. Need user input: `{exe} ask <claim_id> -q \"question (state each number's meaning)\"` (-> {0} + column \"{1}\", mail sent; BLOCKS for the reply in place). tb handles numbers: 1=solved -> col {3}, closed; 2=write project memory first -> col {2}, then ask again; 3+=problem -> col {2}; non-number=read as text -> col {2}; 0 deprecated, read as text, never closes. ONLY 1 closes; others return to col {2}. In a custom question, number your own options from 3 (3/4/5...): 1/2 are reserved system actions (1=close 2=memory, executed by tb), using them as your options would mis-close the task on reply 1, and tba rejects such questions. Plain numbered options; NEVER use a picker or modal dialog.\n",
+        "3. Need user input: `{exe} ask <claim_id> -q \"question (plain-text options numbered from 3)\"` (-> {0} + column \"{1}\", mail sent, returns at once; reply listening owned by tba serve aggregator). tb handles numbers: 1=solved -> col {3}, closed; 2=write project memory first -> col {2}, then ask again; 3+=problem -> col {2}; non-number=read as text -> col {2}; 0 deprecated, read as text, never closes. ONLY 1 closes; others return to col {2}. In a custom question, number your own options from 3 (3/4/5...): 1/2 are reserved system actions (1=close 2=memory, executed by tb), using them as your options would mis-close the task on reply 1, and tba rejects such questions. Plain numbered options; NEVER use DSH ask_user_question picker/modal.\n",
         STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
     ));
 
     let handoff = format!(
-        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\")`; (b) `{exe} ask <claim_id> --done` (1=close/2=memory first/3+=still broken, custom options numbered from 3; -> {0} + column \"{1}\", mail sent). On DSH-style harnesses run BOTH `tba ask <claim_id> --done` and `tba wait <claim_id>` with `run_in_background`: the foreground waiter lives inside the background job, and its exit = job done = task-notification wakes the session. NEVER block in foreground (the agent hangs waiting and gets killed on timeout, so no wake fires). NEVER `--no-wait`. The detached listener keeps polling until reply 1 (running state included); every new reply wakes the session. After each wake-up, start a background `tba wait <claim_id>` before working. See the AGENTS.md entry block 'DSH 后台唤醒配方' for the exact recipe. ",
+        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\")`; (b) `{exe} ask <claim_id> --done` (1=close/2=memory first/3+=still broken, custom options numbered from 3; -> {0} + column \"{1}\", mail sent). `tba ask` writes the note, moves to waiting and sends mail, then returns at once; reply listening is owned by the tba serve WatchAggregator. New mail/comment replies are written to `data/wakes/<sessionId>.json` and dsh-tba-bridge injects them into the session immediately. Do NOT use a background waiter, a foreground waiter, or `--no-wait`; do NOT rerun ask (resends mail). Use `tba events --claim <claim_id>` for replies received during execution; on a chat-box reply run `tba reply <claim_id>` first. Only reply 1 finishes the task (aggregator finish); agents never done/close. ",
         STAGE_WAIT, cfg.tasklist_wait
     );
 
@@ -5193,24 +5188,15 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **交回**：做完两步，不许省：\n\
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
-         `ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（1=收尾 2=写记忆 3+=有问题；0 已废弃按原文不收尾），\
-         **监听一直跑到用户回 1 才停，执行中也不中断**；父进程被杀监听不亡。\n\
-         每条回复都由前台等待者打印后退出、唤醒会话；**会话被唤醒后继续干活前，先挂一条后台 `tba wait <claim_id>`**，\
-         否则执行中窗口的发言要等下次待回复才收得到。\n\
-         **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，\
-         拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。\n\
-         **只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，别当收尾确认。\n\
-         **调用**：`tba ask <claim_id> --done` 用 `run_in_background` 跑（监听已 detached 自愈；不要前台阻塞跑）。\
-         收到回复自动唤起会话；会话窗直接回就先 `tba reply <claim_id>`。\n\
-         **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、\
-         看不到它，所以先跑 `{exe} reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。\n\
-         禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
-          **DSH 后台唤醒配方（重要）**：DSH 只有「后台 job 退出 -> task-notification 唤醒会话」一条唤醒通道。\n\
-          所以下面的命令都必须用 `run_in_background` 跑，让前台等待者活在 DSH job 里——它退出 = job 完成 = 唤醒。\n\
-          ① 领完任务、要问用户：`{exe} ask <claim_id> --done`（**run_in_background**），spawn detached 监听 + 挂前台等待者。\n\
-          ② 被唤醒、干完活、还要等下一条回复：`{exe} wait <claim_id>`（**run_in_background**，不发信），续接等待者。\n\
-          ③ 用户回 1：监听自己 finish + 退出 -> 最后唤醒，你按输出收尾。\n\
-          禁忌：`ask` 重跑（重复发信）；`--no-wait`（不挂等待者，永不唤醒）；前台阻塞跑 ask/wait（等信期间 agent 卡死）。\n\n\
+         **回复监听**：`ask` 写问题进备注 + 转「待回复」+ 发邮件后立即返回；监听由 **tba serve 的 WatchAggregator 统一托管**。\
+          邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。\
+          **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，\
+          拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。选项写纯文本，\
+          **禁用 DSH 的 ask_user_question 选择框/弹窗，禁用 MCP `{exe} ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧会话）。\
+          **查看回复**：执行中收到的回复用 `{exe} events --claim <claim_id>` 查看；不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 `ask`（会重复发信）。\
+          **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、\
+          看不到它，所以先跑 `{exe} reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。\
+          只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
           **通用能力**（别自己拼脚本）：`doctor` 环境自检 / \
           `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / \
          `publish` 发版 / `shot` 截图。先 `{exe} --help`。\n"
@@ -5249,27 +5235,18 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     // 已经是新版就不用动：入口段只有一份、带裸命令、带「交回」「流转」「通用能力」。
     // 「**工具**：`tba`」同时当版本号用——老入口里是本机绝对路径，缺这句就整段
     // 替换成新版（不会重复追加）。`git create` 也是版本号（v0.2.20 加的）。
-    // `dangerouslyDisableSandbox` 是交回姿势的版本号：老入口缺这句要重写一次，
-    // 否则 agent 拿旧姿势跑 ask，78s 就被 SIGTERM 强杀。
+    // v0.2.42：监听由 tba serve 聚合器统一托管，旧 detached / run_in_background 文案整段重写。
     let entry_ok = old.matches(ENTRY_MARK).count() == 1
         && old.contains(&format!("**工具**：`{exe}`"))
         && old.contains("**交回**")
         && old.contains("**流转**")
         && old.contains("**通用能力**")
         && old.contains("git create")
-        && old.contains("监听已 detached 自愈")
-        // v0.2.35 数字协议版本号：老入口还写着 0/1/2 选项或没有保留号规则，
-        // 缺这句就整段重写一次，否则 agent 一直按旧协议出题、和待回复数字打架。
+        // 老入口还写着 0/1/2 选项或没有保留号规则，缺这句就整段重写一次。
         && old.contains("1/2 是系统保留号")
-        // v0.2.36 常驻监听版本号：老入口还写着「收到回复子进程退出」，缺这句就整段重写，
-        // 否则 agent 不知道执行中窗口还要挂 tba wait。
-        && old.contains("监听一直跑到用户回 1")
-        // 「会话窗直接回」是 v0.2.29 后台挂起文案的版本号：老入口还写着
-        // 「前台阻塞 / 绝不结束会话」，缺这句就整段重写一次。
         && old.contains("会话窗直接回")
-        // v0.2.39 DSH 唤醒配方版本号：老入口没写「run_in_background 跑 ask/wait」，
-        // 缺这句就整段重写，否则 agent 在 DSH 里前台阻塞跑 ask/wait，回信后收不到唤醒。
-        && old.contains("DSH 后台唤醒配方");
+        && old.contains("tba serve 的 WatchAggregator 统一托管")
+        && old.contains("禁用 DSH 的 ask_user_question 选择框/弹窗");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
     let ultracave_ok = old.matches(ULTRACAVE_MARK).count() == 1;
 
@@ -5322,11 +5299,9 @@ fn claim_header(c: &Claim, exe: &str) -> String {
          ⚠ 做完必须交回，两步不许省：\n  \
          {exe} note {} --text \"改了什么/怎么验\"\n  \
          {exe} ask {} --done\n\
-           ask 发信后常驻监听一直跑到你回 1，执行中也不停，每条新回复触发 task-notification 唤醒续接；\n\
-          领完任务要问用户用 `run_in_background` 跑 `{exe} ask`；被唤醒后继续干活前先挂一条后台 `{exe} wait`（不发信）。\n\
-         被唤醒后继续干活先挂一条后台 {exe} wait <claim_id>。\
-         会话窗直接回也行，先跑 {exe} reply <claim_id> 推回「进行中」。\
-         禁止 --no-wait；只有用户能收尾。\n",
+           ask 发信后立即返回；回复监听由 tba serve 聚合器统一托管，新回复写 wakes/ 并由 dsh-tba-bridge 插队唤醒。\n\
+          执行中收到的回复用 {exe} events --claim <claim_id> 查看；不要后台挂起、不要等待者、不要 --no-wait，别重跑 ask（重复发信）。\n\
+         会话窗直接回也行，先跑 {exe} reply <claim_id> 推回「进行中」。只有用户回 1 才收尾。\n",
         c.claim_id, c.task_id, c.task_name, c.stage_from, c.stage_to, c.claim_id, c.claim_id
     )
 }
@@ -5974,7 +5949,7 @@ mod tests {
                     &["never edit task state or board columns yourself"],
                     &["never invent tasks"],
                     &["Do NOT run `tba done`", "only the user closes"],
-                    &["numbered", "NEVER use a picker"],
+                    &["numbered", "NEVER use DSH ask_user_question"],
                     &["before/after long ops"],
                     &["never times out"],
                     &["auto-return", "user already closed it"],
@@ -6184,9 +6159,10 @@ mod tests {
         assert!(h.contains("tba note clm-x --text"), "缺 note 命令: {h}");
         assert!(h.contains("tba ask clm-x --done"), "缺 ask 命令: {h}");
         assert!(
-            h.contains("会话窗直接回也行") && h.contains("run_in_background"),
-            "缺后台挂起（run_in_background）+ 会话窗回复的新姿势: {h}"
+            h.contains("会话窗直接回也行") && h.contains("tba serve 聚合器统一托管"),
+            "缺 tba serve 聚合器托管 + 会话窗回复的新姿势: {h}"
         );
+        assert!(!h.contains("run_in_background") && !h.contains("前台等待者"), "不应再要旧唤醒配方: {h}");
 
         // 提示必须在 claim_id 之后、紧跟其后——不能沉到正文后面去。
         let head = h.find("claim_id:").expect("缺 claim_id 行");
@@ -6210,6 +6186,44 @@ mod tests {
             assert!(t.contains("GH_TOKEN"), "缺禁找 token: {t}");
             assert!(t.contains("gh"), "缺禁装 gh: {t}");
         }
+    }
+
+    // 用户选 3 = 最小方案：子代理自己用 CLI 走待回复交互，主代理只做最终确认。
+    #[test]
+    fn subagent_brief_uses_cli_ask_and_forbids_dsh_picker() {
+        for lang in [Lang::Zh, Lang::En] {
+            let t = subagent_workflow_text("tba", "clm-1", lang);
+            assert!(t.contains("tba ask clm-1"), "缺子代理自 ask 命令: {t}");
+            assert!(t.contains("tba reply clm-1"), "缺 reply 命令: {t}");
+            assert!(t.contains("tba events --claim clm-1"), "缺 events 命令: {t}");
+            assert!(t.contains("禁用 DSH") || t.contains("NEVER use DSH's") || t.contains("NEVER use DSH"), "缺禁用 DSH 选择框: {t}");
+            assert!(t.contains("ask_user_question"), "缺点名 DSH ask_user_question: {t}");
+            assert!(t.contains("ask_user"), "缺禁用 MCP ask_user: {t}");
+            assert!(!t.contains("不要自己 ask"), "旧「不要自己 ask」还在: {t}");
+            assert!(!t.contains("不自己 ask"), "旧「不自己 ask」还在: {t}");
+            assert!(!t.contains("do NOT ask"), "旧「do NOT ask」还在: {t}");
+            assert!(t.contains("done / close"), "缺 done/close 边界: {t}");
+        }
+    }
+
+    // 自动生成的 AGENTS.md 入口：旧 spawn detached / run_in_background / 前台等待者
+    // 必须随 tba serve 聚合器模型一起清掉，并写明纯文本 ask 与禁用选择框。
+    #[test]
+    fn entry_file_uses_aggregator_and_plain_text_ask() {
+        let store = tmp_store("entry-aggregator");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("tba serve 的 WatchAggregator 统一托管"), "缺聚合器托管说明: {s}");
+        assert!(s.contains("tba ask <claim_id> -q") || s.contains("纯文本"), "缺纯文本 ask 说明: {s}");
+        assert!(s.contains("禁用 DSH 的 ask_user_question 选择框/弹窗"), "缺禁用 DSH 选择框: {s}");
+        for stale in ["spawn detached", "DSH 后台唤醒配方"] {
+            assert!(!s.contains(stale), "入口块仍含旧措辞 {stale}: {s}");
+        }
+        assert!(
+            ensure_entry_at(&dir, "tba").is_none(),
+            "已是新版就不该反复重写"
+        );
     }
 
     // 造一条台账记录，只关心跟孤儿判定相关的字段。

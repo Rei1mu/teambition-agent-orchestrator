@@ -56,7 +56,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 1. **agent 只写任务备注，不写评论。** 评论是用户的回复通道，写进去会污染 `ask` 的读取。
 2. **不许自己跑 `tba done` / `tba close`。** 只有用户回 `1` 才收尾。
-3. **做完必须 `tba ask --done`。** 监听由 tba 自动挂、detached、后台自愈（看下方「任务队列入口」块，各设备自动同步，不在这手写）。**唤醒由 dsh-tba-bridge 插件负责**：邮件/Teambition 的每条新回复都会被监听写成 `data/wakes/<sessionId>.json`，插件随即注入会话、立刻唤醒——不必等 job 退出，也不必手动挂等待者。**前台等待者已禁用**（`ask`/`wait` 只挂监听、立即返回，不再阻塞），因为「job 退出」会被误读成「收尾确认」。**不许 `--no-wait`**、不许 agent 自己 `done` / `close`，只有用户回 `1` 才收尾（`2`=写记忆、`3+`=有问题、`0` 已废弃，都不收尾）。**监听死了会被 tba 自愈重拉**，不用手动 `tba wait`，也别重跑 `ask`（会重复发信）。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
+3. **做完必须 `tba ask --done`。** 回复监听由 tba serve 的 WatchAggregator 统一托管：邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件随即注入会话、立刻唤醒；不必等 job 退出，也不挂等待者。**禁用 DSH 的 ask_user_question 选择框/弹窗，禁用 MCP `tba ask_user`**；要提问只用 CLI `tba ask <claim> -q "<纯文本选项，选项从 3 起编号>"`，不用 DSH 选择框。**不许 `--no-wait`**、不许 agent 自己 `done` / `close`，只有用户回 `1` 才收尾（`2`=写记忆、`3+`=有问题、`0` 已废弃，都不收尾）。别重跑 `ask`（会重复发信）；执行中收到的回复用 `tba events --claim <claim>` 查看。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
 
@@ -223,19 +223,11 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 ① `tba note <claim_id> --text "改了什么/怎么验"`
 ② `tba ask <claim_id> --done`
 
-`ask` 发邮件后**spawn detached 子进程常驻监听**评论和邮件（1=收尾 2=写记忆 3+=有问题；0 已废弃按原文不收尾），**监听一直跑到用户回 1 才停，执行中也不中断**；父进程被杀监听不亡。
-每条回复都由前台等待者打印后退出、唤醒会话；**会话被唤醒后继续干活前，先挂一条后台 `tba wait <claim_id>`**，否则执行中窗口的发言要等下次待回复才收得到。
-**自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。
-**只有输出里出现 `USER_REPLY=1` 才是用户真回复**；`ask` 前台 exit 0 只是起了监听，不是回复，别当收尾确认。
-**调用**：`tba ask <claim_id> --done` 用 `run_in_background` 跑（监听已 detached 自愈；不要前台阻塞跑）。收到回复自动唤起会话；会话窗直接回就先 `tba reply <claim_id>`。
+**回复监听**：`ask` 写问题进备注 + 转「待回复」+ 发邮件后立即返回；监听由 **tba serve 的 WatchAggregator 统一托管**。
+邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。
+**自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。选项写纯文本，**禁用 DSH 的 ask_user_question 选择框/弹窗，禁用 MCP `tba ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧会话）。
+**查看回复**：执行中收到的回复用 `tba events --claim <claim_id>` 查看；不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 `ask`（会重复发信）。
 **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。
-禁止 `--no-wait`；只有用户能 `done`/`close`，放弃用 `tba release`。
-
-**DSH 后台唤醒配方（重要）**：DSH 只有「后台 job 退出 -> task-notification 唤醒会话」一条唤醒通道。
-所以下面的命令都必须用 `run_in_background` 跑，让前台等待者活在 DSH job 里——它退出 = job 完成 = 唤醒。
-① 领完任务、要问用户：`tba ask <claim_id> --done`（**run_in_background**），spawn detached 监听 + 挂前台等待者。
-② 被唤醒、干完活、还要等下一条回复：`tba wait <claim_id>`（**run_in_background**，不发信），续接等待者。
-③ 用户回 1：监听自己 finish + 退出 -> 最后唤醒，你按输出收尾。
-禁忌：`ask` 重跑（重复发信）；`--no-wait`（不挂等待者，永不唤醒）；前台阻塞跑 ask/wait（等信期间 agent 卡死）。
+只有用户能 `done`/`close`，放弃用 `tba release`。
 
 **通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / `publish` 发版 / `shot` 截图。先 `tba --help`。
