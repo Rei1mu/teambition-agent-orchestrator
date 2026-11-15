@@ -42,7 +42,10 @@ fn run_in(dir: &Path, prog: &str, args: &[&str]) -> Result<Out, String> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<Out, String> {
-    run_in(dir, "git", args)
+    // 走 git_prog()：TBA_GIT / config.toml 的 git_path 配置了就得生效。
+    // 之前写死 "git"，PATH 里挑到没有凭据 helper 的版本就推不上去，
+    // 用户在设置页指的路径形同虚设——agent 只好自己去找 token / 装 gh。
+    run_in(dir, &git_prog(), args)
 }
 
 fn but(dir: &Path, args: &[&str]) -> Result<Out, String> {
@@ -434,7 +437,7 @@ fn github_token() -> Option<String> {
         }
     }
     // 退回 git 凭据：用户 git push 能用，说明 token 在凭据管理器里。
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_prog());
     cmd.args(["credential", "fill"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -968,7 +971,7 @@ fn push_with_token(
     let header = format!("Authorization: Basic {}", b64_encode(format!(":{token}").as_bytes()));
     // 只在 github.com 上注入：写死域名，token 不会随任何重定向跑到第三方域。
     // 注意 key 里带 URL，git 的 -c 按第一个 = 分割，value 里的 = (base64 padding) 会保留。
-    let mut c = Command::new("git");
+    let mut c = Command::new(git_prog());
     c.current_dir(root).args([
         "-c",
         &format!("http.https://github.com/.extraHeader={header}"),

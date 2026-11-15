@@ -1397,11 +1397,14 @@ pub fn classify_claim_result(r: Result<Claim, String>) -> SubPoll {
     }
 }
 
+/// `skip_orphan_guard`：sub 常驻监听派子代理并行处理，不该被别的待回复任务拦住；
+/// go / MCP 手动领任务仍保留「先处理断掉的回复」守卫。
 pub fn claim(
     store: &Store,
     project_id: &str,
     name_filter: Option<&str>,
     agent: &str,
+    skip_orphan_guard: bool,
 ) -> Result<Claim, String> {
     let mut ctx = Ctx::new(store.clone(), false)?;
     let stages = ctx.ensure_stages(project_id)?;
@@ -1436,11 +1439,7 @@ pub fn claim(
     let queue_ids: Vec<String> = candidates.iter().map(|t| t.id.clone()).collect();
     // 孤儿拦截按项目隔离：一台机器可能跑多个项目的 agent 会话，
     // 别的项目的「等回复但会话断了」不该拦住当前项目的领任务。
-    let orphans: Vec<Claim> = orphan_waits(store)
-        .into_iter()
-        .filter(|c| c.project_id == project_id)
-        .filter(|c| !queue_ids.contains(&c.task_id))
-        .collect();
+    let orphans = blocking_orphans(store, project_id, &queue_ids, skip_orphan_guard);
     if !orphans.is_empty() {
         return Err(format!("{BLOCKED_PREFIX}{}", orphan_block_msg(&orphans)));
     }
@@ -1939,6 +1938,125 @@ pub fn start(
         warnings,
         existed: false,
         list_now: ctx.task_list_name(project_id, &task_id),
+    })
+}
+
+// 「添加一个任务」指令：从用户原话里拆出项目名（可选）和任务标题。
+// 支持 "添加一个任务：xxx" / "添加任务 xxx" / "给xx项目添加一个任务：xxx"。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddTaskRequest {
+    pub project: Option<String>,
+    pub title: String,
+}
+
+pub fn parse_add_task(text: &str) -> Option<AddTaskRequest> {
+    let s = text.trim();
+    let (pos, marker_len) = s
+        .find("添加一个任务")
+        .map(|i| (i, "添加一个任务".len()))
+        .or_else(|| s.find("添加任务").map(|i| (i, "添加任务".len())))?;
+    let before = s[..pos].trim();
+    let rest = &s[pos + marker_len..];
+    let trimmed = rest.trim_start();
+    let title = if let Some(t) = trimmed
+        .strip_prefix('：')
+        .or_else(|| trimmed.strip_prefix(':'))
+        .or_else(|| trimmed.strip_prefix('，'))
+        .or_else(|| trimmed.strip_prefix(','))
+    {
+        t.trim()
+    } else if trimmed.len() != rest.len() {
+        trimmed
+    } else {
+        return None;
+    };
+    if title.is_empty() {
+        return None;
+    }
+    // "给xx项目添加一个任务" -> 项目名 xx项目；精确匹配时允许带「项目」后缀。
+    let project = before.rfind('给').and_then(|i| {
+        let p = before[i + '给'.len_utf8()..]
+            .trim()
+            .trim_end_matches(|c: char| c == '，' || c == ',' || c == '。')
+            .trim();
+        if p.is_empty() {
+            None
+        } else {
+            Some(p.to_string())
+        }
+    });
+    Some(AddTaskRequest {
+        project,
+        title: title.to_string(),
+    })
+}
+
+// 用户说的项目名 -> 项目 id。先精确，再试去掉「项目」后缀，最后才做唯一包含匹配。
+// 多义时不猜，交回调用方走 ask 确认。
+pub fn match_project_id(projects: &[(String, String)], name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if let Some((id, _)) = projects.iter().find(|(_, n)| n == name) {
+        return Some(id.clone());
+    }
+    let bare = name.strip_suffix("项目").unwrap_or(name).trim();
+    if !bare.is_empty() {
+        if let Some((id, _)) = projects.iter().find(|(_, n)| n == bare) {
+            return Some(id.clone());
+        }
+    }
+    let needle = name.to_lowercase();
+    let mut hits = projects
+        .iter()
+        .filter(|(_, n)| n.to_lowercase().contains(&needle))
+        .map(|(id, _)| id.clone());
+    let first = hits.next()?;
+    if hits.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddTaskResult {
+    pub task_id: String,
+    pub list_warning: Option<String>,
+}
+
+// 纯建任务：落在「未完成」+ 看板列「未完成」，不 claim、不挪到其他状态。
+// 和 start 的区别正是这里——start 会建 claim、推到「进行中」。
+pub fn add_todo_task(
+    store: &Store,
+    project_id: &str,
+    title: &str,
+    note: &str,
+) -> Result<AddTaskResult, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("任务标题不能为空".into());
+    }
+    let mut ctx = Ctx::new(store.clone(), false)?;
+    let stages = ctx.ensure_stages(project_id)?;
+    let todo = ctx
+        .find_stage(&stages, STAGE_TODO)
+        .ok_or("缺少「未完成」阶段")?
+        .clone();
+    let task_id = ctx.create_task(project_id, &todo, title, note, "")?;
+    let queue = ctx.tb.cfg.tasklist_queue.clone();
+    let list_warning = if ctx
+        .move_to_list(&task_id, project_id, &queue)
+        .unwrap_or(false)
+    {
+        None
+    } else {
+        Some(format!("任务已创建（{task_id}）但没能挪到看板列「{queue}」，需手动拖到「未完成」列。"))
+    };
+    Ok(AddTaskResult {
+        task_id,
+        list_warning,
     })
 }
 
@@ -2766,6 +2884,13 @@ fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
 3. 不要自己 done / close，也不要自己 ask —— 收尾和提问都归主代理（你调不了 DSH 的回复交互）。
 4. 有拿不准的，把疑问写进备注并回报主代理，由主代理去问用户；不要自己假设后硬干。
 
+## 提交推送 / 上传 GitHub：只走 tba
+- 提交推送只跑 `{exe} git main -m "改了什么"`，推之前 `{exe} git status`；要看会跑什么加 `--dry`。
+- 建仓库 / 连远端 / 更新到 GitHub 只跑 `{exe} git create [--name 仓库名]`（幂等，已有远端就直接推）。
+- 发版只跑 `{exe} publish --tag vX.Y.Z --watch`（先升 Cargo.toml 版本号并 cargo build 同步 Cargo.lock）。
+- **不要**自己拼 git remote/push、`git -c http.extraHeader`、找 GitHub token、设 GH_TOKEN、配 SSH key、装 gh，也别让用户去网页建仓库。凭据 tba 自己会从 git 凭据管理器读；读不到就回报主代理问用户，别自己换路子。
+- 详情按需读：`{exe} cap git-main` / `{exe} cap git-create` / `{exe} cap release`。
+
 ## 交回主代理
 回报：改了什么、验证了什么、还剩什么、有什么疑问。主代理用 claim_id（{id}）收尾并视情况提问。"##,
             exe = exe, id = claim_id
@@ -2778,6 +2903,13 @@ fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
   {exe} note {id} --text "what changed / how verified"
 3. Do NOT done / close yourself, and do NOT ask - closing and asking are the main agent's job (you can't drive DSH's reply loop).
 4. If unsure, write the question into the note and report back to the main agent; the main agent asks the user. Do not guess and plow ahead.
+
+## Commit / push / upload to GitHub: tba only
+- To commit & push run only `{exe} git main -m "what changed"`; check `{exe} git status` first; add `--dry` to preview.
+- To create/attach a repo or update GitHub run only `{exe} git create [--name repo]` (idempotent, pushes when a remote exists).
+- To cut a release run only `{exe} publish --tag vX.Y.Z --watch` (bump Cargo.toml version and cargo build to sync Cargo.lock first).
+- NEVER hand-roll git remote/push, `git -c http.extraHeader`, hunt for a GitHub token, set GH_TOKEN, set up SSH keys, install gh, or send the user to the web to create a repo. tba reads credentials from the git credential store; if it can't, report back to the main agent - do not switch tactics.
+- Details on demand: `{exe} cap git-main` / `{exe} cap git-create` / `{exe} cap release`.
 
 ## Hand back to main agent
 Report: what changed, what you verified, what remains, and any open questions. Main agent closes via claim_id ({id}) and asks the user if needed."##,
@@ -4849,6 +4981,24 @@ pub enum GoOutcome {
 // 等于把你还没回答的问题扔掉。所以只标记 + 拦住新任务，让人决定怎么处理。
 pub const ORPHAN_WAIT_SECS: i64 = 60;
 
+/// 领任务前的孤儿拦截判定。`skip=true`（sub 模式）直接放行；否则只拦本项目、
+/// 且不在列1（被拖回列1=用户要求重来，那条等待作废）的断线等待。
+pub fn blocking_orphans(
+    store: &Store,
+    project_id: &str,
+    queue_ids: &[String],
+    skip: bool,
+) -> Vec<Claim> {
+    if skip {
+        return Vec::new();
+    }
+    orphan_waits(store)
+        .into_iter()
+        .filter(|c| c.project_id == project_id)
+        .filter(|c| !queue_ids.contains(&c.task_id))
+        .collect()
+}
+
 pub fn orphan_waits(store: &Store) -> Vec<Claim> {
     store
         .active_claims()
@@ -5277,7 +5427,7 @@ pub fn go(
         let _ = set_session(Some(&cwd_name()));
     }
     let agent = current_agent();
-    let c = match claim(store, &proj.id, None, &agent) {
+    let c = match claim(store, &proj.id, None, &agent, false) {
         Ok(c) => c,
         Err(e) if e.starts_with(BLOCKED_PREFIX) => {
             return Ok(GoOutcome::Blocked {
@@ -5351,6 +5501,43 @@ pub fn agent_prompt_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_add_task_handles_both_phrases_and_optional_project() {
+        assert_eq!(
+            parse_add_task("添加一个任务：修 CI"),
+            Some(AddTaskRequest { project: None, title: "修 CI".into() })
+        );
+        assert_eq!(
+            parse_add_task("给 tba-cli 项目添加一个任务: 补文档"),
+            Some(AddTaskRequest {
+                project: Some("tba-cli 项目".into()),
+                title: "补文档".into(),
+            })
+        );
+        assert_eq!(
+            parse_add_task("请给xx添加一个任务，做测试"),
+            Some(AddTaskRequest {
+                project: Some("xx".into()),
+                title: "做测试".into(),
+            })
+        );
+        assert_eq!(parse_add_task("添加一个任务列表"), None);
+        assert_eq!(parse_add_task("添加一个任务："), None);
+    }
+
+    #[test]
+    fn match_project_id_prefers_exact_then_bare_name() {
+        let projects = vec![
+            ("id-1".to_string(), "tba-cli".to_string()),
+            ("id-2".to_string(), "tba-cli-test".to_string()),
+        ];
+        assert_eq!(match_project_id(&projects, "tba-cli"), Some("id-1".into()));
+        assert_eq!(match_project_id(&projects, "tba-cli项目"), Some("id-1".into()));
+        // 唯一包含匹配可用；两个都命中就不猜。
+        assert_eq!(match_project_id(&projects, "tba"), None);
+        assert_eq!(match_project_id(&projects, "tba-cli-test"), Some("id-2".into()));
+    }
 
     #[test]
     fn watch_baseline_resets_when_claim_leaves_waiting() {
@@ -6003,6 +6190,23 @@ mod tests {
         assert!(warn - head < 200, "交回提示离 claim_id 太远，容易被跳过");
     }
 
+    // 子代理简报必须自带「推送只走 tba、别找 token / 别装 gh」红线。
+    // 之前简报只列能力索引，子代理照样自己拼 git push、找 token，所以补这条回归。
+    #[test]
+    fn subagent_brief_forbids_hand_rolled_git_push() {
+        for lang in [Lang::Zh, Lang::En] {
+            let t = subagent_workflow_text("tba", "clm-1", lang);
+            assert!(t.contains("tba git main"), "缺提交推送命令: {t}");
+            assert!(t.contains("tba git create"), "缺建仓库命令: {t}");
+            assert!(t.contains("tba publish"), "缺发版命令: {t}");
+            assert!(t.contains("tba cap git-main"), "缺按需读正文指引: {t}");
+            // 红线中必须明确点名这几件常被 agent 乱干的事。
+            assert!(t.contains("http.extraHeader"), "缺禁临时拼 token header: {t}");
+            assert!(t.contains("GH_TOKEN"), "缺禁找 token: {t}");
+            assert!(t.contains("gh"), "缺禁装 gh: {t}");
+        }
+    }
+
     // 造一条台账记录，只关心跟孤儿判定相关的字段。
     fn fake_waiting(claim_id: &str, ask_at: &str) -> Claim {
         Claim {
@@ -6063,6 +6267,26 @@ mod tests {
         // 正常结束要删文件，删完就该是「从没等过」——用 ask_at 兜底仍然判孤儿。
         store.wait_drop("clm-dead");
         assert!(store.wait_age("clm-dead").is_none(), "wait_drop 没删掉文件");
+    }
+
+    // sub 模式（skip=true）不被待回复拦住；go 模式（skip=false）仍拦。
+    #[test]
+    fn blocking_orphans_skip_bypasses_guard() {
+        let store = tmp_store("orphan-skip");
+        let old = (chrono::Local::now() - chrono::Duration::seconds(600)).to_rfc3339();
+        let mut c = fake_waiting("clm-orphan", &old);
+        c.project_id = "p-skip".into();
+        store.append_claim(&c).unwrap();
+
+        let queue: Vec<String> = Vec::new();
+        let blocked = blocking_orphans(&store, "p-skip", &queue, false);
+        assert_eq!(blocked.len(), 1, "go 模式该拦住断线等待");
+        let skipped = blocking_orphans(&store, "p-skip", &queue, true);
+        assert!(skipped.is_empty(), "sub 模式该放行，不被待回复拦住");
+
+        // 列1 里的任务即使待回复也不拦。
+        let in_queue = vec!["task-clm-orphan".to_string()];
+        assert!(blocking_orphans(&store, "p-skip", &in_queue, false).is_empty());
     }
 
     // 邮件正文要带本次处理内容：用户在外面收信，光看到「已完成，请确认」判断不了

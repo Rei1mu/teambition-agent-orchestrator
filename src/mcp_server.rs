@@ -243,7 +243,7 @@ fn dispatch(store: &Store, name: &str, args: &Value) -> Value {
             let pid = arg_str(args, "project_id")?;
             let tn = args.get("task_name").and_then(|v| v.as_str());
             let _ = sweep(store, false);
-            let c = claim(store, &pid, tn, &session_tag())?;
+            let c = claim(store, &pid, tn, &session_tag(), false)?;
             Ok(format!(
                 "claim_id: {}\ntask_id: {}\ntask_name: {}\n状态: {} -> {}",
                 c.claim_id, c.task_id, c.task_name, c.stage_from, c.stage_to

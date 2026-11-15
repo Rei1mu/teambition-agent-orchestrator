@@ -389,7 +389,8 @@ fn subagent_watch(
         for m in sweep(store, false).unwrap_or_default() {
             eprintln!("{m}");
         }
-        match classify_claim_result(claim(store, project_id, None, &agent)) {
+        // sub 能让子代理并行处理，不被待回复任务拦住领新任务。
+        match classify_claim_result(claim(store, project_id, None, &agent, true)) {
             SubPoll::Dispatch(c) => {
                 let skills = cached_skills(store, &c.project_id);
                 print!("{}", subagent_brief(store, &c, &c.task_name, &skills, lang));
@@ -1633,7 +1634,7 @@ pub fn run() -> Result<(), String> {
             for m in sweep(&store, false).unwrap_or_default() {
                 eprintln!("{m}");
             }
-            let c = match claim(&store, &project, name.as_deref(), &current_agent()) {
+            let c = match claim(&store, &project, name.as_deref(), &current_agent(), false) {
                 Ok(c) => c,
                 Err(e) if e.starts_with(BLOCKED_PREFIX) => {
                     // 跟 tba g 一致：手上有没人接的「待回复」，先处理掉再来领。

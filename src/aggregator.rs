@@ -17,11 +17,14 @@ use crate::events;
 use crate::mail::{marker_hit, ImapSession};
 use crate::config::STAGE_DONE;
 use crate::ops::{
-    beat, finish, parse_reply, resume, write_wake_request, ReplyAction,
+    add_todo_task, ask, beat, finish, match_project_id, parse_add_task, parse_reply, resume,
+    write_wake_request, ReplyAction,
 };
-use crate::store::Store;
+use crate::store::{Claim, Store};
 use crate::tools::CommentInfo;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -97,17 +100,19 @@ pub fn run_aggregator(store: Store, alive: Arc<AtomicBool>) {
             match imap.as_mut().unwrap().poll_all() {
                 Ok(msgs) => {
                     for (subject, body, _uid) in msgs {
-                        for c in &active {
+                        // 一封邮件可能同时带多个 marker（转发/引用），只归最近的活跃 claim。
+                        let mut hits: Vec<&Claim> = active
+                            .iter()
+                            .filter(|c| {
+                                let marker = format!("[TB {}]", c.claim_id);
+                                marker_hit(&subject, &marker) || marker_hit(&body, &marker)
+                            })
+                            .collect();
+                        hits.sort_by(|a, b| b.heartbeat().cmp(a.heartbeat()));
+                        if let Some(c) = hits.first() {
                             let marker = format!("[TB {}]", c.claim_id);
-                            if !marker_hit(&subject, &marker) && !marker_hit(&body, &marker) {
-                                continue;
-                            }
                             let text = crate::mail::clean_reply(&body, &marker);
-                            events::append(&store.root, &c.claim_id, "mail", &text);
-                            let wake = format!("（邮件回复）\n\n{text}");
-                            write_wake_request(&store.root, &c.claim_id, &wake);
-                            dispatch_reply(&store, &c.claim_id, &wake, "mail");
-                            break; // 一封邮件只属于一个 claim
+                            handle_message(&store, c, &text, "mail");
                         }
                     }
                 }
@@ -146,9 +151,7 @@ pub fn run_aggregator(store: Store, alive: Arc<AtomicBool>) {
                 }
                 if let Some(last) = fresh.last() {
                     let text = last.text.clone();
-                    events::append(&store.root, &c.claim_id, "comment", &text);
-                    write_wake_request(&store.root, &c.claim_id, &text);
-                    dispatch_reply(&store, &c.claim_id, &text, "comment");
+                    handle_message(&store, c, &text, "comment");
                 }
             }
         }
@@ -166,6 +169,280 @@ pub fn run_aggregator(store: Store, alive: Arc<AtomicBool>) {
         std::thread::sleep(std::time::Duration::from_secs(MAIL_POLL_SECS));
     }
     // 退出时 LOGOUT：imap drop 时连接自然关闭，显式 LOGOUT 交给 ImapSession drop。
+}
+
+// 「添加一个任务」确认态：ask 只改状态、不改变这条回复的语义，
+// 所以待确认的项目/标题落在本地文件里（按 claim 隔离），不塞进 Claim 结构。
+const ADD_TASK_PENDING_DIR: &str = "addtask-pending";
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingChoice {
+    num: u32,
+    project_id: Option<String>, // None = 取消添加
+    label: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingAddTask {
+    title: String,
+    source: String,
+    choices: Vec<PendingChoice>,
+}
+
+struct PendingResolution {
+    project_id: Option<String>,
+}
+
+fn pending_path(root: &Path, claim_id: &str) -> PathBuf {
+    root.join(ADD_TASK_PENDING_DIR).join(format!("{claim_id}.json"))
+}
+
+fn save_pending(root: &Path, claim_id: &str, p: &PendingAddTask) -> Result<(), String> {
+    let path = pending_path(root, claim_id);
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let s = serde_json::to_string(p).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, s).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
+fn load_pending(root: &Path, claim_id: &str) -> Option<PendingAddTask> {
+    let s = std::fs::read_to_string(pending_path(root, claim_id)).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+fn clear_pending(root: &Path, claim_id: &str) {
+    let _ = std::fs::remove_file(pending_path(root, claim_id));
+}
+
+fn project_name(projects: &[(String, String)], id: &str) -> String {
+    projects
+        .iter()
+        .find(|(pid, _)| pid == id)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn notify(store: &Store, claim_id: &str, text: &str) {
+    events::append(&store.root, claim_id, "addtask", text);
+    write_wake_request(&store.root, claim_id, text);
+}
+
+// 邮件回信经 clean_reply 后正文不带 marker；唤醒文案仍保留「邮件回复」标记，
+// 让会话里的 agent 一眼看出来源（parse_reply 的 strip_reply_noise 会剥掉它）。
+fn wake_text(source: &str, text: &str) -> String {
+    if source == "mail" {
+        format!("（邮件回复）{text}")
+    } else {
+        text.to_string()
+    }
+}
+
+// 找不到项目时给用户看的候选：优先名字包含用户输入的，最多 5 个；
+// 一个都没有就列前 5 个项目，避免用户面对一长串项目名。
+fn candidate_projects(
+    projects: &[(String, String)],
+    asked: &str,
+    current_id: &str,
+) -> Vec<(String, String)> {
+    let needle = asked.trim().to_lowercase();
+    let mut out: Vec<(String, String)> = projects
+        .iter()
+        .filter(|(id, name)| {
+            id != current_id && (needle.is_empty() || name.to_lowercase().contains(&needle))
+        })
+        .take(5)
+        .cloned()
+        .collect();
+    if out.is_empty() {
+        out = projects
+            .iter()
+            .filter(|(id, _)| id != current_id)
+            .take(5)
+            .cloned()
+            .collect();
+    }
+    out
+}
+
+// 选项必须从 3 起：1/2 是系统保留号（收尾 / 写记忆）。
+fn build_confirmation(
+    title: &str,
+    asked: &str,
+    current_id: &str,
+    current_name: &str,
+    candidates: Vec<(String, String)>,
+) -> (String, Vec<PendingChoice>) {
+    let mut lines = vec![
+        format!("没找到项目「{asked}」。请选择在哪个项目添加任务「{title}」："),
+        String::new(),
+    ];
+    let mut choices = Vec::new();
+    let mut num = 3u32;
+    for (id, name) in candidates {
+        lines.push(format!("{num} = {name}"));
+        choices.push(PendingChoice { num, project_id: Some(id), label: name });
+        num += 1;
+    }
+    lines.push(format!("{num} = 用当前项目「{current_name}」"));
+    choices.push(PendingChoice {
+        num,
+        project_id: Some(current_id.to_string()),
+        label: current_name.to_string(),
+    });
+    num += 1;
+    lines.push(format!("{num} = 取消添加"));
+    choices.push(PendingChoice {
+        num,
+        project_id: None,
+        label: "取消添加".to_string(),
+    });
+    lines.push(String::new());
+    lines.push("回复选项数字即可（1/2 是系统保留号）。".to_string());
+    (lines.join("\n"), choices)
+}
+
+fn resolve_pending(
+    pending: &PendingAddTask,
+    text: &str,
+    projects: &[(String, String)],
+) -> Option<PendingResolution> {
+    let (action, body) = parse_reply(text);
+    match action {
+        ReplyAction::Custom(n) => pending
+            .choices
+            .iter()
+            .find(|c| c.num == n)
+            .map(|c| PendingResolution {
+                project_id: c.project_id.clone(),
+            }),
+        // 用户直接回项目名也认：不强迫一定按编号选。
+        ReplyAction::Free => {
+            let id = match_project_id(projects, &body)?;
+            Some(PendingResolution {
+                project_id: Some(id),
+            })
+        }
+        // 1/2 是系统动作，不当项目确认。
+        _ => None,
+    }
+}
+
+fn create_and_notify(
+    store: &Store,
+    claim: &Claim,
+    title: &str,
+    project_id: &str,
+    source: &str,
+) {
+    let note = format!("由 tba 聚合监听从{source}指令添加");
+    match add_todo_task(store, project_id, title, &note) {
+        Ok(r) => {
+            let mut msg = format!(
+                "已从{source}指令添加任务「{title}」到项目「{}」（task_id {}）",
+                project_name(&store.load_projects_cache(), project_id),
+                r.task_id
+            );
+            if let Some(w) = r.list_warning {
+                msg.push_str(&format!("；{w}"));
+            }
+            notify(store, &claim.claim_id, &msg);
+        }
+        Err(e) => notify(store, &claim.claim_id, &format!("添加任务「{title}」失败：{e}")),
+    }
+}
+
+// 返回 true = 这条消息已消费，不再当普通回复分发。
+fn handle_add_command(store: &Store, claim: &Claim, text: &str, source: &str) -> bool {
+    let Some(req) = parse_add_task(text) else {
+        return false;
+    };
+    let projects = store.load_projects_cache();
+    match req.project.as_deref() {
+        Some(name) => match match_project_id(&projects, name) {
+            Some(pid) => create_and_notify(store, claim, &req.title, &pid, source),
+            None => {
+                let current_name = project_name(&projects, &claim.project_id);
+                let candidates = candidate_projects(&projects, name, &claim.project_id);
+                let (q, choices) = build_confirmation(
+                    &req.title,
+                    name,
+                    &claim.project_id,
+                    &current_name,
+                    candidates,
+                );
+                let pending = PendingAddTask {
+                    title: req.title.clone(),
+                    source: source.to_string(),
+                    choices,
+                };
+                if let Err(e) = save_pending(&store.root, &claim.claim_id, &pending) {
+                    notify(store, &claim.claim_id, &format!("记不下项目确认状态，没添加任务：{e}"));
+                } else {
+                    notify(
+                        store,
+                        &claim.claim_id,
+                        &format!("收到添加任务「{}」的指令，正在等你确认项目。", req.title),
+                    );
+                    if let Err(e) = ask(store, &claim.claim_id, &q) {
+                        clear_pending(&store.root, &claim.claim_id);
+                        notify(store, &claim.claim_id, &format!("项目确认提问失败，没添加任务：{e}"));
+                    }
+                }
+            }
+        },
+        None => create_and_notify(store, claim, &req.title, &claim.project_id, source),
+    }
+    true
+}
+
+fn handle_pending_answer(store: &Store, claim: &Claim, text: &str, source: &str) -> bool {
+    let path = pending_path(&store.root, &claim.claim_id);
+    if !path.exists() {
+        return false;
+    }
+    // 用户在等确认时又发了新的「添加一个任务」：旧确认作废，新指令照常处理。
+    if parse_add_task(text).is_some() {
+        clear_pending(&store.root, &claim.claim_id);
+        return false;
+    }
+    let pending = match load_pending(&store.root, &claim.claim_id) {
+        Some(p) => p,
+        None => {
+            clear_pending(&store.root, &claim.claim_id);
+            return false;
+        }
+    };
+    let projects = store.load_projects_cache();
+    let resolution = resolve_pending(&pending, text, &projects);
+    clear_pending(&store.root, &claim.claim_id);
+    match resolution {
+        Some(r) => match r.project_id {
+            Some(pid) => create_and_notify(store, claim, &pending.title, &pid, &pending.source),
+            None => notify(store, &claim.claim_id, &format!("已取消添加任务「{}」。", pending.title)),
+        },
+        None => notify(
+            store,
+            &claim.claim_id,
+            &format!("没识别到项目，任务「{}」未添加。", pending.title),
+        ),
+    }
+    // 确认完照常回到「进行中」；1/2 仍由 dispatch_reply 按系统语义处理。
+    dispatch_reply(store, &claim.claim_id, text, source);
+    true
+}
+
+fn handle_message(store: &Store, claim: &Claim, text: &str, source: &str) {
+    if handle_pending_answer(store, claim, text, source) {
+        return;
+    }
+    if handle_add_command(store, claim, text, source) {
+        return;
+    }
+    let wake = wake_text(source, text);
+    events::append(&store.root, &claim.claim_id, source, text);
+    write_wake_request(&store.root, &claim.claim_id, &wake);
+    dispatch_reply(store, &claim.claim_id, &wake, source);
 }
 
 // 分发一条回复：parse_reply 判动作，回 1 才 finish；其余 resume/noted 不改终态。
@@ -231,5 +508,51 @@ mod tests {
             !crate::ops::ts_after(comment, &cur.after(baseline)),
             "同一条评论不再满足 ts_after，不会被重放"
         );
+    }
+
+    #[test]
+    fn add_task_confirmation_starts_options_at_three() {
+        let (q, choices) = build_confirmation(
+            "补文档",
+            "未知项目",
+            "cur-id",
+            "当前项目",
+            vec![("a".into(), "A".into()), ("b".into(), "B".into())],
+        );
+        let nums: Vec<u32> = choices.iter().map(|c| c.num).collect();
+        assert_eq!(nums, vec![3, 4, 5, 6]);
+        assert_eq!(choices[2].project_id.as_deref(), Some("cur-id"));
+        assert_eq!(choices[3].project_id, None, "最后一项是取消");
+        assert!(q.lines().any(|l| l.starts_with("3 = A")));
+        assert!(q.lines().any(|l| l.starts_with("6 = 取消添加")));
+        assert!(!q.lines().any(|l| l.starts_with("1 =") || l.starts_with("2 =")));
+    }
+
+    #[test]
+    fn pending_answer_accepts_number_or_project_name() {
+        let pending = PendingAddTask {
+            title: "补文档".into(),
+            source: "comment".into(),
+            choices: vec![
+                PendingChoice { num: 3, project_id: Some("a".into()), label: "A".into() },
+                PendingChoice { num: 4, project_id: None, label: "取消添加".into() },
+            ],
+        };
+        let projects = vec![
+            ("a".to_string(), "A".to_string()),
+            ("b".to_string(), "B".to_string()),
+        ];
+        let by_num = resolve_pending(&pending, "3", &projects).unwrap();
+        assert_eq!(by_num.project_id.as_deref(), Some("a"));
+
+        let by_name = resolve_pending(&pending, "B", &projects).unwrap();
+        assert_eq!(by_name.project_id.as_deref(), Some("b"));
+
+        let cancelled = resolve_pending(&pending, "4", &projects).unwrap();
+        assert_eq!(cancelled.project_id, None);
+
+        // 1/2 是系统保留号，不能拿来做项目确认。
+        assert!(resolve_pending(&pending, "1", &projects).is_none());
+        assert!(resolve_pending(&pending, "2", &projects).is_none());
     }
 }
