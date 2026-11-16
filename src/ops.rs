@@ -1663,35 +1663,146 @@ fn external_done_state(ctx: &mut Ctx, project_id: &str, task_id: &str) -> Option
     external_done_by(&stage_name, &list_name, &cfg)
 }
 
+// 纯判定：claim-less 终态列里的任务，工作流状态是否落后、需要同步。
+// 终态列 + 非终态状态 -> 该列对应的终态（Some("done")/Some("closed")）；
+// 终态列 + 已是终态、或非终态列 -> None（不动）。复用 external_done_by 的判定口径：
+// 列名优先于状态名，所以「列4 + 待回复」判 done、「列5 + 待回复」判 closed。
+// 注意 caller 必须确认「已在终态列」——这里只看列名，列为空时状态终态会误命中，
+// 所以 claim-less 路径调用时 list_name 用的是该任务实际所在列（必非空）。
+fn claimless_stage_fix(
+    stage_name: &str,
+    list_name: &str,
+    cfg: &crate::config::Config,
+) -> Option<&'static str> {
+    let in_terminal_list = list_name == cfg.tasklist_done || list_name == cfg.tasklist_closed;
+    if !in_terminal_list {
+        return None;
+    }
+    // 状态已是任一终态就不动（幂等；也避免列5+状态已解决被反着写回列4的状态）。
+    if stage_name == STAGE_DONE || stage_name == STAGE_CLOSED {
+        return None;
+    }
+    external_done_by(stage_name, list_name, cfg)
+}
+
+// claim-less：终态列（列4/列5）里可能躺着状态没跟上的任务（典型：tba ask -q
+// 自动建的 task，没 claim、被拖进终态列后状态还停在「待回复」）。
+// 只同步工作流状态到该列对应的终态，不写备注、不新建 claim、不碰其他字段。
+// 活动 claim 的任务跳过——那些由上面的 active 分支统一收尾，别两处抢。
+fn reap_claimless_terminal(store: &Store, project_ids: &[String], out: &mut Vec<String>) {
+    for project_id in project_ids {
+        let mut ctx = match Ctx::new(store.clone(), false) {
+            Ok(c) => c,
+            Err(e) => {
+                out.push(format!("claim-less 状态扫描跳过（Ctx 失败）: {e}"));
+                return;
+            }
+        };
+        let cfg = ctx.tb.cfg.clone();
+        let lists = match ctx.task_lists(project_id) {
+            Ok(l) => l,
+            Err(e) => {
+                out.push(format!("claim-less 状态扫描 {project_id} 取看板列失败: {e}"));
+                continue;
+            }
+        };
+        let terminal: Vec<&crate::tools::ListInfo> = lists
+            .iter()
+            .filter(|l| l.name == cfg.tasklist_done || l.name == cfg.tasklist_closed)
+            .collect();
+        if terminal.is_empty() {
+            continue;
+        }
+        let stages = match ctx.ensure_stages(project_id) {
+            Ok(s) => s,
+            Err(e) => {
+                out.push(format!("claim-less 状态扫描 {project_id} 取阶段失败: {e}"));
+                continue;
+            }
+        };
+        for list in terminal {
+            let tasks = match ctx.list_tasks_in_list(project_id, &list.id) {
+                Ok(t) => t,
+                Err(e) => {
+                    out.push(format!(
+                        "claim-less 状态扫描 {project_id} 列「{}」失败: {e}",
+                        list.name
+                    ));
+                    continue;
+                }
+            };
+            for task in tasks {
+                // 有活动 claim 的交给 active 分支；这里只处理没 claim 的。
+                if store.find_active_claim(&task.id).is_some() {
+                    continue;
+                }
+                let stage_name = stages
+                    .iter()
+                    .find(|s| s.id == task.stage_id)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or_default();
+                let Some(fix) = claimless_stage_fix(stage_name, &list.name, &cfg) else {
+                    continue;
+                };
+                let target = if fix == "closed" { STAGE_CLOSED } else { STAGE_DONE };
+                let Some(to) = ctx.find_stage(&stages, target).cloned() else {
+                    out.push(format!(
+                        "claim-less 状态同步 {} 失败: 缺少「{target}」阶段",
+                        task.id
+                    ));
+                    continue;
+                };
+                match ctx.move_task_if_changed(&task.id, &task.stage_id, &to) {
+                    Ok(()) => out.push(format!(
+                        "已同步 claim-less 任务 {}（{}）状态：{stage_name} → {target}",
+                        task.id, task.title
+                    )),
+                    Err(e) => out.push(format!("claim-less 状态同步 {} 失败: {e}", task.id)),
+                }
+            }
+        }
+    }
+}
+
 // tba sub 常驻监听每轮扫一遍所有活动 claim：用户把任务拖进列4/列5（或改状态为
 // 已解决/已完成）就是明确收尾信号。直接 finish 收尾（列4→done / 列5→closed），
 // 清掉 waits 握手让聚合器不再监听，不用再等用户回 1。只碰真的被外部收尾的，
 // 已收尾/没被拖的都不动；单条失败只记消息，不影响其他任务。
+// 另外扫一遍终态列里没 claim 的任务：状态没跟上就同步（见 reap_claimless_terminal）。
 pub fn reap_external_done(store: &Store) -> Vec<String> {
     let active = store.active_claims();
-    if active.is_empty() {
-        return Vec::new();
-    }
-    let mut ctx = match Ctx::new(store.clone(), false) {
-        Ok(c) => c,
-        Err(e) => return vec![format!("外部收尾扫描跳过（Ctx 失败）: {e}")],
-    };
     let mut out = Vec::new();
-    for c in active {
-        if let Some(st) = external_done_state(&mut ctx, &c.project_id, &c.task_id) {
-            let to_stage = if st == "closed" { STAGE_CLOSED } else { STAGE_DONE };
-            match finish(store, &c.claim_id, to_stage) {
-                Ok(_) => {
-                    store.wait_drop(&c.claim_id);
-                    out.push(format!(
-                        "已同步外部收尾 {}（{}）：{to_stage}",
-                        c.claim_id, c.task_name
-                    ));
+    // 项目 id：活动 claim 的 + 当前目录绑定的。claim-less 场景 active 可能为空，
+    // 所以不能因为 active 空就早退；绑定也没有就跳过 network 扫描（单测纯函数照跑）。
+    let mut project_ids: Vec<String> = active.iter().map(|c| c.project_id.clone()).collect();
+    if let Some(p) = crate::ops::read_project_binding() {
+        project_ids.push(p);
+    }
+    project_ids.retain(|p| !p.is_empty());
+    project_ids.dedup();
+
+    if !active.is_empty() {
+        let mut ctx = match Ctx::new(store.clone(), false) {
+            Ok(c) => c,
+            Err(e) => return vec![format!("外部收尾扫描跳过（Ctx 失败）: {e}")],
+        };
+        for c in active {
+            if let Some(st) = external_done_state(&mut ctx, &c.project_id, &c.task_id) {
+                let to_stage = if st == "closed" { STAGE_CLOSED } else { STAGE_DONE };
+                match finish(store, &c.claim_id, to_stage) {
+                    Ok(_) => {
+                        store.wait_drop(&c.claim_id);
+                        out.push(format!(
+                            "已同步外部收尾 {}（{}）：{to_stage}",
+                            c.claim_id, c.task_name
+                        ));
+                    }
+                    Err(e) => out.push(format!("同步外部收尾 {} 失败: {e}", c.claim_id)),
                 }
-                Err(e) => out.push(format!("同步外部收尾 {} 失败: {e}", c.claim_id)),
             }
         }
     }
+    reap_claimless_terminal(store, &project_ids, &mut out);
     out
 }
 
@@ -5754,6 +5865,41 @@ mod tests {
         legacy.tasklist_closed = "5".into();
         assert_eq!(external_done_by("进行中", "4", &legacy), Some("done"));
         assert_eq!(external_done_by("进行中", "5", &legacy), Some("closed"));
+    }
+
+    // claim-less 终态列状态同步：只认「在终态列 + 状态还没到终态」。
+    #[test]
+    fn claimless_stage_fix_only_when_terminal_list_and_stale_state() {
+        let cfg = crate::config::Config::default(); // done=已解决 closed=已完成
+        // 终态列 + 非终态状态 -> 要改（本 bug 的核心场景：已完成列 + 待回复）。
+        assert_eq!(
+            claimless_stage_fix(STAGE_WAIT, &cfg.tasklist_closed, &cfg),
+            Some("closed")
+        );
+        assert_eq!(
+            claimless_stage_fix(STAGE_DOING, &cfg.tasklist_done, &cfg),
+            Some("done")
+        );
+        // 终态列 + 状态已是终态 -> 不动（幂等）。
+        assert_eq!(
+            claimless_stage_fix(STAGE_DONE, &cfg.tasklist_done, &cfg),
+            None
+        );
+        assert_eq!(
+            claimless_stage_fix(STAGE_CLOSED, &cfg.tasklist_closed, &cfg),
+            None
+        );
+        // 非终态列 + 非终态状态 -> 不动。
+        assert_eq!(
+            claimless_stage_fix(STAGE_WAIT, &cfg.tasklist_wait, &cfg),
+            None
+        );
+        assert_eq!(
+            claimless_stage_fix(STAGE_TODO, &cfg.tasklist_queue, &cfg),
+            None
+        );
+        // 列为空（数据源没有列维度）也不动——claim-less 必须有明确列才动。
+        assert_eq!(claimless_stage_fix(STAGE_WAIT, "", &cfg), None);
     }
 
     fn tmp_store(tag: &str) -> Store {
