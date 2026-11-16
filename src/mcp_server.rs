@@ -70,10 +70,10 @@ fn tool_defs() -> Value {
         },
         {
             "name": "ask_user",
-            "description": "提问：把任务状态改回「未完成」但仍留在看板列2，同时把问题写成任务评论。用户在 Teambition 任务下评论回复。",
+            "description": "提问：任务转「待回复」+ 看板列3，问题写进任务备注并发邮件；回复由 tba serve 聚合器托管。优先用 CLI `tba ask <claim_id> -q`（MCP 路径拿不到 DSH_SESSION_ID，可能唤醒旧会话），此工具仅作兼容备用。自定义选项从 3 起编号，1/2 系统保留。",
             "inputSchema": {"type": "object", "properties": {
                 "claim_id": {"type": "string"},
-                "question": {"type": "string", "description": "要问用户的话"}
+                "question": {"type": "string", "description": "要问用户的话（纯文本选项从 3 起编号；1/2 系统保留）"}
             }, "required": ["claim_id", "question"]}
         },
         {
@@ -313,9 +313,9 @@ fn dispatch(store: &Store, name: &str, args: &Value) -> Value {
             let q = arg_str(args, "question")?;
             let c = ask(store, &cid, &q)?;
             Ok(format!(
-                "已提问。任务「{}」现在是「未完成」，仍在看板列「{}」等用户回复；问题已写成任务评论。",
+                "已提问。任务「{}」现在是「待回复」，看板列「{}」；问题已写进任务备注，回复监听由 tba serve 聚合器托管。注意：MCP 路径可能唤醒旧会话，提问优先用 CLI `tba ask <claim_id> -q`。",
                 c.task_name,
-                store.load_config().tasklist_claim
+                store.load_config().tasklist_wait
             ))
         }
         "resume_task" => {
