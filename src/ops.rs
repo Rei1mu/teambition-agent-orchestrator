@@ -64,6 +64,8 @@ pub fn write_wake_request(root: &std::path::Path, claim_id: &str, text: &str) {
 // 工作流状态的 kind 三态（Teambition）：start=开始 / unset=进行中 / end=结束。
 // 只有 kind=end 的任务才算「已完成」(isDone=true)。按 TBHub 的阶段名固定分配：
 //   未完成=start（新任务落这里）、进行中=unset、已解决/已完成=end。
+//   skill/mem 是用途标记，但归为 end（结束态）——用户 2026-11 要求，
+//   代价是这两类任务 isDone=true、会计入完成率（已知并接受）。
 // 约束：一个任务流只能有一个 start，若已被别的状态占用，未完成退化为 unset。
 fn stage_kind(name: &str, has_start: bool) -> &'static str {
     match name {
@@ -77,6 +79,7 @@ fn stage_kind(name: &str, has_start: bool) -> &'static str {
         // 待回复 = 球在用户那，但任务没完成。必须 unset，
         // 用 end 会被算成「已完成」，完成率就假了。
         STAGE_DOING | STAGE_WAIT => "unset",
+        SKILL_STATE | MEMORY_STATE => "end",
         _ => "end",
     }
 }
@@ -475,12 +478,16 @@ impl Ctx {
     // （name 在那个工具里是「重命名工作流」，语义完全不对）。
     // mock 用 taskflowstatus.create，直接收 name/title。
     // 两套参数形状不兼容，按工具名分派，别混发。
+    //
+    // remove_id 非空时先 remove 旧状态再 upsert 同名：服务端 upsert 同名会报
+    // "X exists"，改 kind（或改名）只能 remove + upsert 放同一次调用（实测）。
     fn create_stage(
         &mut self,
         project_id: &str,
         tf: &str,
         name: &str,
         kind: &str,
+        remove_id: Option<&str>,
     ) -> Result<(), String> {
         let tools = self.tool_candidates(
             &self.map.create_stage,
@@ -489,7 +496,11 @@ impl Ctx {
                 "teambition.taskflowstatus.create",
             ],
         );
-        let tfs = json!({"upsert": [{"name": name, "kind": kind}]}).to_string();
+        let mut tfs = json!({"upsert": [{"name": name, "kind": kind}]});
+        if let Some(id) = remove_id {
+            tfs["remove"] = json!([id]);
+        }
+        let tfs = tfs.to_string();
         let mut last_err = String::new();
         for t in &tools {
             let args = if t.contains("taskflow-update") {
@@ -527,7 +538,7 @@ impl Ctx {
             }
             let has_start = stages.iter().any(|s| s.kind == "start");
             let kind = stage_kind(want, has_start);
-            self.create_stage(project_id, &tf, want, kind)?;
+            self.create_stage(project_id, &tf, want, kind, None)?;
             created.push(want.to_string());
         }
         // 重新拉一次，保证 id 准确
@@ -606,14 +617,20 @@ impl Ctx {
             .find(|s| s.name == name))
     }
 
-    // 查一个工作流状态，没有就建（kind=unset：既不是 start 也不是 end）。
-    // 幂等：已存在直接返回。
+    // 查一个工作流状态，没有就建。kind 用 stage_kind 按名字定：
+    // 普通用途状态（如旧调用）默认 unset；skill/mem 是结束态(end)。
+    // 幂等：已存在且 kind 正确直接返回；已存在但 kind 落后（老项目 skill/mem 是 unset）
+    // 则 remove 旧 id + upsert 同名 end（服务端 upsert 同名会报 exists，只能同一次调用里
+    // remove + upsert），实现就地迁移。新 id 会变，任务靠状态名引用，不受影响。
     pub fn ensure_state(&mut self, project_id: &str, name: &str) -> Result<StageInfo, String> {
-        if let Some(s) = self.find_state(project_id, name)? {
-            return Ok(s);
-        }
+        let want = stage_kind(name, false);
+        let remove_id = match self.find_state(project_id, name)? {
+            Some(s) if s.kind == want => return Ok(s),
+            Some(s) => Some(s.id), // kind 落后：remove + upsert 换掉（upsert 同名报 exists）
+            None => None,
+        };
         let tf = self.taskflow_id(project_id)?;
-        self.create_stage(project_id, &tf, name, "unset")?;
+        self.create_stage(project_id, &tf, name, want, remove_id.as_deref())?;
         self.find_state(project_id, name)?
             .ok_or_else(|| format!("建了状态「{name}」但查不到，请去 Teambition 网页确认"))
     }
@@ -5700,6 +5717,22 @@ pub fn agent_prompt_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_and_mem_states_are_end_kind() {
+        // skill/mem 是结束态：无论有没有 start 状态，kind 都必须是 end。
+        assert_eq!(stage_kind(SKILL_STATE, false), "end");
+        assert_eq!(stage_kind(SKILL_STATE, true), "end");
+        assert_eq!(stage_kind(MEMORY_STATE, false), "end");
+        assert_eq!(stage_kind(MEMORY_STATE, true), "end");
+        // 阶段口径不变。
+        assert_eq!(stage_kind(STAGE_TODO, false), "start");
+        assert_eq!(stage_kind(STAGE_TODO, true), "unset");
+        assert_eq!(stage_kind(STAGE_DOING, false), "unset");
+        assert_eq!(stage_kind(STAGE_WAIT, false), "unset");
+        assert_eq!(stage_kind(STAGE_DONE, false), "end");
+        assert_eq!(stage_kind(STAGE_CLOSED, false), "end");
+    }
 
     #[test]
     fn agent_tagged_title_is_idempotent_and_swappable() {
