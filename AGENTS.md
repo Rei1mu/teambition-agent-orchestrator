@@ -60,6 +60,8 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
 
+> **子代理槽位**：tba sub 派的子代理由 DSH 管理（跑完自动结算释放并发槽，可用 `send_message` 冷恢复继续；不同子代理模式见 DSH 文档）。并发上限（默认 8）在 DSH 侧配置，不属 tba；若真的撞满，重启 DSH 或换新会话即可释放，不需要改 tba 代码、也不要在 tba 里写 dispose 逻辑。
+
 ## 详细流程
 
 看 `docs/流程图.md`。需要时再读，不要一开始就整份加载。
