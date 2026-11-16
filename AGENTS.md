@@ -59,6 +59,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 3. **做完必须 `tba ask --done`。** 回复监听由 tba serve 的 WatchAggregator 统一托管：邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件随即注入会话、立刻唤醒；不必等 job 退出，也不挂等待者。**禁用 DSH 的 ask_user_question 选择框/弹窗，禁用 MCP `tba ask_user`**；主代理要用户拍板也走 `tba ask`：没有现成 claim 时直接 `tba ask -q "<纯文本选项，从 3 起编号>"` 自动新建一条 task 并转「待回复」，有 claim 就 `tba ask <claim> -q "..."`，不直接在聊天框给选项；要提问只用 CLI `tba ask <claim> -q "<纯文本选项，选项从 3 起编号>"`，不用 DSH 选择框。**不许 `--no-wait`**、不许 agent 自己 `done` / `close`，只有用户回 `1` 才收尾（`2`=写记忆、`3+`=有问题、`0` 已废弃，都不收尾）。别重跑 `ask`（会重复发信）；执行中收到的回复用 `tba events --claim <claim>` 查看。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
+6. **主代理派子代理前先打 tag**：收到 `tba sub` 简报后，先跑 `tba sub <claim_id> --agent-tag agent-N`（N 按子代理序号递增，如 agent-1 / agent-2），把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
 
 > **子代理槽位**：tba sub 派的子代理由 DSH 管理（跑完自动结算释放并发槽，可用 `send_message` 冷恢复继续；不同子代理模式见 DSH 文档）。并发上限（默认 8）在 DSH 侧配置，不属 tba；若真的撞满，重启 DSH 或换新会话即可释放，不需要改 tba 代码、也不要在 tba 里写 dispose 逻辑。
 

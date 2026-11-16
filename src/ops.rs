@@ -3021,7 +3021,12 @@ pub fn subagent_brief(
     // 主代理收尾指引：子代理自己 note+ask；主代理提问也走 tba ask，不直接在聊天里问。
     s.push_str(&main_agent_tail_text(&exe, &claim.claim_id, lang));
     // 常驻监听唤醒主代理后就退出了；派完子代理得再挂一条，否则队列没人盯。
-    s.push_str("\n===== 主代理：派完子代理再挂一条 `tba sub` 后台监听继续等新任务（裸命令即可，不用开关）=====\n");
+    // v0.2.50：派活打 tag 的强制规范写进简报末尾，主代理一眼能看到。
+    s.push_str(if zh {
+        "\n===== 主代理：收到本简报先 `tba sub <claim_id> --agent-tag agent-N` 打 tag，再用 subagent 工具派活；派完再挂一条 `tba sub` 后台监听继续等新任务（裸命令即可，不用开关）=====\n"
+    } else {
+        "\n===== Main agent: on receiving this brief, first run `tba sub <claim_id> --agent-tag agent-N`, then dispatch via the subagent tool; after dispatch re-hang one `tba sub` (bare command, no flags) =====\n"
+    });
     s
 }
 
@@ -3031,6 +3036,7 @@ fn main_agent_tail_text(exe: &str, claim_id: &str, lang: Lang) -> String {
         format!(
             r#"
 ===== 主代理收尾指引（你来做，别让子代理做）=====
+**派活先打 tag，再调 subagent 工具**：收到简报后先跑 `{exe} sub {id} --agent-tag agent-N`（N 按子代理派发顺序递增，如 agent-1 / agent-2），把 `agent-N:` 前缀写进 Teambition 标题和 claim.note；然后再用 subagent 工具把这份简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `{exe} sub` 继续监听。
 子代理已用 CLI `{exe} ask`/`{exe} reply`/`{exe} events` 走完待回复交互并把结论写进任务备注。你只做最终确认：读回备注与回复，核对产物。done/close 仍只由用户回 1 触发聚合器 finish，主代理不自己 done/close。
 **你要用户拍板时也走 `tba ask` 转「待回复」：手上没有现成 claim 就直接 `{exe} ask -q "问题（纯文本选项，从 3 起编号；1/2 系统保留）"`，tba 会自动新建一条 task 并转「待回复」；有 claim 就带上 `{exe} ask {id} -q "..."`。不要直接在聊天框给选项、不要弹 DSH 的 ask_user_question 选择框、不要用 MCP `{exe} ask_user`。** 收到回复先 `{exe} reply <claim_id>`，再 `{exe} events --claim <claim_id>` 读回原话。
 "#,
@@ -3040,6 +3046,7 @@ fn main_agent_tail_text(exe: &str, claim_id: &str, lang: Lang) -> String {
         format!(
             r#"
 ===== Main agent closing notes (you do this, not the subagent) =====
+**Tag before dispatch**: after receiving the brief, first run `{exe} sub {id} --agent-tag agent-N` (N increments per dispatch: agent-1, agent-2, ...) so the `agent-N:` prefix lands in the Teambition title and claim.note; only then use the subagent tool with this brief as the prompt. Never dispatch via subagent without tagging first. After dispatch re-hang one `{exe} sub` to keep listening.
 The subagent drives the waiting-reply loop via CLI `{exe} ask`/`{exe} reply`/`{exe} events` and writes results into the task note. You only confirm: read the note and replies, check artifacts. done/close still happens only when the user replies 1 (aggregator finish); main agent never runs done/close itself.
 **When YOU need a decision, route it through `{exe} ask` too: with no claim at hand run `{exe} ask -q "question (plain-text options numbered from 3; 1/2 reserved)"` and tba creates a new task and moves it to waiting-reply; with a claim use `{exe} ask {id} -q "..."`. NEVER give options directly in chat, NEVER use DSH's ask_user_question picker/modal, NEVER use MCP `{exe} ask_user`.** On a reply run `{exe} reply <claim_id>` then `{exe} events --claim <claim_id>`.
 "#,
@@ -5367,6 +5374,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **交回**：做完两步，不许省：\n\
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
+         **派子代理先打 tag**：主代理收到 `{exe} sub` 简报后，先跑 `{exe} sub <claim_id> --agent-tag agent-N`\
+         （N 按子代理序号递增，如 agent-1 / agent-2），把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；\
+         然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `{exe} sub` 继续监听。\n\n\
          **回复监听**：`ask` 写问题进备注 + 转「待回复」+ 发邮件后立即返回；监听由 **tba serve 的 WatchAggregator 统一托管**。\
           邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。\
           **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，\
@@ -5429,7 +5439,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         && old.contains("tba serve 的 WatchAggregator 统一托管")
         && old.contains("禁用 DSH 的 ask_user_question 选择框/弹窗")
         && old.contains("主代理要用户拍板也走")
-        && old.contains("自动新建一条 task");
+        && old.contains("自动新建一条 task")
+        // v0.2.50：派子代理前先 --agent-tag 打 tag，老入口缺这句要整段重写一次。
+        && old.contains("派子代理先打 tag");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
     let ultracave_ok = old.matches(ULTRACAVE_MARK).count() == 1;
 
@@ -6466,6 +6478,50 @@ mod tests {
                 "缺不直接聊天问: {t}"
             );
         }
+    }
+
+    // 派子代理前主代理必须先 tba sub <claim_id> --agent-tag agent-N 打 tag，再用 subagent 工具派活。
+    // v0.2.50：简报/入口没写这条时，主代理直接调 subagent 工具，tag 从来没落过，任务标题查不到序号。
+    #[test]
+    fn main_agent_tail_tags_subagent_before_dispatch() {
+        for lang in [Lang::Zh, Lang::En] {
+            let t = main_agent_tail_text("tba", "clm-main", lang);
+            assert!(t.contains("tba sub clm-main --agent-tag agent-N"), "缺打 tag 命令: {t}");
+            assert!(t.contains("subagent"), "缺 subagent 工具派活指引: {t}");
+            assert!(
+                (t.contains("先") && t.contains("再"))
+                    || (t.contains("first run") && t.contains("only then")),
+                "缺先打 tag 再派活的时序: {t}"
+            );
+        }
+    }
+
+    // v0.2.50：入口块必须带派活打 tag 规范；老 AGENTS.md 缺这句要被整段重写一次。
+    #[test]
+    fn entry_file_refreshes_when_agent_tag_rule_missing() {
+        let store = tmp_store("entry-agenttag");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("tba sub <claim_id> --agent-tag agent-N"), "入口缺打 tag 规范: {s}");
+
+        // 造一份「其它版本条件都在、唯独缺 --agent-tag」的老入口。
+        let old = format!(
+            "# 用户说明\n\n{ENTRY_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
+             ## 任务队列入口\n\n\
+             **工具**：`tba`（项目根的 tba.cmd 等价）。\n\n\
+             **交回**：做完两步。`ask` 后 **流转** 到待回复。**通用能力**：`git create`。\n\n\
+             1/2 是系统保留号。\n会话窗直接回\ntba serve 的 WatchAggregator 统一托管\n\
+             禁用 DSH 的 ask_user_question 选择框/弹窗\n主代理要用户拍板也走\n自动新建一条 task\n\n\
+             {RULES_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 编码纪律\n\n四条。\n"
+        );
+        std::fs::write(&p, old).unwrap();
+        assert!(ensure_entry_at(&dir, "tba").is_some(), "缺 --agent-tag 的老入口必须重写");
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("tba sub <claim_id> --agent-tag agent-N"), "重写后仍缺打 tag 规范: {s}");
+        assert_eq!(s.matches(ENTRY_MARK).count(), 1, "重写不能重复追加入口块");
+        assert!(s.contains("# 用户说明"), "用户自己的内容不能丢");
+        assert!(ensure_entry_at(&dir, "tba").is_none(), "已是新版就不该反复重写");
     }
 
     // 自动生成的 AGENTS.md 入口：旧 spawn detached / run_in_background / 前台等待者
