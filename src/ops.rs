@@ -2847,26 +2847,34 @@ pub fn subagent_brief(
     // 项目上下文（能力 + skill 索引）复用开工文案的同款内容，本地就能生成。
     s.push_str(&prompt_head(store, &claim.project_id, &proj_name, skills, None, lang, false));
     s.push_str(&subagent_workflow_text(&exe, &claim.claim_id, lang));
-    // 主代理收尾指引：子代理自己 note+ask，主代理只做最终确认。
-    s.push_str("
-===== 主代理收尾指引（你来做，别让子代理做）=====
-");
-    if zh {
-        s.push_str(&format!(
-            r#"子代理已用 CLI `tba ask`/`tba reply`/`tba events` 走完待回复交互并把结论写进任务备注。你只做最终确认：读回备注与回复，核对产物。done/close 仍只由用户回 1 触发聚合器 finish，主代理不自己 done/close。{exe} note {id} --text "最终确认" 可选。
-"#,
-            exe = exe, id = claim.claim_id
-        ));
-    } else {
-        s.push_str(&format!(
-            r#"The subagent drives the waiting-reply loop via CLI `tba ask`/`tba reply`/`tba events` and writes results into the task note. You only confirm: read the note and replies, check artifacts. done/close still happens only when the user replies 1 (aggregator finish); main agent never runs done/close itself. Optional: {exe} note {id} --text "final confirmation".
-"#,
-            exe = exe, id = claim.claim_id
-        ));
-    }
+    // 主代理收尾指引：子代理自己 note+ask；主代理提问也走 tba ask，不直接在聊天里问。
+    s.push_str(&main_agent_tail_text(&exe, &claim.claim_id, lang));
     // 常驻监听唤醒主代理后就退出了；派完子代理得再挂一条，否则队列没人盯。
     s.push_str("\n===== 主代理：派完子代理再挂一条 `tba sub` 后台监听继续等新任务（裸命令即可，不用开关）=====\n");
     s
+}
+
+/// 主代理侧指引。单独抽出来是为了能单测「主代理提问也走 tba ask、不弹选择框」。
+fn main_agent_tail_text(exe: &str, claim_id: &str, lang: Lang) -> String {
+    if lang == Lang::Zh {
+        format!(
+            r#"
+===== 主代理收尾指引（你来做，别让子代理做）=====
+子代理已用 CLI `{exe} ask`/`{exe} reply`/`{exe} events` 走完待回复交互并把结论写进任务备注。你只做最终确认：读回备注与回复，核对产物。done/close 仍只由用户回 1 触发聚合器 finish，主代理不自己 done/close。
+**你要用户拍板时也走 `tba ask` 转「待回复」：手上没有现成 claim 就直接 `{exe} ask -q "问题（纯文本选项，从 3 起编号；1/2 系统保留）"`，tba 会自动新建一条 task 并转「待回复」；有 claim 就带上 `{exe} ask {id} -q "..."`。不要直接在聊天框给选项、不要弹 DSH 的 ask_user_question 选择框、不要用 MCP `{exe} ask_user`。** 收到回复先 `{exe} reply <claim_id>`，再 `{exe} events --claim <claim_id>` 读回原话。
+"#,
+            exe = exe, id = claim_id
+        )
+    } else {
+        format!(
+            r#"
+===== Main agent closing notes (you do this, not the subagent) =====
+The subagent drives the waiting-reply loop via CLI `{exe} ask`/`{exe} reply`/`{exe} events` and writes results into the task note. You only confirm: read the note and replies, check artifacts. done/close still happens only when the user replies 1 (aggregator finish); main agent never runs done/close itself.
+**When YOU need a decision, route it through `{exe} ask` too: with no claim at hand run `{exe} ask -q "question (plain-text options numbered from 3; 1/2 reserved)"` and tba creates a new task and moves it to waiting-reply; with a claim use `{exe} ask {id} -q "..."`. NEVER give options directly in chat, NEVER use DSH's ask_user_question picker/modal, NEVER use MCP `{exe} ask_user`.** On a reply run `{exe} reply <claim_id>` then `{exe} events --claim <claim_id>`.
+"#,
+            exe = exe, id = claim_id
+        )
+    }
 }
 
 /// 子代理专属流程说明：任务已认领，它自己用 CLI 走待回复交互 + 写备注 + 回报，不碰 done/close。
@@ -4417,7 +4425,7 @@ fn workflow_text_zh(
     // 第 3 步：数字协议由 tb 执行（agent 不解释、不跑 done），只有 1 收尾。
     // ask 默认挂后台常驻监听，所以这里不再有单独的 wait 一步。
     s.push_str(&format!(
-        "3. 要用户输入：`{exe} ask <claim_id> -q \"问题（纯文本选项，从 3 起编号）\"`（问题进备注，转「{0}」+列「{1}」，发邮件，立即返回；回复监听由 tba serve 聚合器统一托管）。回复数字 tb 自动处理：1=已解决→列{3}收尾；2=先写项目记忆→列{2}，写完再ask；3+=有问题→列{2}；非数字=按原文→列{2}；0 已废弃，按原文不收尾。只有1收尾，其余回列{2}。只等别重复问。自定义问题里选项必须从 3 起编号（3/4/5…），1/2 是系统保留号（1=收尾 2=写记忆，tb 直接执行），拿来当自己的选项会导致用户回 1 被误收尾，tba 会拒绝发这种问题。选项用纯文本编号，禁用选择框/弹窗，禁用 DSH ask_user_question。\n",
+        "3. 要用户输入（主代理/子代理都一样）：`{exe} ask <claim_id> -q \"问题（纯文本选项，从 3 起编号）\"` 转「{0}」+列「{1}」+发邮件，立即返回；回复监听由 tba serve 聚合器统一托管。**主代理手上没有现成 claim 时直接 `{exe} ask -q \"...\"`，tba 自动新建一条 task 并转「待回复」。不要直接在聊天框给选项、不要弹 DSH 的 ask_user_question 选择框、不要用 MCP `{exe} ask_user`**。回复数字 tb 自动处理：1=已解决→列{3}收尾；2=先写项目记忆→列{2}，写完再ask；3+=有问题→列{2}；非数字=按原文→列{2}；0 已废弃，按原文不收尾。只有1收尾，其余回列{2}。只等别重复问。自定义问题里选项必须从 3 起编号（3/4/5…），1/2 是系统保留号（1=收尾 2=写记忆，tb 直接执行），拿来当自己的选项会导致用户回 1 被误收尾，tba 会拒绝发这种问题。选项用纯文本编号，**主代理也不直接在聊天问**，禁用选择框/弹窗，禁用 DSH ask_user_question，禁用 MCP `{exe} ask_user`。\n",
         STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
     ));
 
@@ -4507,7 +4515,7 @@ fn workflow_text(
     }
 
     s.push_str(&format!(
-        "3. Need user input: `{exe} ask <claim_id> -q \"question (plain-text options numbered from 3)\"` (-> {0} + column \"{1}\", mail sent, returns at once; reply listening owned by tba serve aggregator). tb handles numbers: 1=solved -> col {3}, closed; 2=write project memory first -> col {2}, then ask again; 3+=problem -> col {2}; non-number=read as text -> col {2}; 0 deprecated, read as text, never closes. ONLY 1 closes; others return to col {2}. In a custom question, number your own options from 3 (3/4/5...): 1/2 are reserved system actions (1=close 2=memory, executed by tb), using them as your options would mis-close the task on reply 1, and tba rejects such questions. Plain numbered options; NEVER use DSH ask_user_question picker/modal.\n",
+        "3. User input (main + subagent): `{exe} ask <claim_id> -q \"question (options from 3)\"` -> {0} + col \"{1}\", mail sent; aggregator owns replies. **Main agent with no claim: `{exe} ask -q \"...\"` creates a task in waiting-reply. Never give options in chat, NEVER use DSH ask_user_question or MCP `{exe} ask_user`.** tb handles numbers: 1=solved -> col {3}, closed; 2=write project memory first -> col {2}, then ask again; 3+=problem -> col {2}; non-number=read as text -> col {2}; 0 deprecated, read as text, never closes. ONLY 1 closes; others return to col {2}. In a custom question, number your own options from 3 (3/4/5...): 1/2 are reserved system actions (1=close 2=memory, executed by tb), using them as your options would mis-close the task on reply 1, and tba rejects such questions. Plain numbered options; main agent also uses `{exe} ask`, never chat; NEVER use DSH ask_user_question or MCP `{exe} ask_user`.\n",
         STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
     ));
 
@@ -5192,7 +5200,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
           邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。\
           **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，\
           拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。选项写纯文本，\
-          **禁用 DSH 的 ask_user_question 选择框/弹窗，禁用 MCP `{exe} ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧会话）。\
+          **主代理要用户拍板也走 `{exe} ask`：没有现成 claim 时直接 `{exe} ask -q \"问题（纯文本选项，从 3 起编号）\"`，tba 自动新建一条 task 并转「待回复」；有 claim 就 `{exe} ask <claim_id> -q \"...\"`。不直接在聊天框给选项、禁用 DSH 的 ask_user_question 选择框/弹窗、不用 MCP `{exe} ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧会话）。\
           **查看回复**：执行中收到的回复用 `{exe} events --claim <claim_id>` 查看；不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 `ask`（会重复发信）。\
           **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、\
           看不到它，所以先跑 `{exe} reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。\
@@ -5236,6 +5244,8 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     // 「**工具**：`tba`」同时当版本号用——老入口里是本机绝对路径，缺这句就整段
     // 替换成新版（不会重复追加）。`git create` 也是版本号（v0.2.20 加的）。
     // v0.2.42：监听由 tba serve 聚合器统一托管，旧 detached / run_in_background 文案整段重写。
+    // v0.2.43：主代理要用户拍板也走 tba ask，不直接在聊天框给选项；缺这句就再重写一次。
+    // v0.2.44：主代理无 claim 时 ask 自动新建 task，入口块要带上这句。
     let entry_ok = old.matches(ENTRY_MARK).count() == 1
         && old.contains(&format!("**工具**：`{exe}`"))
         && old.contains("**交回**")
@@ -5246,7 +5256,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         && old.contains("1/2 是系统保留号")
         && old.contains("会话窗直接回")
         && old.contains("tba serve 的 WatchAggregator 统一托管")
-        && old.contains("禁用 DSH 的 ask_user_question 选择框/弹窗");
+        && old.contains("禁用 DSH 的 ask_user_question 选择框/弹窗")
+        && old.contains("主代理要用户拍板也走")
+        && old.contains("自动新建一条 task");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
     let ultracave_ok = old.matches(ULTRACAVE_MARK).count() == 1;
 
@@ -6206,6 +6218,28 @@ mod tests {
         }
     }
 
+    // 主代理要用户拍板也必须走 tba ask -q，不能直接在聊天框给选项 / 弹 DSH 选择框。
+    #[test]
+    fn main_agent_tail_routes_decisions_through_tba_ask() {
+        for lang in [Lang::Zh, Lang::En] {
+            let t = main_agent_tail_text("tba", "clm-main", lang);
+            assert!(t.contains("tba ask -q"), "缺主代理无 claim 直建 task 的 ask -q: {t}");
+            assert!(t.contains("tba ask clm-main -q"), "缺主代理带 claim 的 ask -q: {t}");
+            assert!(
+                t.contains("自动新建") || t.contains("creates a new task"),
+                "缺自动新建 task 说明: {t}"
+            );
+            assert!(t.contains("tba reply <claim_id>"), "缺主代理 reply: {t}");
+            assert!(t.contains("tba events --claim"), "缺主代理 events: {t}");
+            assert!(t.contains("ask_user_question"), "缺点名禁用 DSH 选择框: {t}");
+            assert!(t.contains("ask_user"), "缺点名禁用 MCP ask_user: {t}");
+            assert!(
+                t.contains("不要直接在聊天框") || t.contains("NEVER give options directly in chat"),
+                "缺不直接聊天问: {t}"
+            );
+        }
+    }
+
     // 自动生成的 AGENTS.md 入口：旧 spawn detached / run_in_background / 前台等待者
     // 必须随 tba serve 聚合器模型一起清掉，并写明纯文本 ask 与禁用选择框。
     #[test]
@@ -6216,7 +6250,9 @@ mod tests {
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(s.contains("tba serve 的 WatchAggregator 统一托管"), "缺聚合器托管说明: {s}");
         assert!(s.contains("tba ask <claim_id> -q") || s.contains("纯文本"), "缺纯文本 ask 说明: {s}");
-        assert!(s.contains("禁用 DSH 的 ask_user_question 选择框/弹窗"), "缺禁用 DSH 选择框: {s}");
+        assert!(s.contains("禁用 DSH 的 ask_user_question 选择框/弹窗") || s.contains("不弹 DSH 的 ask_user_question 选择框/弹窗"), "缺禁用 DSH 选择框: {s}");
+        assert!(s.contains("主代理要用户拍板也走"), "缺主代理也走 tba ask 规则: {s}");
+        assert!(s.contains("自动新建一条 task"), "缺无 claim 自动建 task 规则: {s}");
         for stale in ["spawn detached", "DSH 后台唤醒配方"] {
             assert!(!s.contains(stale), "入口块仍含旧措辞 {stale}: {s}");
         }

@@ -1762,15 +1762,40 @@ pub fn run() -> Result<(), String> {
                 let _ = std::io::stdout().flush();
                 return Ok(());
             }
-            let claim_id = claim_id
-                .ok_or("要给 claim id：`tba ask <claim_id> -q \"...\"`（直连模式可写 --off 省掉它）")?;
+            // 主代理要用户拍板但手上没有现成 claim（比如会话内直接提的要求）：
+            // 不带 claim_id 且非 --off 时，直接新建一条 task 并转「待回复」。
+            // 标题用问题首行，避免长问题撑爆标题，也让每次提问各自独立。
+            let claim_id = match claim_id {
+                Some(id) => id,
+                None => {
+                    let pid = resolve_project(None)?;
+                    let title = q
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("需要你回复")
+                        .trim()
+                        .chars()
+                        .take(60)
+                        .collect::<String>();
+                    let r = start(&store, &pid, &title, "", &current_agent())?;
+                    for w in &r.warnings {
+                        eprintln!("警告: {w}");
+                    }
+                    println!(
+                        "已新建任务并提问：task_id: {}  链接: {}",
+                        r.claim.task_id,
+                        crate::ops::task_url(&r.claim.task_id)
+                    );
+                    r.claim.claim_id
+                }
+            };
             let c = ask(&store, &claim_id, &q)?;
             let cfg = store.load_config();
             println!(
                 "已提问。任务「{}」现在是「{}」，看板列「{}」，球在用户那边。",
                 c.task_name, STAGE_WAIT, cfg.tasklist_wait
             );
-            println!("问题已写进任务备注，邮件已发。");
+            println!("问题已写进任务备注，并尝试发送邮件（失败会写进备注）。");
             if no_wait {
                 println!(
                     "\n（--no-wait）不等回复。想等就自己跑: tba wait {}",

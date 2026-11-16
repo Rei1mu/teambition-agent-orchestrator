@@ -256,7 +256,7 @@ pub enum Cmd {
     /// 提问：改成「待回复」+ 看板列「待回复」，问题写进任务备注，发邮件，
     /// 然后后台常驻监听邮件/评论，收到回复才退出并唤醒会话（本轮回复可正常结束）。
     Ask {
-        /// claim id（--off 时可以省略）
+        /// claim id（省略且非 --off 时自动新建一条 task 并转「待回复」）
         claim_id: Option<String>,
         /// 要问用户的话
         #[arg(long, short = 'q')]
