@@ -379,12 +379,17 @@ fn subagent_watch(
     let iv = store.load_config().wait_interval_secs.max(5);
     let agent = current_agent();
     eprintln!(
-        "tba sub 常驻监听已挂上：项目 {project_id} · 每 {iv} 秒查一次看板列「{STAGE_TODO}」；空队列不退出，领到任务才唤醒。"
+        "tba sub 常驻监听已挂上：项目 {project_id} · 每 {iv} 秒查一次看板列「{STAGE_TODO}」；同时扫描列「{STAGE_DONE}」/「{STAGE_CLOSED}」同步误拖任务的状态与会话；空队列不退出，领到任务才唤醒。"
     );
     loop {
         // 常驻进程不走 cmds::run 的批量续命；自己每轮刷一次，
         // 免得空队列挂久了把同会话的 running 任务误判成死会话回收。
         store.beat_agent(&agent);
+        // 用户把活动任务拖进列4/5 = 明确收尾：同步状态 + 清等待/唤醒握手。
+        // 必须在 sweep 之前——被外部收尾的 waiting 任务否则会一直挂在聚合器里。
+        for m in reap_external_done(store) {
+            eprintln!("{m}");
+        }
         // 没僵尸时 sweep 直接返回，不联网；有僵尸先退回列1，别让它占着队列。
         for m in sweep(store, false).unwrap_or_default() {
             eprintln!("{m}");

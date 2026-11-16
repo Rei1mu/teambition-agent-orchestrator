@@ -1665,6 +1665,38 @@ fn external_done_state(ctx: &mut Ctx, project_id: &str, task_id: &str) -> Option
     external_done_by(&stage_name, &list_name, &cfg)
 }
 
+// tba sub 常驻监听每轮扫一遍所有活动 claim：用户把任务拖进列4/列5（或改状态为
+// 已解决/已完成）就是明确收尾信号。直接 finish 收尾（列4→done / 列5→closed），
+// 清掉 waits 握手让聚合器不再监听，不用再等用户回 1。只碰真的被外部收尾的，
+// 已收尾/没被拖的都不动；单条失败只记消息，不影响其他任务。
+pub fn reap_external_done(store: &Store) -> Vec<String> {
+    let active = store.active_claims();
+    if active.is_empty() {
+        return Vec::new();
+    }
+    let mut ctx = match Ctx::new(store.clone(), false) {
+        Ok(c) => c,
+        Err(e) => return vec![format!("外部收尾扫描跳过（Ctx 失败）: {e}")],
+    };
+    let mut out = Vec::new();
+    for c in active {
+        if let Some(st) = external_done_state(&mut ctx, &c.project_id, &c.task_id) {
+            let to_stage = if st == "closed" { STAGE_CLOSED } else { STAGE_DONE };
+            match finish(store, &c.claim_id, to_stage) {
+                Ok(_) => {
+                    store.wait_drop(&c.claim_id);
+                    out.push(format!(
+                        "已同步外部收尾 {}（{}）：{to_stage}",
+                        c.claim_id, c.task_name
+                    ));
+                }
+                Err(e) => out.push(format!("同步外部收尾 {} 失败: {e}", c.claim_id)),
+            }
+        }
+    }
+    out
+}
+
 // ---- 接单 / 提问 / 继续 / 放弃 / 回收 ----
 //
 // 这是「任务跟着会话走」的核心状态机。两个维度组合出五种局面：
@@ -5656,6 +5688,9 @@ mod tests {
         // 只改状态、列还在「未完成」也算完成
         assert_eq!(external_done_by("已解决", "未完成", &cfg), Some("done"));
         assert_eq!(external_done_by("已完成", "未完成", &cfg), Some("closed"));
+        // 待回复任务被拖进列4/5 也要识别（tba sub 每轮扫活动 claim 的核心场景）。
+        assert_eq!(external_done_by("待回复", "已解决", &cfg), Some("done"));
+        assert_eq!(external_done_by("待回复", "已完成", &cfg), Some("closed"));
         // 列和状态冲突时列优先：拖到「已完成」列=关闭
         assert_eq!(external_done_by("已解决", "已完成", &cfg), Some("closed"));
         // 没收尾的都不算
