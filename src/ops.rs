@@ -1648,11 +1648,9 @@ pub fn external_done_by(
 fn external_done_state(ctx: &mut Ctx, project_id: &str, task_id: &str) -> Option<&'static str> {
     let cfg = ctx.tb.cfg.clone();
     let info = ctx.task_info(task_id).ok()?;
-    let list_name = if info.list_id.is_empty() {
-        String::new()
-    } else {
-        ctx.list_name_of(project_id, &info.list_id)
-    };
+    // 用 task_list_name（走 list_tasks + tql）读列名，不用 task_info().list_id：
+    // get_task 的 list_id 常为空，导致拖到终态列判不出来（实测 show 能读列、reap 漏判）。
+    let list_name = ctx.task_list_name(project_id, task_id);
     let stage_name = if info.stage_id.is_empty() {
         String::new()
     } else {

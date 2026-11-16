@@ -45,6 +45,8 @@ enum Ev {
     Created(Result<String, String>),
     /// 编译工具链位置检测结果（MSVC / Windows SDK）。
     ToolchainChecked(crate::toolchain::Resolved),
+    /// DSH 插件检测结果（后台，不挡窗口）
+    PluginsChecked(Vec<PluginStatus>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -97,6 +99,113 @@ fn save_prefs(store: &Store, p: &UiPrefs) {
     if let Ok(s) = toml::to_string_pretty(p) {
         let _ = std::fs::write(prefs_path(store), s);
     }
+}
+
+// DSH 插件检测。只查路径、只提示，不自动装。
+// 路径用 ~ 开头，detect_plugins 里按 USERPROFILE 展开（Windows）。
+const MODSEARCH_PATHS: &[&str] = &[
+    "~/.dsh/profiles/desktop/node_modules/@liustack/modsearch",
+    "~/.dsh/profiles/web/node_modules/@liustack/modsearch",
+    "~/.dsh/skills/modsearch",
+];
+const BRIDGE_PATHS: &[&str] = &[
+    "~/.dsh/dsh-tba-bridge",
+    "~/.dsh/profiles/desktop/node_modules/dsh-tba-bridge",
+];
+const CONTEXT_DIFF_PATHS: &[&str] = &["~/.dsh/profiles/desktop/node_modules/dsh-context-diff"];
+const SESSION_PRUNER_PATHS: &[&str] = &["~/.dsh/profiles/desktop/node_modules/dsh-session-pruner"];
+
+const MODSEARCH_DESC: &str = "全网最强 DSH 免费联网搜索插件，免费免注册免 API key，为不能联网的模型补搜索，问网页/X 返回结构化 JSON 证据";
+const BRIDGE_DESC: &str = "tba 回复唤醒桥：邮件 / Teambition 新回复立刻注入会话，不用等 job 退出";
+const CONTEXT_DIFF_DESC: &str = "上下文差异能力插件";
+const SESSION_PRUNER_DESC: &str = "会话清理插件";
+
+// 两类来源，文案分开写：GitHub 用 dsh plugin --profile ... add "github:..."，
+// dsh 类从插件市场装，用 dsh plugin add <包名>。
+const INSTALL_MODSEARCH: &str = "GitHub 安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin --profile web add \"github:liustack/modsearch\"\n仓库：https://github.com/liustack/modsearch\n装完重启 harness / 在 Web UI 确认加载。";
+const INSTALL_BRIDGE: &str = "GitHub 安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin --profile desktop add \"github:Rei1mu/dsh-tba-bridge\"\n仓库：https://github.com/Rei1mu/dsh-tba-bridge\n装完重启 harness / 在 Web UI 确认加载。";
+const INSTALL_CONTEXT_DIFF: &str = "从 DSH 插件市场安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin add dsh-context-diff\n装完重启 harness / 在 Web UI 确认加载。";
+const INSTALL_SESSION_PRUNER: &str = "从 DSH 插件市场安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin add dsh-session-pruner\n装完重启 harness / 在 Web UI 确认加载。";
+
+struct PluginSpec {
+    name: &'static str,
+    desc: &'static str,
+    paths: &'static [&'static str],
+    install_text: &'static str,
+}
+
+const PLUGIN_SPECS: &[PluginSpec] = &[
+    PluginSpec {
+        name: "modsearch",
+        desc: MODSEARCH_DESC,
+        paths: MODSEARCH_PATHS,
+        install_text: INSTALL_MODSEARCH,
+    },
+    PluginSpec {
+        name: "dsh-tba-bridge",
+        desc: BRIDGE_DESC,
+        paths: BRIDGE_PATHS,
+        install_text: INSTALL_BRIDGE,
+    },
+    PluginSpec {
+        name: "dsh-context-diff",
+        desc: CONTEXT_DIFF_DESC,
+        paths: CONTEXT_DIFF_PATHS,
+        install_text: INSTALL_CONTEXT_DIFF,
+    },
+    PluginSpec {
+        name: "dsh-session-pruner",
+        desc: SESSION_PRUNER_DESC,
+        paths: SESSION_PRUNER_PATHS,
+        install_text: INSTALL_SESSION_PRUNER,
+    },
+];
+
+#[derive(Clone, Debug)]
+struct PluginStatus {
+    name: &'static str,
+    desc: &'static str,
+    installed: bool,
+    paths: Vec<PathBuf>,
+    install_text: &'static str,
+}
+
+fn plugin_home() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_default()
+}
+
+fn expand_tilde(path: &str, home: &PathBuf) -> PathBuf {
+    let p = std::path::Path::new(path);
+    let mut parts = p.components();
+    if parts.next().and_then(|c| c.as_os_str().to_str()) == Some("~") {
+        let mut out = home.clone();
+        for c in parts {
+            out.push(c);
+        }
+        out
+    } else {
+        p.to_path_buf()
+    }
+}
+
+fn detect_plugins(home: &PathBuf) -> Vec<PluginStatus> {
+    PLUGIN_SPECS
+        .iter()
+        .map(|s| {
+            let paths: Vec<PathBuf> = s.paths.iter().map(|p| expand_tilde(p, home)).collect();
+            let installed = paths.iter().any(|p| p.exists());
+            PluginStatus {
+                name: s.name,
+                desc: s.desc,
+                installed,
+                paths,
+                install_text: s.install_text,
+            }
+        })
+        .collect()
 }
 
 pub struct App {
@@ -167,6 +276,8 @@ pub struct App {
     tc_check: Option<bool>,
     // 最近一次检测结果（None = 还没测过）。
     tc_resolved: Option<crate::toolchain::Resolved>,
+    // DSH 插件状态（None = 后台还没测完）
+    plugins: Option<Vec<PluginStatus>>,
 }
 
 // skill 编辑窗的编辑态。正文是整段 markdown，直接存 String。
@@ -512,13 +623,24 @@ impl App {
             toolchain: crate::toolchain::Toolchain::default(),
             tc_check: Some(true),
             tc_resolved: None,
+            plugins: None,
         };
         if !needs_token {
             app.reload_projects();
         }
         // GitButler 检测放后台跑（要起子进程取版本/工作区状态），不挡窗口打开
         app.check_gitbutler();
+        app.check_plugins();
         app
+    }
+
+    /// 后台检测 4 个 DSH 插件（只查路径，不挡窗口打开）。
+    fn check_plugins(&mut self) {
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let rows = detect_plugins(&plugin_home());
+            let _ = tx.send(Ev::PluginsChecked(rows));
+        });
     }
 
     /// 后台检测 GitButler CLI + git。
@@ -1080,6 +1202,38 @@ impl App {
         }
     }
 
+    /// DSH 插件卡：4 个插件的已装/未装状态 + 未装的可复制安装文案。
+    /// 只提示、不自动装；检测走后台线程，不挡窗口。
+    fn draw_plugins_card(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("DSH 插件").strong());
+        ui.label("只检测、不自动安装。未装的把文案复制去你自己的 shell 跑（本机 dsh 不在 PATH）。");
+        let Some(rows) = self.plugins.as_ref() else {
+            ui.label("检测中...");
+            return;
+        };
+        for p in rows {
+            ui.horizontal_wrapped(|ui| {
+                if p.installed {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0x2e, 0x7d, 0x32),
+                        format!("✓ {}", p.name),
+                    );
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xc6, 0x28, 0x28),
+                        format!("✗ {}", p.name),
+                    );
+                    if ui.small_button("复制安装文案").clicked() {
+                        ui.ctx().copy_text(p.install_text.to_string());
+                        self.status = format!("已复制 {} 安装文案", p.name);
+                    }
+                }
+                ui.label(egui::RichText::new(p.desc).small().weak());
+            });
+        }
+    }
+
     fn reload_projects(&mut self) {
         // 离线：不连 Teambition，直接用上次同步下来的项目列表。
         // 「刷新」在这里的含义变成「重读缓存」，语义上说得通，按钮就不用换文案。
@@ -1246,6 +1400,9 @@ impl eframe::App for App {
                 Ev::ToolchainChecked(r) => {
                     self.tc_resolved = Some(r);
                     self.tc_check = None;
+                }
+                Ev::PluginsChecked(rows) => {
+                    self.plugins = Some(rows);
                 }
                 Ev::GbInstalled(r) => {
                     self.gb_busy = false;
@@ -2494,6 +2651,7 @@ impl App {
         // GitButler / git 也从主界面搬到这里：优先级仍然最高（缺它 TBHub 不干活），
         // 但它平时是「装好就再也不看」的东西，不该常年占着项目列表上方。
         self.draw_gitbutler_card(ui);
+        self.draw_plugins_card(ui);
         ui.add_space(12.0);
         ui.label(
             "界面偏好会单独存到 data/ui.toml，不会碰 Teambition 配置（token 等）。",
@@ -2898,6 +3056,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
         App::new(Store { root })
+    }
+
+    #[test]
+    fn plugin_paths_expand_tilde_from_home() {
+        let home = PathBuf::from(r"C:\Users\tester");
+        assert_eq!(
+            expand_tilde("~/.dsh/profiles/desktop/node_modules/@liustack/modsearch", &home),
+            home.join(r".dsh\profiles\desktop\node_modules\@liustack\modsearch")
+        );
+        assert_eq!(
+            expand_tilde("~/.dsh/dsh-tba-bridge", &home),
+            home.join(r".dsh\dsh-tba-bridge")
+        );
+        assert_eq!(
+            expand_tilde("~/.dsh/skills/modsearch", &home),
+            home.join(r".dsh\skills\modsearch")
+        );
+    }
+
+    #[test]
+    fn plugin_detect_parses_all_four_paths() {
+        let root = std::env::temp_dir().join(format!("tba-plugins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        // modsearch：scope 包 + skills 目录；bridge：bundle 路径。
+        for rel in [
+            r".dsh\profiles\desktop\node_modules\@liustack\modsearch",
+            r".dsh\skills\modsearch",
+            r".dsh\dsh-tba-bridge",
+            r".dsh\profiles\desktop\node_modules\dsh-context-diff",
+            r".dsh\profiles\desktop\node_modules\dsh-session-pruner",
+        ] {
+            std::fs::create_dir_all(home.join(rel)).unwrap();
+        }
+        let rows = detect_plugins(&home);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].name, "modsearch");
+        assert!(rows[0].paths.iter().any(|p| p
+            .to_string_lossy()
+            .contains("@liustack\\modsearch")));
+        assert!(rows[0].paths.iter().any(|p| p.to_string_lossy().contains("skills\\modsearch")));
+        assert!(rows[0].installed);
+        assert_eq!(rows[1].name, "dsh-tba-bridge");
+        assert!(rows[1].paths.iter().any(|p| p.to_string_lossy().contains("dsh-tba-bridge")));
+        assert!(rows[1].installed);
+        assert!(rows[2].installed && rows[3].installed);
+
+        // 缺一个就应报未装（另一个路径还在也不能误判已装）。
+        std::fs::remove_dir_all(home.join(r".dsh\dsh-tba-bridge")).unwrap();
+        std::fs::remove_dir_all(
+            home.join(r".dsh\profiles\desktop\node_modules\dsh-tba-bridge"),
+        )
+        .ok();
+        let rows2 = detect_plugins(&home);
+        assert!(!rows2[1].installed, "bridge 两个路径都没了就该是未装");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_detect_current_machine_all_installed() {
+        let rows = detect_plugins(&plugin_home());
+        assert_eq!(rows.len(), 4);
+        for p in &rows {
+            assert!(p.installed, "当前环境应已装 {}", p.name);
+        }
+    }
+
+    #[test]
+    fn plugin_install_texts_distinguish_github_and_dsh_sources() {
+        let gh = [INSTALL_MODSEARCH, INSTALL_BRIDGE];
+        let dsh = [INSTALL_CONTEXT_DIFF, INSTALL_SESSION_PRUNER];
+        for t in gh {
+            assert!(t.contains("github:"), "GitHub 类要有 github: 源: {t}");
+            assert!(
+                t.contains("github.com/"),
+                "GitHub 类要带仓库地址: {t}"
+            );
+            assert!(t.contains("--profile"), "GitHub 类要写 profile: {t}");
+        }
+        assert!(INSTALL_MODSEARCH.contains("https://github.com/liustack/modsearch"));
+        assert!(INSTALL_BRIDGE.contains("https://github.com/Rei1mu/dsh-tba-bridge"));
+        for t in dsh {
+            assert!(t.contains("dsh plugin add"), "dsh 类给市场安装命令: {t}");
+            assert!(t.contains("插件市场"), "dsh 类要说清来源: {t}");
+            assert!(!t.contains("github:"), "dsh 类不该出现 github:: {t}");
+        }
+        for a in gh {
+            for b in dsh {
+                assert_ne!(a, b, "两类文案不能相同");
+            }
+        }
     }
 
     // 等待参数：空/非法输入回落默认，别把配置写成 0 把轮询打爆。
