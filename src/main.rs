@@ -213,6 +213,10 @@ pub enum Cmd {
         /// 文案语言：zh=中文(默认) / en=英文
         #[arg(long, default_value = "zh")]
         lang: String,
+        /// 子代理标记（序号由主代理给，如 agent-21）。派活时写进 claim.note，
+        /// 并把 Teambition 任务标题改成 `agent-21:原标题`（永久保留），简报标题同步带前缀。
+        #[arg(long)]
+        agent_tag: Option<String>,
         /// 新建一条任务并置「进行中」+ 看板列「进行中」：标题即后面的文字（多词直接写，不用引号）。
         /// 例：tba sub 把侧栏改窄一点
         /// 给了文字就走「建任务」分支，不再派子代理、不再领任务。

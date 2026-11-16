@@ -2828,6 +2828,36 @@ impl WatchBaseline {
     }
 }
 
+// 给任务标题加子代理前缀：`agent-21:原标题`。
+// 基于原标题、先剥掉已有的 `agent-xxx:` 前缀，保证重复派同一个 tag 不叠加、换 tag 能覆盖。
+// tag 由主代理派活时给（tba 自己不知道 DSH 的子代理序号）。
+pub fn agent_tagged_title(tag: &str, title: &str) -> String {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return title.to_string();
+    }
+    let base = match title.split_once(':') {
+        Some((head, rest)) if head.starts_with("agent-") && !rest.is_empty() => rest,
+        _ => title,
+    };
+    format!("{tag}:{base}")
+}
+
+// 派子代理时落标记：写 claim.note（主代理给的 agent-21）、改 Teambition 任务标题加前缀。
+// 前缀永久保留（收尾不还原）。只动 Teambition 标题与 note；不碰 task_name，
+// 免得影响 tba status 显示和 start() 按标题找 claim 的幂等逻辑。
+pub fn apply_agent_tag(store: &Store, claim: &Claim, tag: &str) -> Result<(), String> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return Ok(());
+    }
+    let title = agent_tagged_title(tag, &claim.task_name);
+    let mut ctx = Ctx::new(store.clone(), false)?;
+    ctx.update_task_content(&claim.task_id, &title, "")?;
+    store.patch_claim(&claim.claim_id, |c| c.note = tag.to_string())?;
+    Ok(())
+}
+
 pub fn subagent_brief(
     store: &Store,
     claim: &Claim,
@@ -5518,6 +5548,25 @@ pub fn agent_prompt_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_tagged_title_is_idempotent_and_swappable() {
+        assert_eq!(agent_tagged_title("agent-21", "原任务"), "agent-21:原任务");
+        // 重复派同一个 tag 不叠加。
+        assert_eq!(
+            agent_tagged_title("agent-21", "agent-21:原任务"),
+            "agent-21:原任务"
+        );
+        // 换 tag 覆盖旧前缀，不残留。
+        assert_eq!(
+            agent_tagged_title("agent-22", "agent-21:原任务"),
+            "agent-22:原任务"
+        );
+        // 空 tag 在调用处就不会调到这里；仍保证不改标题。
+        assert_eq!(agent_tagged_title("  ", "原任务"), "原任务");
+        // 标题里别的冒号不当成子代理前缀。
+        assert_eq!(agent_tagged_title("agent-21", "a:b"), "agent-21:a:b");
+    }
 
     #[test]
     fn parse_add_task_handles_both_phrases_and_optional_project() {

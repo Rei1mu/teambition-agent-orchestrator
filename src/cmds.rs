@@ -1559,7 +1559,7 @@ pub fn run() -> Result<(), String> {
             }
             claim_and_print(&store, project.as_deref(), lang, !no_entry, true)?;
         }
-        Cmd::Subagent { target, project, lang, task } => {
+        Cmd::Subagent { target, project, lang, agent_tag, task } => {
             use std::io::Write;
             let lang = Lang::parse(&lang)
                 .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
@@ -1619,6 +1619,11 @@ pub fn run() -> Result<(), String> {
                 subagent_watch(&store, &pid, lang)?;
                 return Ok(());
             };
+            // 主代理给了子代理序号（如 agent-21）就落标记：写 claim.note、
+            // 把 Teambition 标题改成 `agent-21:原标题`（永久保留）。
+            if let Some(tag) = agent_tag.as_deref() {
+                apply_agent_tag(&store, &claim, tag)?;
+            }
             // 任务正文：派已领任务时走离线——台账里的 task_name 即标题，
             // 正文由子代理按 task_id 链接自己读（见简报末尾），避免为取正文联网。
             // 领新任务时 go() 已经联网，这里沿用同一条 claim，不二次联网。
