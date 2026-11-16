@@ -981,6 +981,7 @@ pub fn run() -> Result<(), String> {
             | Cmd::Doctor
             | Cmd::Git { .. }
             | Cmd::Create { .. }
+            | Cmd::Refresh { .. }
             | Cmd::EnsureProject { .. }
             | Cmd::Prompt { init: true, .. }
             // MCP server / 配置打印：挂给陌生 agent 用的入口，缺 but 也必须能起。
@@ -1146,6 +1147,13 @@ pub fn run() -> Result<(), String> {
             }
             for p in &projects {
                 println!("{}\t{}", p.id, p.name);
+            }
+        }
+        Cmd::Refresh { f } => {
+            let dir = std::env::current_dir().map_err(|e| format!("读当前目录失败: {e}"))?;
+            match crate::ops::refresh_agents_at(&dir, "tba", f) {
+                Some(p) => println!("已刷新 AGENTS.md: {}（{}）", p.display(), if f { "整份覆盖" } else { "只刷自动块" }),
+                None => println!("AGENTS.md 无需改动"),
             }
         }
         Cmd::Init { project } => {

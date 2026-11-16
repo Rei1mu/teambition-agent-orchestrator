@@ -59,7 +59,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 3. **做完必须 `tba ask --done`。** 回复监听由 tba serve 的 WatchAggregator 统一托管：邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件随即注入会话、立刻唤醒；不必等 job 退出，也不挂等待者。**禁用 DSH 的 ask_user_question 选择框/弹窗，禁用 MCP `tba ask_user`**；主代理要用户拍板也走 `tba ask`：没有现成 claim 时直接 `tba ask -q "<纯文本选项，从 3 起编号>"` 自动新建一条 task 并转「待回复」，有 claim 就 `tba ask <claim> -q "..."`，不直接在聊天框给选项；要提问只用 CLI `tba ask <claim> -q "<纯文本选项，选项从 3 起编号>"`，不用 DSH 选择框。**不许 `--no-wait`**、不许 agent 自己 `done` / `close`，只有用户回 `1` 才收尾（`2`=写记忆、`3+`=有问题、`0` 已废弃，都不收尾）。别重跑 `ask`（会重复发信）；执行中收到的回复用 `tba events --claim <claim>` 查看。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
-6. **主代理派子代理前先打 tag**：收到 `tba sub` 简报后，先跑 `tba sub <claim_id> --agent-tag agent-N`（N 按子代理序号递增，如 agent-1 / agent-2），把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
+6. **主代理派子代理前先打 tag**：收到 `tba sub` 简报后，先跑 DSH 的 `list_agents` 看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。然后跑 `tba sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
 
 > **子代理槽位**：tba sub 派的子代理由 DSH 管理（跑完自动结算释放并发槽，可用 `send_message` 冷恢复继续；不同子代理模式见 DSH 文档）。并发上限（默认 8）在 DSH 侧配置，不属 tba；若真的撞满，重启 DSH 或换新会话即可释放，不需要改 tba 代码、也不要在 tba 里写 dispose 逻辑。
 
@@ -132,7 +132,6 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 ### 跨设备 / 其他 agent
 
 本文件随 git 仓库同步，用本仓库的 WorkBuddy 自动生效。非本仓库的 agent：复制本 `## 默认回复风格：ultracave` 整节到其项目指令即可，无需安装技能。
-
 <!-- tba:rules 由 tba 自动生成，删掉不影响功能 -->
 ## 编码纪律
 
@@ -226,11 +225,10 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 ① `tba note <claim_id> --text "改了什么/怎么验"`
 ② `tba ask <claim_id> --done`
 
-**回复监听**：`ask` 写问题进备注 + 转「待回复」+ 发邮件后立即返回；监听由 **tba serve 的 WatchAggregator 统一托管**。
-邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。
-**自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。选项写纯文本，**主代理要用户拍板也走 `tba ask`：没有现成 claim 时直接 `tba ask -q "问题（纯文本选项，从 3 起编号）"` 自动新建一条 task 并转「待回复」；有 claim 就 `tba ask <claim_id> -q "..."`。不直接在聊天框给选项、禁用 DSH 的 ask_user_question 选择框/弹窗、不用 MCP `tba ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧会话）。
-**查看回复**：执行中收到的回复用 `tba events --claim <claim_id>` 查看；不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 `ask`（会重复发信）。
-**会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。
-只有用户能 `done`/`close`，放弃用 `tba release`。
+**派子代理先打 tag**：主代理收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。然后跑 `tba sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
+
+**收到用户回复自己判断分派**：发出 `tba sub` 进监听后，用户可能在本会话或其他渠道回复；先 `tba reply <claim_id>` + `tba events --claim <claim_id>` 读回原话，再自己判断是「继续当前子代理任务」（`send_message` 转给现有子代理）还是「新任务派新子代理」（按上面打 tag 规范新起 agent-N）。别都当新任务，也别把新任务塞回旧子代理。
+
+**回复监听**：`ask` 写问题进备注 + 转「待回复」+ 发邮件后立即返回；监听由 **tba serve 的 WatchAggregator 统一托管**。邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。**自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。选项写纯文本，**主代理要用户拍板也走 `tba ask`：没有现成 claim 时直接 `tba ask -q "问题（纯文本选项，从 3 起编号）"`，tba 自动新建一条 task 并转「待回复」；有 claim 就 `tba ask <claim_id> -q "..."`。不直接在聊天框给选项、禁用 DSH 的 ask_user_question 选择框/弹窗、不用 MCP `tba ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧会话）。**查看回复**：执行中收到的回复用 `tba events --claim <claim_id>` 查看；不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 `ask`（会重复发信）。**会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。只有用户能 `done`/`close`，放弃用 `tba release`。
 
 **通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / `publish` 发版 / `shot` 截图。先 `tba --help`。

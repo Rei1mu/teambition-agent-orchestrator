@@ -73,6 +73,13 @@ pub enum Cmd {
         #[arg(long)]
         project: String,
     },
+    /// 刷新当前工作区的 AGENTS.md：用 tba 生成器重生成自动块（bootstrap/entry/rules/ultracave），
+    /// 用户手写内容一字不动；--f 则整份用最新 AGENTS.md 覆盖
+    Refresh {
+        /// 强制整份覆盖（含用户手写内容）。默认只重写 tba 自动生成的块
+        #[arg(long)]
+        f: bool,
+    },
     /// 给当前目录接一个 Teambition 项目：有就复用，没有就新建，并补齐阶段/记忆状态。
     /// 幂等，可反复跑。成功后把 project id 记到 .tba/project
     EnsureProject {
