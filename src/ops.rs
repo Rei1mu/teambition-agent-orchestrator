@@ -4629,7 +4629,7 @@ fn workflow_text_zh(
 
     // 第 4 步：做完必须交回用户。ask 立即返回，回复由聚合器握手唤醒会话。
     // 调用姿势单独抽出来，两个分支共用，免得只改一处、文案分叉。
-    let ask_posture = "**ask 调用姿势（tba serve 聚合器统一托管）**：`tba ask <claim_id> --done` 写备注+待回复+发信后立即返回；回复监听由 tba serve 聚合器统一托管，邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 注入会话、立刻唤醒。不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 ask（重复发信）。查看执行中收到的回复用 `tba events --claim <claim_id>`；会话窗直接回话要先把任务推回「进行中」再干活：`tba reply <claim_id>`。只有回复 1 才收尾（聚合器 finish）；不许 agent 自己 done/close。";
+    let ask_posture = "**ask 调用姿势（tba serve 聚合器统一托管）**：`tba ask <claim_id> --done` 写备注+待回复+发信后立即返回；回复监听由 tba serve 聚合器统一托管，邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 注入会话、立刻唤醒。不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 ask（重复发信）。查看执行中收到的回复用 `tba events --claim <claim_id>`；会话窗直接回话要先把任务推回「进行中」再干活：`tba reply <claim_id>`。只有回复 1 才收尾（聚合器 finish）；不许 agent 自己 done/close。**主代理要用户确认/收尾必须当场 `{exe} ask` 发邮件并明确告诉用户去邮箱回 1——用户不常看 DSH，不能只在聊天框说「回 1」而不发 ask；发完确认「已发邮件通知」，别让任务停在进行中空等。**";
     if memory_on {
         s.push_str(&format!(
             "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题，自定义选项从 3 起编号；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
@@ -5412,6 +5412,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **交回**：做完两步，不许省：\n\
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
+         **主代理收尾/要拍板必须当场 `tba ask` 发邮件，明确告诉用户去邮箱回 1；不能只在聊天框说回 1 而不发 ask。发完确认邮件已发，别让任务停在进行中空等。**\n\n\
          **派子代理先打 tag**：主代理收到 `{exe} sub` 简报后，先跑 DSH 的 `list_agents`\
           看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；\
           例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。\
@@ -5487,7 +5488,8 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         // 缺这句就整段重写一次。
         && old.contains("不要从 agent-1 重新开始")
         // v0.2.51：收到用户回复自己判断继续当前子代理还是派新子代理；老入口缺这句要整段重写一次。
-        && old.contains("收到用户回复自己判断分派");
+        && old.contains("收到用户回复自己判断分派")
+        && old.contains("去邮箱回 1");
     let rules_ok = old.matches(RULES_MARK).count() == 1;
     let ultracave_ok = old.matches(ULTRACAVE_MARK).count() == 1;
 

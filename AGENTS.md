@@ -57,6 +57,8 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 1. **agent 只写任务备注，不写评论。** 评论是用户的回复通道，写进去会污染 `ask` 的读取。
 2. **不许自己跑 `tba done` / `tba close`。** 只有用户回 `1` 才收尾。
 3. **做完必须 `tba ask --done`。** 回复监听由 tba serve 的 WatchAggregator 统一托管：邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件随即注入会话、立刻唤醒；不必等 job 退出，也不挂等待者。**禁用 DSH 的 ask_user_question 选择框/弹窗，禁用 MCP `tba ask_user`**；主代理要用户拍板也走 `tba ask`：没有现成 claim 时直接 `tba ask -q "<纯文本选项，从 3 起编号>"` 自动新建一条 task 并转「待回复」，有 claim 就 `tba ask <claim> -q "..."`，不直接在聊天框给选项；要提问只用 CLI `tba ask <claim> -q "<纯文本选项，选项从 3 起编号>"`，不用 DSH 选择框。**不许 `--no-wait`**、不许 agent 自己 `done` / `close`，只有用户回 `1` 才收尾（`2`=写记忆、`3+`=有问题、`0` 已废弃，都不收尾）。别重跑 `ask`（会重复发信）；执行中收到的回复用 `tba events --claim <claim>` 查看。**用户在会话窗直接回话**也会唤醒会话，但后台监听只看邮件/评论、看不到聊天框，所以先跑 `tba reply <claim>` 把任务推回「进行中」再干活，干完再 `ask`。
+
+> **主代理每次要用户确认/收尾，必须当场 `tba ask <claim> --done`（或 `-q`）发邮件，并明确告诉用户「去邮箱回 1」——用户不常看 DSH，不能只在聊天框说「回 1 收尾」而不发 ask。发完确认邮件确实发出（`已发邮件通知`），别让任务停在「进行中」空等。
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
 6. **主代理派子代理前先打 tag**：收到 `tba sub` 简报后，先跑 DSH 的 `list_agents` 看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。然后跑 `tba sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
