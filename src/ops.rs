@@ -3083,9 +3083,11 @@ fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
 1. 只改完成这个任务必须改的，遵循项目编码纪律（见上方上下文）。
 2. 干完把「改了什么/怎么验」写进任务备注（不是评论）：
   {exe} note {id} --text "改了什么/怎么验"
+   项目记忆（踩坑/决策）要写云端用 `{exe} memory --project <id> --append "..." --section 踩坑`；别写本地 note.md，`tba mem` 只是任务状态。
 3. 自己用 CLI 走待回复交互：要问用户就 `{exe} ask {id} -q "问题（纯文本选项，从 3 起编号；1/2 系统保留）"`，收尾确认可 `{exe} ask {id} --done`；收到回复先 `{exe} reply {id}` 推回「进行中」，再看 `{exe} events --claim {id}` 读回原话。**禁用 DSH 的 ask_user_question 选择框/弹窗（禁用 DSH 选择框/ask_user），禁止 MCP `{exe} ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧主代理）。只用 CLI，回复会唤醒你自己的会话。
 4. 不要自己 done / close —— 用户回 1 后由 tba serve 聚合器自动 finish，不放给子代理；主代理保留重挂 `tba sub`、派活和最终确认。
 5. 有拿不准的，自己用上面的 `tba ask -q` 问用户（纯文本选项从 3 起），别假设后硬干；同时把疑问写进备注并回报主代理。
+6. **探查大文件先量行数、grep 定位，按行段读。别一上来整份读几千行的大文件**——token 会在探查阶段吃光，零改动零结论。
 
 ## 提交推送 / 上传 GitHub：只走 tba
 - 提交推送只跑 `{exe} git main -m "改了什么"`，推之前 `{exe} git status`；要看会跑什么加 `--dry`。
@@ -3104,9 +3106,11 @@ fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
 1. Change only what this task requires; follow the project coding rules above.
 2. When done, write "what changed / how verified" to the task note (not a comment):
   {exe} note {id} --text "what changed / how verified"
+   For project memory use `{exe} memory --project <id> --append "..." --section 踩坑`; NOT a local note.md, and `tba mem` is only a task state.
 3. Drive the waiting-reply loop yourself via CLI: `{exe} ask {id} -q "question (plain-text options numbered from 3; 1/2 reserved)"` or `{exe} ask {id} --done` for the final check; on a reply run `{exe} reply {id}` (back to in-progress) then `{exe} events --claim {id}` to read it. NEVER use DSH's ask_user_question picker/modal (禁用 DSH 选择框/ask_user), NEVER use MCP `{exe} ask_user` (serve has no DSH_SESSION_ID and may wake the old main session). CLI only; the reply wakes your own session.
 4. Do NOT done / close yourself - user reply 1 makes the tba serve aggregator finish it; closing is not delegated to subagents. Main agent keeps re-hanging `tba sub`, dispatching, and final confirmation.
 5. If unsure, ask the user yourself with `tba ask -q` (plain-text options from 3), and also write the question into the note and report back to the main agent. Do not guess and plow ahead.
+6. **Before exploring a large file, check its line count and grep to locate, then read in line ranges. Never read a several-thousand-line file in full up front** - tokens run out during exploration, with zero changes and zero conclusions.
 
 ## Commit / push / upload to GitHub: tba only
 - To commit & push run only `{exe} git main -m "what changed"`; check `{exe} git status` first; add `--dry` to preview.
@@ -4612,7 +4616,7 @@ fn workflow_text_zh(
     // 输出通道：agent 只写**备注**，不写评论。评论是用户的地盘。
     if memory_on {
         s.push_str(&format!(
-            "2. 开工先读项目记忆：`{exe} memory --project {project_id}`。干活；过程和结论写进**任务备注**（`{exe} note <claim_id> --text \"...\"`，往后追加）。**不写评论**（那是用户的通道）。长操作前后各跑一次 `{exe} beat <claim_id>`。\n"
+            "2. 开工先读项目记忆：`{exe} memory --project {project_id}`。干活；过程和结论写进**任务备注**（`{exe} note <claim_id> --text \"...\"`，往后追加）。**写项目记忆用 `{exe} memory --project {project_id} --append \"...\" --section 踩坑`，不是写本地 note.md、不是 `tba mem`（mem 只是任务状态）**。**不写评论**（那是用户的通道）。长操作前后各跑一次 `{exe} beat <claim_id>`。\n"
         ));
     } else {
         s.push_str(&format!(
@@ -4704,7 +4708,7 @@ fn workflow_text(
 
     if memory_on {
         s.push_str(&format!(
-            "2. Read memory first: `{exe} memory --project {project_id}`. Work; findings -> **task note** (`{exe} note <claim_id> --text \"...\"`). NEVER post comments - that's the user's channel. `{exe} beat <claim_id>` before/after long ops.\n"
+            "2. Read memory first: `{exe} memory --project {project_id}`. Work; findings -> **task note** (`{exe} note <claim_id> --text \"...\"`). Write project memory with `{exe} memory --project {project_id} --append \"...\" --section 踩坑`; NOT a local note.md, and `tba mem` is only a task state. NEVER post comments - that's the user's channel. `{exe} beat <claim_id>` before/after long ops.\n"
         ));
     } else {
         s.push_str(&format!(
@@ -5436,13 +5440,13 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     // 四条编码纪律。来自 Karpathy 对 LLM 编码陷阱的总结，专治三种毛病：
     // 默默做错误假设、把 100 行堆成 1000 行、顺手改与任务无关的代码。
     //
-    // 为什么放 AGENTS.md 而不是塞进 prompt：这四条是**通用编码习惯**，跟 tba 的
+    // 为什么放 AGENTS.md 而不是塞进 prompt：这几条是**通用编码习惯**，跟 tba 的
     // 任务流程无关，而且每条都要解释才管用。塞进 prompt 每次会话固定多 1500 字，
     // 而 AGENTS.md 是 agent 进项目就会读的约定文件，成本几乎为零。
     let rules = format!(
         "{RULES_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
          ## 编码纪律\n\n\
-         四条，动手前过一遍。\n\n\
+         五条，动手前过一遍。\n\n\
          1. **先想再写。** 不假设、不藏困惑。不确定就问，别猜着往下做；有歧义就摆出几种解释；\
          有更简单的路就直说；想不明白就停下问。\n\
          2. **最简实现。** 不加没要的功能、不做一次性抽象、不留「以后可能用得上」的开关、\
@@ -5451,9 +5455,10 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          3. **只改必须改的。** 不顺手「改进」旁边的代码/注释/格式，不重构没坏的东西，跟随现有风格。\
          发现无关的死代码只说一句，别删。检验：每行改动都能直接追溯到用户的要求。\n\
          4. **先定验证标准。** 把「加个校验」变成「为非法输入写测试再让它过」；\
-         把「修 bug」变成「写个复现的测试再让它过」。多步任务先列「步骤 → 怎么验证」。\n\n\
+         把「修 bug」变成「写个复现的测试再让它过」。多步任务先列「步骤 → 怎么验证」。\n\
+         5. **探查大文件按块读，别整读。** 几千行源码先量行数、用 grep 定位，再按行段读；整份塞进上下文会中途撑爆，零改动零结论。\n\n\
          例外：错别字、一行小改这类琐碎活，别上完整流程。\
-         这四条是为了减少非琐碎工作的代价，不是拖慢简单任务。\n"
+         这五条是为了减少非琐碎工作的代价，不是拖慢简单任务。\n"
     );
 
     let mut old = std::fs::read_to_string(&path).unwrap_or_default();
@@ -5490,7 +5495,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         // v0.2.51：收到用户回复自己判断继续当前子代理还是派新子代理；老入口缺这句要整段重写一次。
         && old.contains("收到用户回复自己判断分派")
         && old.contains("去邮箱回 1");
-    let rules_ok = old.matches(RULES_MARK).count() == 1;
+    // v0.2.54：编码纪律加第 5 条（大文件按块读）；老规则块缺这句就整段重写一次。
+    let rules_ok = old.matches(RULES_MARK).count() == 1
+        && old.contains("探查大文件按块读");
     let ultracave_ok = old.matches(ULTRACAVE_MARK).count() == 1;
 
     // 转发脚本只写 `tba.exe`，不带本机绝对路径，换设备一样能用。
@@ -6411,6 +6418,16 @@ mod tests {
     }
 
     #[test]
+    fn rules_block_has_big_file_pitfall() {
+        let store = tmp_store("rules-bigfile");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("生成初始 AGENTS.md");
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("探查大文件按块读"), "缺第 5 条大文件按块读: {s}");
+        assert!(s.contains("这五条"), "「四条」旧口径没改: {s}");
+    }
+
+    #[test]
     fn refresh_force_drops_user_content() {
         let store = tmp_store("refresh-force");
         let dir = store.root.clone();
@@ -6536,6 +6553,38 @@ mod tests {
             assert!(t.contains("http.extraHeader"), "缺禁临时拼 token header: {t}");
             assert!(t.contains("GH_TOKEN"), "缺禁找 token: {t}");
             assert!(t.contains("gh"), "缺禁装 gh: {t}");
+        }
+    }
+
+    // 2026-11-17：子代理整读大文件爆上下文 + 项目记忆写错地方，两处预防针都要在简报里。
+    #[test]
+    fn subagent_brief_warns_big_files_and_memory_command() {
+        for lang in [Lang::Zh, Lang::En] {
+            let t = subagent_workflow_text("tba", "clm-1", lang);
+            assert!(
+                t.contains("grep") && (t.contains("行段") || t.contains("line ranges")),
+                "缺大文件按块读预防针: {t}"
+            );
+            assert!(
+                t.contains("memory --project") && t.contains("--append"),
+                "缺正确的项目记忆写入命令: {t}"
+            );
+            assert!(
+                t.contains("note.md") && t.contains("tba mem"),
+                "缺点名别写 note.md / 别用 tba mem: {t}"
+            );
+        }
+    }
+
+    // 开工文案里：读记忆给命令，写记忆也必须给命令，否则 agent 会瞎写本地 note.md。
+    #[test]
+    fn workflow_text_teaches_how_to_write_project_memory() {
+        let cfg = tmp_store("wfmemwrite").load_config();
+        for lang in [Lang::Zh, Lang::En] {
+            let wf = workflow_text("tba", "p-1", &cfg, None, None, lang, true);
+            assert!(wf.contains("--append"), "缺项目记忆写入命令: {wf}");
+            assert!(wf.contains("note.md"), "缺点名别写 note.md: {wf}");
+            assert!(wf.contains("tba mem"), "缺点名 tba mem 只是状态: {wf}");
         }
     }
 
