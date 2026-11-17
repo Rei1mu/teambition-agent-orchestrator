@@ -9,11 +9,11 @@
 //!   tba git status          分支 / 脏文件 / 远端领先落后 / 是不是 GitButler 项目
 //!   tba git main            提交并推送。GitButler 项目走 but，普通仓库走 git
 //!   tba git tag <tag>       打 tag 并推
-//!   tba publish             打版本 tag + 推 + (--watch) 等 CI + 列产物
+//!   tba publish             打版本 tag + 推（默认不等 CI；--watch 才等并列出产物）
 //!   tba publish --init      生成 windows x64 + arm64(MSVC) 的 release workflow
 //!
 //! 约定：所有函数只在 stdout 打印人能读的一行行文字，错误走 Err。
-//! 联网只用于 --watch 查 CI，拿不到 token 就降级成「你自己去 Actions 页看」。
+//! 联网只用于 --watch 查 CI；默认发版只打 tag + 推 tag，不联网、不等 CI。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

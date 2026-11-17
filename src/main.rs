@@ -507,14 +507,14 @@ pub enum Cmd {
         #[arg(long)]
         dry: bool,
     },
-    /// 通用能力：发版。打 tag -> 推 -> (--watch) 等 CI 并列出产物。
+    /// 通用能力：发版。打 tag -> 推；默认不等 CI，--watch 才等并列出产物。
     /// 注意：`release <claim_id>` 是「退回队列」，发版是 `publish`
     #[command(name = "publish", visible_alias = "rel")]
     Publish {
         /// 版本号或 tag，如 0.2.0 / v0.2.0。缺省读 Cargo.toml 的 version
         #[arg(long)]
         tag: Option<String>,
-        /// 等 CI 跑完并列出产物（要 GitHub token：GH_TOKEN 或 git 凭据）
+        /// 等 CI 跑完并列出产物（要 GitHub token）。默认不等 CI；CI 失败用户会反馈
         #[arg(long)]
         watch: bool,
         /// owner/repo。缺省从 origin 解析

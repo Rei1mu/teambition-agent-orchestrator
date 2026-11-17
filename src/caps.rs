@@ -185,14 +185,14 @@ pub const BODY_RELEASE: &str = "\
 （CI 用 `--locked`，lock 里还是旧版本号会直接失败：`cannot update the lock file ... --locked`）
 
 ## 2. 一条命令发版
-`tba publish --tag vX.Y.Z --watch`
+`tba publish --tag vX.Y.Z`
 
-打 tag -> 推 tag -> 等 CI -> 列产物。没有 `--tag` 时读 Cargo.toml 的 version。
-`--watch` 需要 GitHub token（`GH_TOKEN` 环境变量，或 git 凭据里存过）；
-拿不到就只打 tag，自己开 Actions 页看。
+打 tag -> 推 tag，就结束。**默认不等 CI**——CI 默认会成功，失败用户会反馈。
+没有 `--tag` 时读 Cargo.toml 的 version。
+只有用户明确要看 CI 产物时才加 `--watch`（要 GitHub token，且会卡到 CI 跑完）。
 
 ## 3. 收尾
-CI 绿了再给用户地址：`https://github.com/<owner>/<repo>/releases/tag/vX.Y.Z`
+告诉用户 tag 已推、CI 在跑；地址：`https://github.com/<owner>/<repo>/releases/tag/vX.Y.Z`
 
 ## 红线
 - CI 没绿不许说「已发布」。

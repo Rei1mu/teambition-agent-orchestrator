@@ -3092,7 +3092,7 @@ fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
 ## 提交推送 / 上传 GitHub：只走 tba
 - 提交推送只跑 `{exe} git main -m "改了什么"`，推之前 `{exe} git status`；要看会跑什么加 `--dry`。
 - 建仓库 / 连远端 / 更新到 GitHub 只跑 `{exe} git create [--name 仓库名]`（幂等，已有远端就直接推）。
-- 发版只跑 `{exe} publish --tag vX.Y.Z --watch`（先升 Cargo.toml 版本号并 cargo build 同步 Cargo.lock）。
+- 发版只跑 `{exe} publish --tag vX.Y.Z`（先升 Cargo.toml 版本号并 cargo build 同步 Cargo.lock）。默认不等 CI，CI 失败用户会反馈；别加 `--watch`。
 - **不要**自己拼 git remote/push、`git -c http.extraHeader`、找 GitHub token、设 GH_TOKEN、配 SSH key、装 gh，也别让用户去网页建仓库。凭据 tba 自己会从 git 凭据管理器读；读不到就回报主代理问用户，别自己换路子。
 - 详情按需读：`{exe} cap git-main` / `{exe} cap git-create` / `{exe} cap release`。
 
@@ -3115,7 +3115,7 @@ fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
 ## Commit / push / upload to GitHub: tba only
 - To commit & push run only `{exe} git main -m "what changed"`; check `{exe} git status` first; add `--dry` to preview.
 - To create/attach a repo or update GitHub run only `{exe} git create [--name repo]` (idempotent, pushes when a remote exists).
-- To cut a release run only `{exe} publish --tag vX.Y.Z --watch` (bump Cargo.toml version and cargo build to sync Cargo.lock first).
+- To cut a release run only `{exe} publish --tag vX.Y.Z` (bump Cargo.toml version and cargo build to sync Cargo.lock first). No `--watch` by default: CI usually passes and the user reports failures; don't wait on CI.
 - NEVER hand-roll git remote/push, `git -c http.extraHeader`, hunt for a GitHub token, set GH_TOKEN, set up SSH keys, install gh, or send the user to the web to create a repo. tba reads credentials from the git credential store; if it can't, report back to the main agent - do not switch tactics.
 - Details on demand: `{exe} cap git-main` / `{exe} cap git-create` / `{exe} cap release`.
 
@@ -6572,6 +6572,10 @@ mod tests {
             assert!(
                 t.contains("note.md") && t.contains("tba mem"),
                 "缺点名别写 note.md / 别用 tba mem: {t}"
+            );
+            assert!(
+                t.contains("publish --tag vX.Y.Z") && !t.contains("publish --tag vX.Y.Z --watch"),
+                "发版简报还教 --watch: {t}"
             );
         }
     }
