@@ -3146,53 +3146,36 @@ pub fn subagent_brief(
     // 项目上下文（能力 + skill 索引）复用开工文案的同款内容，本地就能生成。
     s.push_str(&prompt_head(store, &claim.project_id, &proj_name, skills, None, false));
     s.push_str(&subagent_workflow_text(&exe, &claim.claim_id));
-    // 主代理收尾指引：子代理自己 note+ask；主代理提问也走 tba ask，不直接在聊天里问。
-    s.push_str(&main_agent_tail_text(&exe, &claim.claim_id));
-    // 常驻监听唤醒主代理后就退出了；派完子代理得再挂一条，否则队列没人盯。
-    // v0.2.50：派活打 tag 的强制规范写进简报末尾，主代理一眼能看到。
-    // v0.2.51：序号规则见 main_agent_tail_text——list_agents 当前最大序号 +1，不从 agent-1 重来。
-    s.push_str(
-        "\\n===== 主代理：收到本简报先跑 `list_agents` 看当前最大 agent-N（含 inactive），取最大序号 +1（不要从 agent-1 重新开始），再 `tba sub <claim_id> --agent-tag agent-N` 打 tag，然后用 subagent 工具派活；派完再挂一条 `tba sub` 后台监听继续等新任务（裸命令即可，不用开关）。收到用户回复先 reply+events 读回，再自己判断「继续当前子代理」还是「新任务派新子代理」并据此分派=====\n",
-    );
+    // 派活/提问/收尾规则已经全在 AGENTS.md 入口块里，简报再抄一遍纯浪费 token——
+    // 每个子代理简报都要重发，重复的部分按份数计费。这里只留一行指路。
+    s.push_str("\n主代理：读完本简报，按 AGENTS.md 入口块的打 tag 规则派活即可。\n");
     s
 }
 
-/// 主代理侧指引。单独抽出来是为了能单测「主代理提问也走 tba ask、不弹选择框」。
-fn main_agent_tail_text(exe: &str, claim_id: &str) -> String {
-    format!(
-        r#"
-===== 主代理收尾指引（你来做，别让子代理做）=====
-**派活先打 tag，再调 subagent 工具**：收到简报后先跑 DSH 的 `list_agents` 看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。然后跑 `{exe} sub {id} --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题和 claim.note；再用 subagent 工具把这份简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `{exe} sub` 继续监听。
-子代理已用 CLI `{exe} ask`/`{exe} reply`/`{exe} events` 走完待回复交互并把结论写进任务备注。你只做最终确认：读回备注与回复，核对产物。done/close 仍只由用户回 1 触发聚合器 finish，主代理不自己 done/close。
-**用户回复后的分派**：发出 `tba sub` 进监听后，用户可能在本会话或其他渠道回复。收到回复先 `{exe} reply <claim_id>` + `{exe} events --claim <claim_id>` 读回原话，再**自己判断**这条回复是「继续当前子代理任务」还是「新任务要派新子代理」：前者用 `send_message` 把回复转给现有子代理接着干；后者按上面的打 tag 规范新起 agent-N 派新子代理。别把两种情况都当新任务，也别把新任务硬塞回旧子代理。
-**你要用户拍板时也走 `tba ask` 转「待回复」：手上没有现成 claim 就直接 `{exe} ask -q "问题（纯文本选项，从 3 起编号；1/2 系统保留）"`，tba 会自动新建一条 task 并转「待回复」；有 claim 就带上 `{exe} ask {id} -q "..."`。不要直接在聊天框给选项、不要弹 DSH 的 ask_user_question 选择框、不要用 MCP `{exe} ask_user`。** 收到回复先 `{exe} reply <claim_id>`，再 `{exe} events --claim <claim_id>` 读回原话。
-"#,
-        exe = exe, id = claim_id
-    )
-}
-
 /// 子代理专属流程说明：任务已认领，它自己用 CLI 走待回复交互 + 写备注 + 回报，不碰 done/close。
+///
+/// 长度有成本：每派一个子代理就重发一份，所以派活/提问/收尾这类**主代理规则**
+/// 一律不在这里复述——它们已经在 AGENTS.md 入口块里，简报只留一行指路。
 fn subagent_workflow_text(exe: &str, claim_id: &str) -> String {
     format!(
         r##"## 你的职责
 1. 只改完成这个任务必须改的，遵循项目编码纪律（见上方上下文）。
-2. 干完把「改了什么/怎么验」写进任务备注（不是评论）：
-  {exe} note {id} --text "改了什么/怎么验"
-   项目记忆（踩坑/决策）要写云端用 `{exe} memory --project <id> --append "..." --section 踩坑`；别写本地 note.md，`tba mem` 只是任务状态。
-3. 自己用 CLI 走待回复交互：要问用户就 `{exe} ask {id} -q "问题（纯文本选项，从 3 起编号；1/2 系统保留）"`，收尾确认可 `{exe} ask {id} --done`；收到回复先 `{exe} reply {id}` 推回「进行中」，再看 `{exe} events --claim {id}` 读回原话。**禁用 DSH 的 ask_user_question 选择框/弹窗（禁用 DSH 选择框/ask_user），禁止 MCP `{exe} ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧主代理）。只用 CLI，回复会唤醒你自己的会话。
-4. 不要自己 done / close —— 用户回 1 后由 tba serve 聚合器自动 finish，不放给子代理；主代理保留重挂 `tba sub`、派活和最终确认。
-5. 有拿不准的，自己用上面的 `tba ask -q` 问用户（纯文本选项从 3 起），别假设后硬干；同时把疑问写进备注并回报主代理。
-6. **探查大文件先量行数、grep 定位，按行段读。别一上来整份读几千行的大文件**——token 会在探查阶段吃光，零改动零结论。
+2. 干完把「改了什么/怎么验」写进任务备注（不是评论）：`{exe} note {id} --text "改了什么/怎么验"`。项目记忆（踩坑/决策）写云端用 `{exe} memory --project <id> --append "..." --section 踩坑`；别写本地 note.md，`tba mem` 只是任务状态。
+3. 要问用户就 `{exe} ask {id} -q "问题（纯文本选项，从 3 起编号；1/2 系统保留）"`，收尾确认 `{exe} ask {id} --done`；收到回复先 `{exe} reply {id}` 再 `{exe} events --claim {id}` 读回原话。只用 CLI：**禁用 DSH 的 ask_user_question 选择框/弹窗，禁用 MCP `{exe} ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧主代理）。
+4. **不要自己 done / close**：用户回 1 后由 tba serve 聚合器自动 finish。这是本简报里唯一一条 done/close 规则。
+5. 拿不准的先用上面的 `ask -q` 问用户，别假设后硬干；同时把疑问写进备注并回报主代理。
+6. 探查大文件先量行数、grep 定位、按行段读，别整份读几千行的大文件。
+7. **回报时贴编译/测试结果的最后 3~5 行 + 改动函数清单**，主代理据此验收，不要只说「通过」。
+
+## 通用能力：用到才读
+`{exe} cap list` 看目录，要哪条再 `{exe} cap <名字>` 读正文（别全读）。
 
 ## 提交推送 / 上传 GitHub：只走 tba
-- 提交推送只跑 `{exe} git main -m "改了什么"`，推之前 `{exe} git status`；要看会跑什么加 `--dry`。
-- 建仓库 / 连远端 / 更新到 GitHub 只跑 `{exe} git create [--name 仓库名]`（幂等，已有远端就直接推）。
-- 发版只跑 `{exe} publish --tag vX.Y.Z`（先升 Cargo.toml 版本号并 cargo build 同步 Cargo.lock）。默认不等 CI，CI 失败用户会反馈；别加 `--watch`。
-- **不要**自己拼 git remote/push、`git -c http.extraHeader`、找 GitHub token、设 GH_TOKEN、配 SSH key、装 gh，也别让用户去网页建仓库。凭据 tba 自己会从 git 凭据管理器读；读不到就回报主代理问用户，别自己换路子。
-- 详情按需读：`{exe} cap git-main` / `{exe} cap git-create` / `{exe} cap release`。
+- 提交推送 `{exe} git main -m "改了什么"`（推前 `{exe} git status`）；建/连仓库 `{exe} git create`；发版 `{exe} publish --tag vX.Y.Z`（先升 Cargo.toml 版本号，默认不等 CI，别加 `--watch`）。详情按需读 `{exe} cap git-main` / `{exe} cap git-create` / `{exe} cap release`。
+- 不要自己拼 git remote/push、`git -c http.extraHeader`、找 token / 设 GH_TOKEN、配 SSH key、装 gh。凭据 tba 自己从 git 凭据管理器读；读不到就回报主代理问用户。
 
 ## 交回主代理
-回报：改了什么、验证了什么、还剩什么、有什么疑问。主代理用 claim_id（{id}）收尾并视情况提问。"##,
+回报：改了什么、验证了什么（贴编译/测试最后 3~5 行）、还剩什么、有什么疑问。主代理用 claim_id（{id}）收尾并视情况提问。"##,
         exe = exe, id = claim_id
     )
 }
@@ -5318,6 +5301,12 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
           动手活（改代码、改文件、查文件、调研、跑验证）**尽量不自己干**，合理拆给子代理：\
           能由子代理独立完成的一律派子代理，只有需要本会话上下文的整合、收尾、拍板、`ask` 才自己来。\
           派活仍按上面「派子代理先打 tag」规范执行。\n\n\
+          **省 token（主代理必读）**：\n\
+          ① 子代理回报的编译/测试数字**直接采信**，主代理只抽查一次，不重跑全套；\n\
+          ② 不读全量 diff——派活时就要求子代理回报「改了哪几个函数 + 关键 hunk」，主代理只按需看可疑处；\n\
+          ③ 一份活整包派出去（代码 + 文档文案 + 编译 + 实测 + 提交），主代理不接手其中任何一环；\n\
+          ④ 主代理只做：打 tag → 派活 → 汇总回复 → `ask` 收尾 → 部署一条命令；\n\
+          ⑤ 保留并行：每个子任务各自的 claim，谁先完成谁先 `ask`，**不要**等所有子任务汇总成一条再问。\n\n\
           **收到用户回复自己判断分派**：发出 `{exe} sub` 进监听后，用户可能在本会话或其他渠道回复；先 `{exe} reply <claim_id>` + `{exe} events --claim <claim_id>` 读回原话，再自己判断是「继续当前子代理任务」（`send_message` 转给现有子代理）还是「新任务派新子代理」（按上面打 tag 规范新起 agent-N）。别都当新任务，也别把新任务塞回旧子代理。\n\n\
          **回复监听**：`ask` 写问题进备注 + 转「待回复」+ 发邮件后立即返回；监听由 **tba serve 的 WatchAggregator 统一托管**。\
           邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。\
@@ -6471,25 +6460,33 @@ mod tests {
     }
 
     // 主代理要用户拍板也必须走 tba ask -q，不能直接在聊天框给选项 / 弹 DSH 选择框。
+    // v0.2.58：简报末尾的「主代理收尾指引」整段删除（规则已在 AGENTS.md 入口块里，
+    // 每派一个子代理就重发一份，重复部分按份计费）。断言改为盯入口块，别让规则真丢。
     #[test]
-    fn main_agent_tail_routes_decisions_through_tba_ask() {
-        let t = main_agent_tail_text("tba", "clm-main");
+    fn main_agent_entry_routes_decisions_through_tba_ask() {
+        let store = tmp_store("entry-main-ask");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
+        let t = std::fs::read_to_string(&p).unwrap();
         assert!(t.contains("tba ask -q"), "缺主代理无 claim 直建 task 的 ask -q: {t}");
-        assert!(t.contains("tba ask clm-main -q"), "缺主代理带 claim 的 ask -q: {t}");
-        assert!(t.contains("自动新建"), "缺自动新建 task 说明: {t}");
+        assert!(t.contains("tba ask <claim_id> -q"), "缺主代理带 claim 的 ask -q: {t}");
+        assert!(t.contains("自动新建一条 task"), "缺自动新建 task 说明: {t}");
         assert!(t.contains("tba reply <claim_id>"), "缺主代理 reply: {t}");
         assert!(t.contains("tba events --claim"), "缺主代理 events: {t}");
         assert!(t.contains("ask_user_question"), "缺点名禁用 DSH 选择框: {t}");
         assert!(t.contains("ask_user"), "缺点名禁用 MCP ask_user: {t}");
-        assert!(t.contains("不要直接在聊天框"), "缺不直接聊天问: {t}");
+        assert!(t.contains("不直接在聊天框给选项"), "缺不直接聊天问: {t}");
     }
 
     // 派子代理前主代理必须先 tba sub <claim_id> --agent-tag agent-N 打 tag，再用 subagent 工具派活。
     // v0.2.51：N 是 DSH 当前子代理总数 +1（全局递增），不是本轮第一个；老「如 agent-1 / agent-2」文案必须换掉。
     #[test]
-    fn main_agent_tail_tags_subagent_before_dispatch() {
-        let t = main_agent_tail_text("tba", "clm-main");
-        assert!(t.contains("tba sub clm-main --agent-tag agent-N"), "缺打 tag 命令: {t}");
+    fn entry_tags_subagent_before_dispatch() {
+        let store = tmp_store("entry-tag-dispatch");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
+        let t = std::fs::read_to_string(&p).unwrap();
+        assert!(t.contains("tba sub <claim_id> --agent-tag agent-N"), "缺打 tag 命令: {t}");
         assert!(t.contains("subagent"), "缺 subagent 工具派活指引: {t}");
         assert!(
             t.contains("先") && t.contains("再"),
@@ -6508,7 +6505,8 @@ mod tests {
         );
     }
 
-    // v0.2.51：简报末尾 footer 也要直接写清序号规则，不能只说 agent-N 让主代理猜。
+    // v0.2.51：序号规则必须在入口块里写清，不能只说 agent-N 让主代理猜。
+    // v0.2.58：简报 footer 删除，这份回归挪到子代理简报「只留一行指路 + 规则在入口块」上。
     #[test]
     fn subagent_brief_footer_states_agent_number_rule() {
         let store = tmp_store("brief-footer-agentnum");
@@ -6532,16 +6530,22 @@ mod tests {
             question: String::new(),
         };
         let t = subagent_brief(&store, &claim, "", &[]);
-        assert!(t.contains("list_agents"), "简报 footer 缺 list_agents: {t}");
         assert!(
-            t.contains("不要从 agent-1 重新开始"),
-            "简报 footer 缺不从 agent-1 重来: {t}"
+            t.contains("按 AGENTS.md 入口块的打 tag 规则派活"),
+            "简报缺一行指路: {t}"
         );
+        // 收尾指引整段不许再回来（重复规则 = 每次派活重付一遍）。
         assert!(
-            t.contains("最大序号 +1"),
-            "简报 footer 缺最大序号 +1: {t}"
+            !t.contains("主代理收尾指引") && !t.contains("===== 主代理：收到本简报"),
+            "简报又抄了一遍主代理规则: {t}"
         );
-        assert!(!t.contains("如 agent-1 / agent-2"), "简报 footer 仍有误导性示例: {t}");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
+        let e = std::fs::read_to_string(&p).unwrap();
+        assert!(e.contains("list_agents"), "入口缺 list_agents: {e}");
+        assert!(e.contains("最大序号 +1"), "入口缺最大序号 +1: {e}");
+        assert!(e.contains("不要从 agent-1 重新开始"), "入口缺不从 agent-1 重来: {e}");
+        assert!(!e.contains("如 agent-1 / agent-2"), "入口仍有误导性示例: {e}");
     }
 
     // v0.2.51：主代理收到用户回复后要自己判断「继续当前子代理」还是「新任务派新子代理」。
@@ -6568,9 +6572,10 @@ mod tests {
             question: String::new(),
         };
         let t = subagent_brief(&store, &claim, "", &[]);
+        // v0.2.58：分派规则只留在入口块，简报不再复述（见 subagent_brief_footer_states_agent_number_rule）。
         assert!(
-            t.contains("自己判断"),
-            "简报缺收到回复自己判断分派: {t}"
+            !t.contains("自己判断这条回复"),
+            "简报又抄了分派规则: {t}"
         );
         let dir = store.root.clone();
         let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
@@ -6624,6 +6629,11 @@ mod tests {
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(s.contains("主代理不自己写、优先派子代理"), "入口缺主代理派活规则: {s}");
         assert!(s.contains("省 token、省时间"), "入口缺省 token 前提: {s}");
+        // v0.2.58：主代理省 token 的五条（采信子代理数字 / 不读全量 diff / 整包派活 / 只做收尾 5 步 / 保留并行）。
+        assert!(s.contains("省 token（主代理必读）"), "入口缺省 token 节: {s}");
+        assert!(s.contains("直接采信"), "入口缺「采信子代理数字」: {s}");
+        assert!(s.contains("不读全量 diff"), "入口缺「不读全量 diff」: {s}");
+        assert!(s.contains("保留并行"), "入口缺「保留并行」: {s}");
 
         // 造一份「其它版本条件都在、只缺主代理派活规则」的老入口。
         let old = format!(

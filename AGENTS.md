@@ -69,7 +69,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 看 `docs/流程图.md`。需要时再读，不要一开始就整份加载。
 
-<!-- tba:rules v0.2.57 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:rules v0.2.58 由 tba 自动生成，删掉不影响功能 -->
 ## 编码纪律
 
 五条，动手前过一遍。
@@ -83,7 +83,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 例外：错别字、一行小改这类琐碎活，别上完整流程。这五条是为了减少非琐碎工作的代价，不是拖慢简单任务。
 
 
-<!-- tba:ultracave v0.2.57 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:ultracave v0.2.58 由 tba 自动生成，删掉不影响功能 -->
 ## 默认回复风格：ultracave
 
 本项目会话默认用 ultracave 风格回复。不依赖 caveman / ultracave 技能。下方为 ultracave 技能原文，尽量保留。
@@ -150,7 +150,7 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 本文件随 git 仓库同步，用本仓库的 WorkBuddy 自动生效。非本仓库的 agent：复制本 `## 默认回复风格：ultracave` 整节到其项目指令即可，无需安装技能。
 
 
-<!-- tba:entry v0.2.57 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:entry v0.2.58 由 tba 自动生成，删掉不影响功能 -->
 ## 任务队列入口
 
 **工具**：`tba`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。直接执行，别搜 exe、别验证路径、别读 `.tba/`。
@@ -174,6 +174,13 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 **派子代理先打 tag**：主代理收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。然后跑 `tba sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
 
 **主代理不自己写、优先派子代理**：主代理（lead）以**省 token、省时间**为前提，动手活（改代码、改文件、查文件、调研、跑验证）**尽量不自己干**，合理拆给子代理：能由子代理独立完成的一律派子代理，只有需要本会话上下文的整合、收尾、拍板、`ask` 才自己来。派活仍按上面「派子代理先打 tag」规范执行。
+
+**省 token（主代理必读）**：
+① 子代理回报的编译/测试数字**直接采信**，主代理只抽查一次，不重跑全套；
+② 不读全量 diff——派活时就要求子代理回报「改了哪几个函数 + 关键 hunk」，主代理只按需看可疑处；
+③ 一份活整包派出去（代码 + 文档文案 + 编译 + 实测 + 提交），主代理不接手其中任何一环；
+④ 主代理只做：打 tag → 派活 → 汇总回复 → `ask` 收尾 → 部署一条命令；
+⑤ 保留并行：每个子任务各自的 claim，谁先完成谁先 `ask`，**不要**等所有子任务汇总成一条再问。
 
 **收到用户回复自己判断分派**：发出 `tba sub` 进监听后，用户可能在本会话或其他渠道回复；先 `tba reply <claim_id>` + `tba events --claim <claim_id>` 读回原话，再自己判断是「继续当前子代理任务」（`send_message` 转给现有子代理）还是「新任务派新子代理」（按上面打 tag 规范新起 agent-N）。别都当新任务，也别把新任务塞回旧子代理。
 
