@@ -178,12 +178,17 @@ pub enum Cmd {
     },
     /// 一句话开工：按当前目录绑定的项目领一条「未完成」任务，打印正文和流程。
     /// 跟一段文字（不带 --off）则在 Teambition 新建一条任务并置「进行中」+ 看板列「进行中」。
-    /// 退出码 3=目录未绑定项目 / 4=项目查不到 / 0=已领到或队列空(EMPTY) / 建任务时 0=成功
+    /// 没绑定项目时打印候选名/引导接入；用户拍板后 `tba go --name "<名字>"` 一条龙建好并领任务。
+    /// 退出码 0=已领到/队列空(EMPTY)/已引导接入 / 5=有没人接的待回复 / 建任务时 0=成功
     #[command(visible_aliases = ["g", "r", "run"])]
     Go {
         /// 项目 id。省略则按 .tba/project 绑定解析
         #[arg(long)]
         project: Option<String>,
+        /// 当前工作区还没接 Teambition 项目时，用这个名字建项目 + 初始化 + 写绑定 + 补 AGENTS.md。
+        /// 没给名字时 tba 会打印候选名让你选，选好后重跑 `tba go --name "<名字>"`。
+        #[arg(long)]
+        name: Option<String>,
         /// 不自动往当前目录补 AGENTS.md 入口
         #[arg(long)]
         no_entry: bool,
@@ -211,6 +216,10 @@ pub enum Cmd {
         /// 派子代理的项目 id，或建任务时指定项目 id（默认按 .tba/project 绑定解析）。
         #[arg(long)]
         project: Option<String>,
+        /// 当前工作区还没接 Teambition 项目时，用这个名字建项目 + 初始化 + 写绑定 + 补 AGENTS.md。
+        /// 没给名字时 tba 会打印候选名让你选，选好后重跑 `tba sub --name "<名字>"`。
+        #[arg(long)]
+        name: Option<String>,
         /// 子代理标记（序号由主代理给，如 agent-21）。派活时写进 claim.note，
         /// 并把 Teambition 任务标题改成 `agent-21:原标题`（永久保留），简报标题同步带前缀。
         #[arg(long)]

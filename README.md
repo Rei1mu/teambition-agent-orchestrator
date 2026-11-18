@@ -68,7 +68,7 @@ tba onboard
 tba
 ```
 
-有绑定就领任务并输出 `claim_id`（`EMPTY` 表示队列空）；没绑定只列候选项目名，原样交你拍板，选定后跑 `tba create --name "<选定的>" --go`。看板列 1~5 由 tba 自动补齐，补不动才给你项目链接和手动兜底步骤。
+有绑定就领任务并输出 `claim_id`（`EMPTY` 表示队列空）；没绑定只列候选项目名，原样交你拍板，选定后跑 `tba go --name "<选定的>"`（或 `tba sub --name "<选定的>"`）一条命令建好并开工。看板列 1~5 由 tba 自动补齐，补不动才给你项目链接和手动兜底步骤。
 
 ---
 
@@ -152,7 +152,7 @@ MSVC 工具链要求与本机构建约定见 [docs/REFERENCE.md](docs/REFERENCE.
   ├─ 不带参数执行 tba
   ├─ 有 .tba/project 且线上项目还在？
   │    ├─ 否 → 本地列候选项目名 → 原样交用户拍板
-  │    │        → tba create --name "<选定的>" --go
+  │    │        → tba go --name "<选定的>"
   │    └─ 是 → 直接往下
   ├─ ensure_tasklists：只建缺的 1~5 数字列，已有列绝不删改
   │    └─ 补齐失败 → 打印项目链接 + 手动补列兜底，不阻断领任务
@@ -385,7 +385,7 @@ tba publish --tag v0.2.32 --watch
 | 邮件回信没反应 | `tba mail status`（能否收信）、`tba events`（有没有落盘）、标题里 `[TB ...]` 是否还在 |
 | 后台没唤起会话 | `data/waits/<claim>.wait` 心跳是否刷新、`tba inbox` 有没有标「等待中断」 |
 | 收尾了但看板列没动 | 列名是否对得上 `data/config.toml`，列不存在时只跳过移列 |
-| 领不到任务 | 退出码 3 = 目录未绑定项目，4 = 项目查不到；`tba ensure-project --project <id>` 重绑 |
+| 领不到任务 | 现在不再用退出码 3/4：没绑定时 `tba go` / `tba sub` 直接列候选名 + 给 `--name` 收尾命令；重绑用 `tba ensure-project --project <id>` |
 | MCP 没生效 | 配置写的是 exe 绝对路径、是否点过「信任」、是否新开会话 |
 
 更多历史细节、命令参数、GitButler / 工具链 / 截图等专题见 [文档索引](#文档索引)。

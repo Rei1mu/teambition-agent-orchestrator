@@ -186,9 +186,16 @@ fn first_heading(body: &str) -> Option<String> {
 
 // 解析 --project：给了就用；没给走 .tba/project 绑定。
 // 两者都没有就报错——绝不猜项目，猜错会把任务领到别的项目里。
-fn resolve_project(project: Option<&str>) -> Result<String, String> {
+fn resolve_project(project: Option<&str>, name: Option<&str>) -> Result<String, String> {
     if let Some(p) = project.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(p.to_string());
+    }
+    // 没绑定项目但用户已给名字：建/复用 + 初始化 + 写绑定，一条命令做完。
+    if let Some(n) = name.map(str::trim).filter(|s| !s.is_empty()) {
+        let dir = std::env::current_dir().map_err(|e| format!("拿不到当前目录: {e}"))?;
+        let r = crate::create::create(&crate::store::Store::new(), &dir, n, None)?;
+        print!("{}", crate::ops::tasklist_guidance(&r.project_id, &r.tasklists, true));
+        return Ok(r.project_id);
     }
     match read_project_binding() {
         Some(b) => Ok(b),
@@ -754,63 +761,118 @@ fn onboard(store: &Store) -> Result<(), String> {
     Ok(())
 }
 
+/// go 发现当前工作区没有对应 Teambition 项目时的引导/接入。
+/// 用户已给名字（--name / --project）就一条龙建好并接着领；
+/// 没给名字只列候选、交用户拍板，agent 不自己起名。
+/// 有了名字（用户给的）就建/复用 + 初始化 + 写绑定 + 补 AGENTS.md + 写 MCP 配置，
+/// 返回建好的 project id 和项目名。项目链接在 tasklist_guidance 里原样打出。
+fn create_with_name(
+    store: &Store,
+    name: &str,
+    project: Option<&str>,
+) -> Result<(String, String), String> {
+    use std::io::Write;
+    let dir = std::env::current_dir().map_err(|e| format!("拿不到当前目录: {e}"))?;
+    let r = crate::create::create(store, &dir, name, project)?;
+    println!(
+        "\n项目就绪: {}\t{}{}",
+        r.project_id,
+        r.project_name,
+        if r.created { "（新建）" } else { "（复用）" }
+    );
+    if let Some(p) = &r.entry {
+        println!("AGENTS.md 入口: {}", p.display());
+    }
+    print!("{}", crate::ops::tasklist_guidance(&r.project_id, &r.tasklists, true));
+    // MCP 只对下一次会话准备：写失败不能挡住接入和领任务。
+    match mcp_install() {
+        Ok(msg) => println!("\n[MCP] {msg}"),
+        Err(e) => eprintln!("[MCP] 写配置失败（不影响接入）：{e}"),
+    }
+    let _ = std::io::stdout().flush();
+    Ok((r.project_id, r.project_name))
+}
+
+/// go/sub 发现当前工作区没有对应 Teambition 项目时的引导/接入。
+/// 用户已给名字（--name / --project）就一条龙建好；
+/// 没给名字只列候选交用户拍板，agent 不自己起名。
+/// 返回 Some((project_id, project_name)) = 已建好，调用方决定接着领任务还是监听；
+/// None = 已在 stdout 给出候选/收尾命令，调用方应结束本轮。
+fn need_project_bootstrap(
+    store: &Store,
+    project: Option<&str>,
+    name: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    use std::io::IsTerminal;
+    if let Some(n) = name.map(str::trim).filter(|s| !s.is_empty()) {
+        return create_with_name(store, n, project).map(Some);
+    }
+    // 显式给了 --project（绑定失效、线上没了）也当作用户已拍板：
+    // 用该 id 复用/接入，不再问名字。
+    if let Some(pid) = project.map(str::trim).filter(|s| !s.is_empty()) {
+        // create() 先校验 name 非空；给了 --project 时 ensure_project 优先用 id，
+        // 名字只是占位，不会拿去建项目。
+        return create_with_name(store, pid, project).map(Some);
+    }
+
+    let dir = std::env::current_dir().unwrap_or_default();
+    let rows = crate::create::scan(store, &dir, None);
+    if rows.is_empty() {
+        println!("当前工作区没有对应的 Teambition 项目，也没扫到候选名。");
+        println!("问用户想要什么名字，再跑 `tba go --name \"<用户给的名字>\"` / `tba sub --name \"<名字>\"`。");
+        println!("一条命令自动建项目 + 初始化 + 写绑定 + 领任务/监听，项目链接原样转给用户。");
+        return Ok(None);
+    }
+    println!("当前工作区没有对应的 Teambition 项目。候选项目名（原样交给用户拍板，不要自己挑）：");
+    print_name_rows(&rows);
+    println!("用户点头后只跑：`tba go --name \"<选定的名字>\"` 或 `tba sub --name \"<选定的名字>\"`。");
+    println!("一条命令自动建项目 + 初始化 + 写绑定 + 领任务/监听，项目链接原样转给用户。");
+    let _ = std::io::stdout().flush();
+    // 人自己在终端敲：就地选号，一次做完。
+    if std::io::stdin().is_terminal() {
+        let picked = pick_name_interactive(&rows)?;
+        println!("\n已选项目名: {picked}");
+        return create_with_name(store, &picked, None).map(Some);
+    }
+    Ok(None)
+}
+
 /// 「去队列领一条任务 + 打开工文案」。
 /// Cmd::Go 和自举一条龙共用，避免两边行为漂移。
 fn claim_and_print(
     store: &Store,
     project: Option<&str>,
+    name: Option<&str>,
     write_entry: bool,
     guide_tasklists: bool,
 ) -> Result<(), String> {
     use std::io::Write;
     match go(store, project, write_entry, guide_tasklists)? {
         GoOutcome::NoBinding { cwd } => {
+            // 没绑定 / 项目查不到，都当成「这个工作区还没接上项目」。
+            // 用户已给名字（--name / --project）就一条龙建好接着领；
+            // 没给名字就列候选交用户拍板，agent 只给一条收尾命令，不自己起名。
             println!("NO_BINDING {cwd}");
-            eprintln!("当前目录没有绑定 Teambition 项目（缺 .tba/project）。停，不领任务。");
-            eprintln!(
-                "要接入：跑 `tba`（不带参数）扫候选项目名，把候选交给用户挑，\
-                 再 `tba create --name \"<选定的名字>\" --go`"
-            );
-            let _ = std::io::stdout().flush();
-            std::process::exit(3);
+            match need_project_bootstrap(store, project, name)? {
+                Some((pid, _)) => {
+                    // create() 已补过列、写过绑定，go 只管领任务，别再查第二遍。
+                    return claim_and_print(store, Some(pid.as_str()), None, false, false);
+                }
+                None => return Ok(()),
+            }
         }
-        GoOutcome::NoProject { id, name } => {
-            if id.is_empty() {
-                println!("NO_PROJECT {name}");
-                eprintln!("当前目录按名字「{name}」在 Teambition 上没找到项目（或撞了多个同名）。");
-            } else {
-                println!("NO_PROJECT {id}");
-                eprintln!("本地绑定指向的项目「{id}」在 Teambition 里查不到（可能被删了）。");
-            }
-            // 「绑定还在、线上项目没了」也算没有对应空间：别把 agent 卡在
-            // ensure-project 上，按工作区重新列候选，交用户拍板后走 create --go。
-            eprintln!("没有对应的 Teambition 项目空间。tba 不会自己建：项目名必须用户拍板。");
-            eprintln!("按工作区重新接一次，候选如下：");
-            // 这里只列名字线索，纯本地。别用 create::scan：它会再开一个 Ctx 联网
-            // 核对同名项目 —— go() 刚查完项目列表才走到这，再握手一次就是白等一分钟。
-            let dir = std::env::current_dir().unwrap_or_default();
-            let rows: Vec<crate::create::Row> = crate::naming::candidates(&dir)
-                .into_iter()
-                .map(|c| crate::create::Row {
-                    name: c.name,
-                    source: c.source,
-                    mark: "本地线索，未联网核对".to_string(),
-                })
-                .collect();
-            if rows.is_empty() {
-                eprintln!("没扫到候选名：直接问用户要一个项目名。");
-            } else {
-                eprintln!("候选项目名（原样交给用户拍板，不要自己挑）：");
-                print_name_rows(&rows);
-            }
-            eprintln!(
-                "用户点头后只跑 `tba create --name \"<选定的>\" --go`：复用/新建项目并重写本地绑定。"
+        GoOutcome::NoProject { id, name: hint } => {
+            // 绑定还在、线上项目没了，也当成「这个工作区还没接上项目」重新引导。
+            println!(
+                "NO_PROJECT {}",
+                if id.is_empty() { &hint } else { &id }
             );
-            eprintln!(
-                "建完会打印项目链接，并自动补齐 未完成/进行中/待回复/已解决/已完成 五个看板列（老数字列会自动改名）；补不动才提示手动建。"
-            );
-            let _ = std::io::stdout().flush();
-            std::process::exit(4);
+            match need_project_bootstrap(store, project, name)? {
+                Some((pid, _)) => {
+                    return claim_and_print(store, Some(pid.as_str()), None, false, false);
+                }
+                None => return Ok(()),
+            }
         }
         GoOutcome::Empty { project_name } => {
             println!("EMPTY {project_name}");
@@ -873,7 +935,7 @@ fn finish_bootstrap(
     // 用刚建/复用出来的项目 id，别让 go() 去读 cwd 的 .tba/project：
     // `--dir <别的目录>` 时绑定写在 dir，进程 cwd 里根本没有。
     // create() 已经在 dir 写过入口文件，这里 write_entry=false，别再往 cwd 补一份。
-    claim_and_print(store, Some(r.project_id.as_str()), false, false)
+    claim_and_print(store, Some(r.project_id.as_str()), None, false, false)
 }
 
 /// 无参数 + 没有 .tba/project 时的一次性自举卡。
@@ -938,6 +1000,7 @@ pub fn run() -> Result<(), String> {
             if crate::ops::read_project_binding().is_some() {
                 Cmd::Go {
                     project: None,
+                    name: None,
                     no_entry: false,
                     off: false,
                     task: Vec::new(),
@@ -1472,6 +1535,7 @@ pub fn run() -> Result<(), String> {
         }
         Cmd::Go {
             project,
+            name,
             no_entry,
             off,
             task,
@@ -1482,7 +1546,7 @@ pub fn run() -> Result<(), String> {
             // 例：tba go 把侧栏改窄一点
             if !off && !task.is_empty() {
                 let desc = task.join(" ");
-                let pid = resolve_project(project.as_deref())?;
+                let pid = resolve_project(project.as_deref(), name.as_deref())?;
                 let r = start(&store, &pid, desc.trim(), "", &current_agent())?;
                 for w in &r.warnings {
                     eprintln!("警告: {w}");
@@ -1548,15 +1612,15 @@ pub fn run() -> Result<(), String> {
                 let _ = std::io::stdout().flush();
                 return Ok(());
             }
-            claim_and_print(&store, project.as_deref(), !no_entry, true)?;
+            claim_and_print(&store, project.as_deref(), name.as_deref(), !no_entry, true)?;
         }
-        Cmd::Subagent { target, project, agent_tag, task } => {
+        Cmd::Subagent { target, project, name, agent_tag, task } => {
             use std::io::Write;
             // 跟了文字：新建一条任务并开工，不再派子代理。
             // 标题即文字，置「进行中」+ 看板列「进行中」。
             if !task.is_empty() {
                 let desc = task.join(" ");
-                let pid = resolve_project(project.as_deref())?;
+                let pid = resolve_project(project.as_deref(), name.as_deref())?;
                 let r = start(&store, &pid, desc.trim(), "", &current_agent())?;
                 for w in &r.warnings {
                     eprintln!("警告: {w}");
@@ -1603,7 +1667,21 @@ pub fn run() -> Result<(), String> {
             } else {
                 // 裸 `tba sub`：常驻监听「未完成」列。空队列继续等，领到才退出唤醒。
                 // 简报由 subagent_watch 打印后返回，不走下面单次派发的打印。
-                let pid = resolve_project(project.as_deref())?;
+                // 没绑定项目（也没指定）时先走引导/接入：有名字就建好项目再监听，
+                // 没名字就列候选交用户拍板。绝不自己起名、不盲目长挂空等。
+                // 只做只读探测，不能像 go() 那样顺手领一条任务——sub 只监听不预领。
+                if project.as_deref().map(str::trim).unwrap_or("").is_empty()
+                    && read_project_binding().is_none()
+                {
+                    match need_project_bootstrap(&store, None, name.as_deref())? {
+                        Some((pid, _)) => {
+                            // 建好项目后进入常驻监听；MCP 配置也已写好，不必再装一遍。
+                            return subagent_watch(&store, &pid);
+                        }
+                        None => return Ok(()),
+                    }
+                }
+                let pid = resolve_project(project.as_deref(), name.as_deref())?;
                 subagent_watch(&store, &pid)?;
                 return Ok(());
             };
@@ -1623,7 +1701,7 @@ pub fn run() -> Result<(), String> {
             let _ = std::io::stdout().flush();
         }
         Cmd::Claim { project, name } => {
-            let project = resolve_project(project.as_deref())?;
+            let project = resolve_project(project.as_deref(), None)?;
             // 领之前先回收死会话，别让一个已经不存在的会话占着任务。
             for m in sweep(&store, false).unwrap_or_default() {
                 eprintln!("{m}");
@@ -1705,7 +1783,7 @@ pub fn run() -> Result<(), String> {
                 })
                 .ok_or("需要 --title，或给一个首行是 `# 标题` 的 --file")?;
             let agent = agent.unwrap_or_else(current_agent);
-            let project = resolve_project(project.as_deref())?;
+            let project = resolve_project(project.as_deref(), None)?;
             let r = start(&store, &project, &title, &body, &agent)?;
             for w in &r.warnings {
                 eprintln!("警告: {w}");
@@ -1762,7 +1840,7 @@ pub fn run() -> Result<(), String> {
             let claim_id = match claim_id {
                 Some(id) => id,
                 None => {
-                    let pid = resolve_project(None)?;
+                    let pid = resolve_project(None, None)?;
                     let title = q
                         .lines()
                         .find(|l| !l.trim().is_empty())

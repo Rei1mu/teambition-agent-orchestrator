@@ -4969,8 +4969,8 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>) -> String {
     ));
     s.push_str(&format!(
         "\n**更省事（陌生 agent）**：项目目录跑 `{exe}`（不带参数）扫候选，把候选交用户拍板；\
-         之后只跑一条 `{exe} create --name \"<选定的>\" --go`，\
-         建项目 + 写 MCP 配置 + 当场领任务一次做完。\n"
+         之后只跑一条 `{exe} go --name \"<选定的>\"` 或 `{exe} sub --name \"<选定的>\"`，\
+         建项目 + 补 7 状态 + 写绑定 + 补 AGENTS.md + 写 MCP 配置 + 当场开工/监听一次做完。\n"
     ));
     s.push_str(&format!(
         "\n**建完项目要给用户的东西**：输出里的「项目链接」（`https://www.teambition.com/project/<id>`）。\n\
@@ -5073,6 +5073,14 @@ const ENTRY_MARK: &str = "<!-- tba:entry";
 // 在下次 tba g 时能补上这一节，而不是被「已有入口」挡住。
 const RULES_MARK: &str = "<!-- tba:rules";
 
+// 固定生成文案的版本指纹。绑定 crate 版本，发版才变。
+// 版本写在每块第一行的标记里（如 `<!-- tba:entry v0.2.57 ... -->`）；
+// 版本一致就跳过不重写（省 token），不一致或缺失就整块清掉重写——把「逐句
+// contains 检查」换成「只比指纹」，以后改文案不用每句加检查。
+// 版本号必须和标记同一行：单独一行 `<!-- tba:entry-ver -->` 会被标记前缀
+// `<!-- tba:entry` 匹配到，`matches(ENTRY_MARK).count()` 数成 2，把「块重复」判定搞错。
+const ENTRY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // 当前目录是不是 git 仓库（向上找 .git；worktree 里 .git 是文件，用 exists 一并覆盖）。
 // 用来区分「项目目录」和「随手打开的目录」——后者不该去猜 Teambition 项目。
 fn is_git_repo() -> bool {
@@ -5125,16 +5133,26 @@ pub fn ensure_entry_in(store: &Store, dir: &std::path::Path) -> Option<std::path
 pub fn refresh_agents_at(dir: &std::path::Path, cmd: &str, force: bool) -> Option<std::path::PathBuf> {
     let path = dir.join("AGENTS.md");
     let old = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut stale = old;
-    // 改入口块里的一句版本文案即可：entry_ok 变 false，ensure_entry_at 会清掉全部旧块重生成。
-    // 绝不碰块外用户内容——这份 AGENTS.md 里用户自己写了一段 ultracave 文案。
-    stale = stale.replacen("派子代理先打 tag", "派子代理先打 TAG-STALE", 1);
+    let mut stale = old.clone();
+    // 把三个块标记行里的版本号摘掉：gate 只认「标记 + 当前版本」，摘掉就不通过，
+    // ensure_entry_at 会清掉全部旧块重生成。只动版本标记，块外用户内容一个字不碰。
+    for mark in [ENTRY_MARK, RULES_MARK, ULTRACAVE_MARK] {
+        stale = stale.replace(&format!("{mark} v{ENTRY_VERSION}"), mark);
+    }
     if force {
         // --f：连用户手写内容一起丢，只留 tba 块。
         stale = String::new();
     }
     std::fs::write(&path, stale).ok()?;
-    ensure_entry_at(dir, cmd)
+    let r = ensure_entry_at(dir, cmd);
+    // 重生成结果与原来逐字相同时算「无需改动」，别每次 refresh 都报「已刷新」。
+    if !force
+        && r.is_some()
+        && std::fs::read_to_string(&path).ok().as_deref() == Some(old.as_str())
+    {
+        return None;
+    }
+    r
 }
 
 fn ensure_entry_file(store: &Store) -> Option<std::path::PathBuf> {
@@ -5220,8 +5238,7 @@ fn strip_unmarked_ultracave(s: &str) -> String {
 }
 
 const ULTRACAVE_MARK: &str = "<!-- tba:ultracave";
-const ULTRACAVE_BLOCK: &str = "<!-- tba:ultracave v1 由 tba 自动生成，删掉不影响功能 -->\n\
-## 默认回复风格：ultracave\n\n\
+const ULTRACAVE_BODY: &str = "## 默认回复风格：ultracave\n\n\
 本项目会话默认用 ultracave 风格回复。不依赖 caveman / ultracave 技能。下方为 ultracave 技能原文，尽量保留。\n\n\
 中文回复。本项目默认即生效，无需命令开启；用户说 `stop caveman` 或 `normal mode` 即退回正常语气。\n\n\
 # ultracave\n\n\
@@ -5256,6 +5273,14 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 ### 跨设备 / 其他 agent\n\n\
 本文件随 git 仓库同步，用本仓库的 WorkBuddy 自动生效。非本仓库的 agent：复制本 `## 默认回复风格：ultracave` 整节到其项目指令即可，无需安装技能。\n";
 
+// 带标记 + 版本行的 ultracave 块。版本塞进标记行（见 ENTRY_VERSION 注释）。
+fn ultracave_block() -> String {
+    format!(
+        "{ULTRACAVE_MARK} v{ENTRY_VERSION} 由 tba 自动生成，删掉不影响功能 -->\n\
+         {ULTRACAVE_BODY}"
+    )
+}
+
 fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBuf> {
     let path = dir.join("AGENTS.md");
     ensure_bootstrap_block(&path);
@@ -5264,15 +5289,16 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     let exe = cmd.to_string();
 
     let entry = format!(
-        "{ENTRY_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
+        "{ENTRY_MARK} v{ENTRY_VERSION} 由 tba 自动生成，删掉不影响功能 -->\n\
          ## 任务队列入口\n\n\
          **工具**：`{exe}`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。\
          直接执行，别搜 exe、别验证路径、别读 `.tba/`。\n\n\
          **开工**：用户说「开工」→ 跑 `{exe}`（不带参数）。有 `.tba/project` 就领任务；\
-         没有就列候选项目名交给用户拍板，用户点头后只跑 `{exe} create --name \"<选定的>\" --go`\
-         （建项目 + 写 MCP 配置 + 当场领任务，一条命令做完）。退出码：\
-         0+claim_id=干活；0+EMPTY=队列空；3=没绑定项目；4=项目查不到，问用户。\
-         别自建任务。\n\n\
+         没有就列候选项目名交给用户拍板（agent 不许自己起名），用户点头后只跑\
+         `{exe} go --name \"<选定的>\"` 或 `{exe} sub --name \"<选定的>\"`——\
+         一条命令做完建/复用项目 + 补 7 状态 + 写绑定 + 补 AGENTS.md + 写 MCP 配置 + 当场开工/监听，\
+         项目链接原样转给用户。已给 `--name` / `--project` 时 tba 自动建好并开工，不用再问。\
+         退出码：0+claim_id=干活；0+EMPTY=队列空。别自建任务。\n\n\
          **流转**：进行中 → `ask` 后 待回复 → 用户收尾 已解决。\n\n\
          **lead 单任务**：每次开工先跑 `{exe} lead start \"<当前任务名，≤20字>\"` 建一条 lead: 任务（绑本次会话）；\n\
          所有汇报和提问合一条——用 `{exe} lead report \"<汇报内容>\"`（say / ask 是同义别名）写到这条 lead 任务，\n\
@@ -5314,7 +5340,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     // 任务流程无关，而且每条都要解释才管用。塞进 prompt 每次会话固定多 1500 字，
     // 而 AGENTS.md 是 agent 进项目就会读的约定文件，成本几乎为零。
     let rules = format!(
-        "{RULES_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
+        "{RULES_MARK} v{ENTRY_VERSION} 由 tba 自动生成，删掉不影响功能 -->\n\
          ## 编码纪律\n\n\
          五条，动手前过一遍。\n\n\
          1. **先想再写。** 不假设、不藏困惑。不确定就问，别猜着往下做；有歧义就摆出几种解释；\
@@ -5332,48 +5358,24 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     );
 
     let mut old = std::fs::read_to_string(&path).unwrap_or_default();
-    let ultracave = ULTRACAVE_BLOCK.to_string();
+    let ultracave = ultracave_block();
 
     // 迁移：清掉旧的手动 `<!-- user:ultracave -->` 节（内部有 `## ` 子标题，
     // 不能用 strip_tba_block，按下一个 tba 标记收边界）。新块由下面的 ultracave 逻辑补。
     old = strip_marker_block_to_next_tba(&old, "<!-- user:ultracave");
 
-    // 已经是新版就不用动：入口段只有一份、带裸命令、带「交回」「流转」「通用能力」。
-    // 「**工具**：`tba`」同时当版本号用——老入口里是本机绝对路径，缺这句就整段
-    // 替换成新版（不会重复追加）。`git create` 也是版本号（v0.2.20 加的）。
-    // v0.2.42：监听由 tba serve 聚合器统一托管，旧 detached / run_in_background 文案整段重写。
-    // v0.2.43：主代理要用户拍板也走 tba ask，不直接在聊天框给选项；缺这句就再重写一次。
-    // v0.2.44：主代理无 claim 时 ask 自动新建 task，入口块要带上这句。
-    let entry_ok = old.matches(ENTRY_MARK).count() == 1
-        && old.contains(&format!("**工具**：`{exe}`"))
-        && old.contains("**交回**")
-        && old.contains("**流转**")
-        && old.contains("**通用能力**")
-        && old.contains("git create")
-        // 老入口还写着 0/1/2 选项或没有保留号规则，缺这句就整段重写一次。
-        && old.contains("1/2 是系统保留号")
-        && old.contains("会话窗直接回")
-        && old.contains("tba serve 的 WatchAggregator 统一托管")
-        && old.contains("禁用 DSH 的 ask_user_question 选择框/弹窗")
-        && old.contains("主代理要用户拍板也走")
-        && old.contains("自动新建一条 task")
-        // v0.2.50：派子代理前先 --agent-tag 打 tag，老入口缺这句要整段重写一次。
-        && old.contains("派子代理先打 tag")
-        // v0.2.51：序号规则改为 list_agents 最大序号 +1；老入口写的是 agent-1 / agent-2，
-        // 缺这句就整段重写一次。
-        && old.contains("不要从 agent-1 重新开始")
-        // v0.2.51：收到用户回复自己判断继续当前子代理还是派新子代理；老入口缺这句要整段重写一次。
-        && old.contains("收到用户回复自己判断分派")
-        && old.contains("去邮箱回 1")
-        // lead 单任务：开工建 lead: 任务、report 统一汇报+提问、回 1 联动收尾。
-        // 老入口缺这句要整段重写一次。
-        && old.contains("lead 单任务")
-        // v0.2.57：主代理不自己写、优先派子代理。老入口缺这句要整段重写一次。
-        && old.contains("主代理不自己写、优先派子代理");
-    // v0.2.54：编码纪律加第 5 条（大文件按块读）；老规则块缺这句就整段重写一次。
-    let rules_ok = old.matches(RULES_MARK).count() == 1
-        && old.contains("探查大文件按块读");
-    let ultracave_ok = old.matches(ULTRACAVE_MARK).count() == 1;
+    // 版本门：同一行同时含标记 + 版本号才算数。
+    // 版本不一致或缺失就整块清掉重写；老文件（无版本）自然重写一次，平滑迁移。
+    let ver = format!("v{ENTRY_VERSION}");
+    let entry_ok = old
+        .lines()
+        .any(|l| l.contains(ENTRY_MARK) && l.contains(&ver));
+    let rules_ok = old
+        .lines()
+        .any(|l| l.contains(RULES_MARK) && l.contains(&ver));
+    let ultracave_ok = old
+        .lines()
+        .any(|l| l.contains(ULTRACAVE_MARK) && l.contains(&ver));
 
     // 转发脚本只写 `tba.exe`，不带本机绝对路径，换设备一样能用。
     // 带 .exe 后缀是必须的：只写 `tba` 的话 cmd 会先匹配到当前目录的 tba.cmd，

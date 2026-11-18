@@ -75,6 +75,12 @@ impl CommentCursor {
 }
 
 pub fn run_aggregator(store: Store, alive: Arc<AtomicBool>) {
+    // 离线模式不连 Teambition：回复聚合器整条腿（IMAP + 评论 + 状态流转）都不要起，
+    // 一处早退覆盖所有 spawn 路径。 wakes 握手写文件是本地操作，不在此拦。
+    if store.load_config().offline() {
+        eprintln!("当前是离线模式，不启动回复聚合器（不轮询邮件/Teambition）。");
+        return;
+    }
     let mut imap: Option<ImapSession> = None;
     let mut cursors: HashMap<String, CommentCursor> = HashMap::new();
     let mut last_mail = Instant::now() - std::time::Duration::from_secs(MAIL_POLL_SECS);

@@ -69,7 +69,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 看 `docs/流程图.md`。需要时再读，不要一开始就整份加载。
 
-<!-- tba:rules 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:rules v0.2.57 由 tba 自动生成，删掉不影响功能 -->
 ## 编码纪律
 
 五条，动手前过一遍。
@@ -83,7 +83,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 例外：错别字、一行小改这类琐碎活，别上完整流程。这五条是为了减少非琐碎工作的代价，不是拖慢简单任务。
 
 
-<!-- tba:ultracave v1 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:ultracave v0.2.57 由 tba 自动生成，删掉不影响功能 -->
 ## 默认回复风格：ultracave
 
 本项目会话默认用 ultracave 风格回复。不依赖 caveman / ultracave 技能。下方为 ultracave 技能原文，尽量保留。
@@ -150,18 +150,20 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 本文件随 git 仓库同步，用本仓库的 WorkBuddy 自动生效。非本仓库的 agent：复制本 `## 默认回复风格：ultracave` 整节到其项目指令即可，无需安装技能。
 
 
-<!-- tba:entry 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:entry v0.2.57 由 tba 自动生成，删掉不影响功能 -->
 ## 任务队列入口
 
 **工具**：`tba`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。直接执行，别搜 exe、别验证路径、别读 `.tba/`。
 
-**开工**：用户说「开工」→ 跑 `tba`（不带参数）。有 `.tba/project` 就领任务；没有就列候选项目名交给用户拍板，用户点头后只跑 `tba create --name "<选定的>" --go`（建项目 + 写 MCP 配置 + 当场领任务，一条命令做完）。退出码：0+claim_id=干活；0+EMPTY=队列空；3=没绑定项目；4=项目查不到，问用户。别自建任务。
+**开工**：用户说「开工」→ 跑 `tba`（不带参数）。有 `.tba/project` 就领任务；没有就列候选项目名交给用户拍板（agent 不许自己起名），用户点头后只跑`tba go --name "<选定的>"` 或 `tba sub --name "<选定的>"`——一条命令做完建/复用项目 + 补 7 状态 + 写绑定 + 补 AGENTS.md + 写 MCP 配置 + 当场开工/监听，项目链接原样转给用户。已给 `--name` / `--project` 时 tba 自动建好并开工，不用再问。退出码：0+claim_id=干活；0+EMPTY=队列空。别自建任务。
 
 **流转**：进行中 → `ask` 后 待回复 → 用户收尾 已解决。
 
-**内部任务例外**：项目全部完成、进入收尾时，lead 用 `start` / MCP `start_task` 自建的内部任务
-（非用户派的队列任务），实质完成后 lead 直接 `tba close <claim_id>` 转「已完成」列，
-不 `ask`、不等用户回 1。下面「只有用户能 done/close」的红线只对用户派的队列任务成立。
+**lead 单任务**：每次开工先跑 `tba lead start "<当前任务名，≤20字>"` 建一条 lead: 任务（绑本次会话）；
+所有汇报和提问合一条——用 `tba lead report "<汇报内容>"`（say / ask 是同义别名）写到这条 lead 任务，
+会发邮件等你回 1。工作全部做完后，在最后一次 report 里列清所有子任务状态；你回 1 收尾 lead 任务时，
+系统自动把同会话还在「待回复」的子代理任务收为「已解决」，把已断线的僵尸任务收为「已完成」。
+不再用 start/start_task 自建多个内部任务，也不自己 done/close。
 
 **交回**：做完两步，不许省：
 ① `tba note <claim_id> --text "改了什么/怎么验"`
@@ -170,6 +172,8 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 **主代理收尾/要拍板必须当场 `tba ask` 发邮件，明确告诉用户去邮箱回 1；不能只在聊天框说回 1 而不发 ask。发完确认邮件已发，别让任务停在进行中空等。**
 
 **派子代理先打 tag**：主代理收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。然后跑 `tba sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
+
+**主代理不自己写、优先派子代理**：主代理（lead）以**省 token、省时间**为前提，动手活（改代码、改文件、查文件、调研、跑验证）**尽量不自己干**，合理拆给子代理：能由子代理独立完成的一律派子代理，只有需要本会话上下文的整合、收尾、拍板、`ask` 才自己来。派活仍按上面「派子代理先打 tag」规范执行。
 
 **收到用户回复自己判断分派**：发出 `tba sub` 进监听后，用户可能在本会话或其他渠道回复；先 `tba reply <claim_id>` + `tba events --claim <claim_id>` 读回原话，再自己判断是「继续当前子代理任务」（`send_message` 转给现有子代理）还是「新任务派新子代理」（按上面打 tag 规范新起 agent-N）。别都当新任务，也别把新任务塞回旧子代理。
 
