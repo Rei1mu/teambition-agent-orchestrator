@@ -59,39 +59,71 @@ fn but_prog() -> &'static str {
         "but"
     }
 }
-/// git 程序名 / 路径。优先级：环境变量 TBA_GIT > config.toml 的 git_path > PATH 里的 git。
+/// git 程序路径 + 来源。优先级：TBA_GIT > config.toml 的 git_path
+/// > 自动探测 Git for Windows 标准安装位 > PATH 里的 git。
 ///
-/// 装了多个 git（Git for Windows / GitButler 自带 / scoop 版）时，PATH 里挑错版本会出
-/// 稀奇古怪的问题，指定一次最稳。和 GitButler 的 but_path 同一思路：**不扫盘**。
-pub fn git_prog() -> String {
+/// PATH 兜底放最后：PATH 可能被便携版/工具链注入的 git 抢占，那些版本常缺
+/// credential.helper，push 取不到 token（实测 DSH 便携 niugit 触发 `failed to execute
+/// prompt script`）。自动探测优先认系统 Git，和 GitButler 的 but_path 同一思路。
+fn resolve_git() -> (String, &'static str) {
     if let Ok(v) = std::env::var("TBA_GIT") {
         let v = v.trim().to_string();
         if !v.is_empty() {
-            return v;
+            return (v, "环境变量");
         }
     }
     let cfg = crate::config::Config::load(&crate::config::data_dir());
     if !cfg.git_path.trim().is_empty() {
-        cfg.git_path.trim().to_string()
-    } else {
-        "git".to_string()
+        return (cfg.git_path.trim().to_string(), "手动指定");
     }
+    if let Some(p) = detect_git_install() {
+        return (p, "自动探测");
+    }
+    ("git".to_string(), "PATH")
 }
 
-/// git 路径来源（和 git_prog 同优先级，只报来源不报路径）。
+pub fn git_prog() -> String {
+    resolve_git().0
+}
+
+/// git 路径来源（和 git_prog 同一套逻辑，只报来源不报路径）。
 /// 用于 `tba where` 告诉用户这份 git 是从哪来的。
 pub fn git_source() -> &'static str {
-    if let Ok(v) = std::env::var("TBA_GIT") {
-        if !v.trim().is_empty() {
-            return "环境变量";
+    resolve_git().1
+}
+
+/// 候选列表里第一个真实存在的文件。抽出来单测可注入临时路径，不依赖真实安装。
+fn first_existing(candidates: &[&str]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|p| Path::new(p).is_file())
+        .map(|s| s.to_string())
+}
+
+/// 找 Git for Windows 标准安装位。不依赖 PATH，也不先看环境变量
+/// （DSH / 子进程里 ProgramFiles 常取不到）——和 toolchain::vswhere 同思路。
+fn detect_git_install() -> Option<String> {
+    const STANDARD: &[&str] = &[
+        "C:\\Program Files\\Git\\bin\\git.exe",
+        "C:\\Program Files\\Git\\cmd\\git.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\git.exe",
+        "C:\\Program Files (x86)\\Git\\cmd\\git.exe",
+    ];
+    if let Some(p) = first_existing(STANDARD) {
+        return Some(p);
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(pf) = std::env::var(key) {
+            let p = Path::new(&pf);
+            for rel in ["Git\\bin\\git.exe", "Git\\cmd\\git.exe"] {
+                let full = p.join(rel);
+                if full.is_file() {
+                    return Some(full.to_string_lossy().to_string());
+                }
+            }
         }
     }
-    let cfg = crate::config::Config::load(&crate::config::data_dir());
-    if !cfg.git_path.trim().is_empty() {
-        "手动指定"
-    } else {
-        "PATH"
-    }
+    None
 }
 
 
@@ -1176,6 +1208,21 @@ pub fn create_repo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_existing_picks_first_present_file() {
+        let root = std::env::temp_dir().join(format!("tba-git-detect-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+        std::fs::write(&b, "x").unwrap();
+        let cand = [a.to_string_lossy().to_string(), b.to_string_lossy().to_string()];
+        let got = first_existing(&cand.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        assert_eq!(got.as_deref(), Some(b.to_string_lossy().as_ref()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn parse_head_reads_ahead_behind() {
