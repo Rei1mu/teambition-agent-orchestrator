@@ -5358,6 +5358,33 @@ fn strip_marker_block_to_next_tba(s: &str, mark: &str) -> String {
     format!("{}{}", &s[..start], &s[end..])
 }
 
+// 清掉历史 refresh 留下的「无标记 ultracave 残留」：正文里有行首的
+// `## 默认回复风格：ultracave` 但前面没有 `<!-- tba:` 标记。这些是旧版
+// strip_tba_block 被块内 `##` 截断后剩下的，strip_marker_block_to_next_tba
+// 找不到 mark 删不掉。必须在删完带标记真块之后调用，那时剩下的全是残留。
+// 只认行首标题，避免命中正文里反引号中的同名引用。
+fn strip_unmarked_ultracave(s: &str) -> String {
+    const HEAD: &str = "## 默认回复风格：ultracave";
+    // 行首标题位置（含开头），从后往前删，避免删除影响前面的下标。
+    let heads: Vec<usize> = s
+        .match_indices(HEAD)
+        .filter(|(p, _)| *p == 0 || s[..*p].ends_with('\n'))
+        .map(|(p, _)| p)
+        .collect();
+    let mut out = s.to_string();
+    for &pos in heads.iter().rev() {
+        let after = pos + HEAD.len();
+        let rest = &out[after..];
+        let end_rel = rest
+            .find("\n## ")
+            .or_else(|| rest.find("\n<!-- tba:"))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        out = format!("{}{}", &out[..pos], &out[after + end_rel..]);
+    }
+    out
+}
+
 const ULTRACAVE_MARK: &str = "<!-- tba:ultracave";
 const ULTRACAVE_BLOCK: &str = "<!-- tba:ultracave v1 由 tba 自动生成，删掉不影响功能 -->\n\
 ## 默认回复风格：ultracave\n\n\
@@ -5413,6 +5440,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          0+claim_id=干活；0+EMPTY=队列空；3=没绑定项目；4=项目查不到，问用户。\
          别自建任务。\n\n\
          **流转**：进行中 → `ask` 后 待回复 → 用户收尾 已解决。\n\n\
+         **内部任务例外**：项目全部完成、进入收尾时，lead 用 `start` / MCP `start_task` 自建的内部任务\n\
+         （非用户派的队列任务），实质完成后 lead 直接 `{exe} close <claim_id>` 转「已完成」列，\n\
+         不 `ask`、不等用户回 1。下面「只有用户能 done/close」的红线只对用户派的队列任务成立。\n\n\
          **交回**：做完两步，不许省：\n\
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
@@ -5494,7 +5524,10 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         && old.contains("不要从 agent-1 重新开始")
         // v0.2.51：收到用户回复自己判断继续当前子代理还是派新子代理；老入口缺这句要整段重写一次。
         && old.contains("收到用户回复自己判断分派")
-        && old.contains("去邮箱回 1");
+        && old.contains("去邮箱回 1")
+        // v0.2.56：内部任务例外——项目收尾时 lead 自建任务直接 close，不 ask。
+        // 老入口缺这句要整段重写一次。
+        && old.contains("内部任务例外");
     // v0.2.54：编码纪律加第 5 条（大文件按块读）；老规则块缺这句就整段重写一次。
     let rules_ok = old.matches(RULES_MARK).count() == 1
         && old.contains("探查大文件按块读");
@@ -5521,7 +5554,12 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     // 实测把一份 100 多行的 AGENTS.md 删到只剩两个块。
     old = strip_tba_block(&old, ENTRY_MARK);
     old = strip_tba_block(&old, RULES_MARK);
-    old = strip_tba_block(&old, ULTRACAVE_MARK);
+    // ultracave 块内部全是 `## ` 子标题，strip_tba_block 会被块内第一个 `## ` 提前截断，
+    // 只删掉标记行、留下正文，下次 refresh 又追加一份——实测刷出三份逐字相同的 ultracave。
+    // 按下一个 `<!-- tba:` 标记收边界才能整块删干净。
+    old = strip_marker_block_to_next_tba(&old, ULTRACAVE_MARK);
+    // 再清掉历史遗留的无标记 ultracave 残留（旧版截断留下的正文）。
+    old = strip_unmarked_ultracave(&old);
     // 删块会留下连续空行，收一下。
     while old.contains("\n\n\n") {
         old = old.replace("\n\n\n", "\n\n");
@@ -6425,6 +6463,47 @@ mod tests {
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(s.contains("探查大文件按块读"), "缺第 5 条大文件按块读: {s}");
         assert!(s.contains("这五条"), "「四条」旧口径没改: {s}");
+    }
+
+    // v0.2.56：内部任务例外必须写进入口块，否则 lead 自建任务又走 ask 空等。
+    #[test]
+    fn entry_file_has_internal_task_close_exception() {
+        let store = tmp_store("entry-internal-exception");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("生成初始 AGENTS.md");
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("内部任务例外"), "缺内部任务例外标记: {s}");
+        assert!(
+            s.contains("项目全部完成") && s.contains("close <claim_id>") && s.contains("不 `ask`"),
+            "缺 lead 自建任务收尾直接 close 的指引: {s}"
+        );
+    }
+
+    // v0.2.57：旧版 strip_tba_block 被 ultracave 块内 `##` 截断，refresh 一次多一份。
+    // 脏文件（两份无标记残留 + 一份带标记）refresh 后必须只剩一份带标记的。
+    #[test]
+    fn refresh_collapses_duplicate_ultracave_blocks() {
+        let store = tmp_store("refresh-dedup-ultracave");
+        let dir = store.root.clone();
+        let clean = ensure_entry_at(&dir, "tba").expect("生成初始 AGENTS.md");
+        let full = std::fs::read_to_string(&clean).unwrap();
+        // 抽带标记的 ultracave 整块，复制两份去掉标记的正文模拟历史残留。
+        let marked = full.find(ULTRACAVE_MARK).expect("缺 ultracave 标记");
+        let block = &full[marked..];
+        let unmarked = block.replace(ULTRACAVE_MARK, "").trim_start().to_string();
+        let dirty = format!("{unmarked}\n\n{unmarked}\n\n{full}");
+        std::fs::write(&clean, &dirty).unwrap();
+
+        assert!(refresh_agents_at(&dir, "tba", false).is_some(), "脏文件该重写");
+        let out = std::fs::read_to_string(&clean).unwrap();
+        // 正文里还有一句「复制本 `## 默认回复风格：ultracave` 整节」也是同名串，
+        // 只数行首标题才是真正的块数。
+        let head_count = out
+            .match_indices("## 默认回复风格：ultracave")
+            .filter(|(p, _)| *p == 0 || out[..*p].ends_with('\n'))
+            .count();
+        assert_eq!(head_count, 1, "refresh 后 ultracave 块该只剩一份: {out}");
+        assert_eq!(out.matches(ULTRACAVE_MARK).count(), 1, "标记块该只有一份");
     }
 
     #[test]
