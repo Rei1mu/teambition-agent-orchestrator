@@ -113,19 +113,16 @@ const BRIDGE_PATHS: &[&str] = &[
     "~/.dsh/profiles/desktop/node_modules/dsh-tba-bridge",
 ];
 const CONTEXT_DIFF_PATHS: &[&str] = &["~/.dsh/profiles/desktop/node_modules/dsh-context-diff"];
-const SESSION_PRUNER_PATHS: &[&str] = &["~/.dsh/profiles/desktop/node_modules/dsh-session-pruner"];
 
 const MODSEARCH_DESC: &str = "全网最强 DSH 免费联网搜索插件，免费免注册免 API key，为不能联网的模型补搜索，问网页/X 返回结构化 JSON 证据";
 const BRIDGE_DESC: &str = "tba 回复唤醒桥：邮件 / Teambition 新回复立刻注入会话，不用等 job 退出";
 const CONTEXT_DIFF_DESC: &str = "上下文差异能力插件";
-const SESSION_PRUNER_DESC: &str = "会话清理插件";
 
 // 两类来源，文案分开写：GitHub 用 dsh plugin --profile ... add "github:..."，
 // dsh 类从插件市场装，用 dsh plugin add <包名>。
 const INSTALL_MODSEARCH: &str = "GitHub 安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin --profile web add \"github:liustack/modsearch\"\n仓库：https://github.com/liustack/modsearch\n装完重启 harness / 在 Web UI 确认加载。";
 const INSTALL_BRIDGE: &str = "GitHub 安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin --profile desktop add \"github:Rei1mu/dsh-tba-bridge\"\n仓库：https://github.com/Rei1mu/dsh-tba-bridge\n装完重启 harness / 在 Web UI 确认加载。";
 const INSTALL_CONTEXT_DIFF: &str = "从 DSH 插件市场安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin add dsh-context-diff\n装完重启 harness / 在 Web UI 确认加载。";
-const INSTALL_SESSION_PRUNER: &str = "从 DSH 插件市场安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin add dsh-session-pruner\n装完重启 harness / 在 Web UI 确认加载。";
 
 struct PluginSpec {
     name: &'static str,
@@ -152,12 +149,6 @@ const PLUGIN_SPECS: &[PluginSpec] = &[
         desc: CONTEXT_DIFF_DESC,
         paths: CONTEXT_DIFF_PATHS,
         install_text: INSTALL_CONTEXT_DIFF,
-    },
-    PluginSpec {
-        name: "dsh-session-pruner",
-        desc: SESSION_PRUNER_DESC,
-        paths: SESSION_PRUNER_PATHS,
-        install_text: INSTALL_SESSION_PRUNER,
     },
 ];
 
@@ -3076,7 +3067,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_detect_parses_all_four_paths() {
+    fn plugin_detect_parses_all_paths() {
         let root = std::env::temp_dir().join(format!("tba-plugins-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
@@ -3086,12 +3077,11 @@ mod tests {
             r".dsh\skills\modsearch",
             r".dsh\dsh-tba-bridge",
             r".dsh\profiles\desktop\node_modules\dsh-context-diff",
-            r".dsh\profiles\desktop\node_modules\dsh-session-pruner",
         ] {
             std::fs::create_dir_all(home.join(rel)).unwrap();
         }
         let rows = detect_plugins(&home);
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].name, "modsearch");
         assert!(rows[0].paths.iter().any(|p| p
             .to_string_lossy()
@@ -3101,7 +3091,7 @@ mod tests {
         assert_eq!(rows[1].name, "dsh-tba-bridge");
         assert!(rows[1].paths.iter().any(|p| p.to_string_lossy().contains("dsh-tba-bridge")));
         assert!(rows[1].installed);
-        assert!(rows[2].installed && rows[3].installed);
+        assert!(rows[2].installed);
 
         // 缺一个就应报未装（另一个路径还在也不能误判已装）。
         std::fs::remove_dir_all(home.join(r".dsh\dsh-tba-bridge")).unwrap();
@@ -3117,7 +3107,7 @@ mod tests {
     #[test]
     fn plugin_detect_current_machine_all_installed() {
         let rows = detect_plugins(&plugin_home());
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 3);
         for p in &rows {
             assert!(p.installed, "当前环境应已装 {}", p.name);
         }
@@ -3126,7 +3116,7 @@ mod tests {
     #[test]
     fn plugin_install_texts_distinguish_github_and_dsh_sources() {
         let gh = [INSTALL_MODSEARCH, INSTALL_BRIDGE];
-        let dsh = [INSTALL_CONTEXT_DIFF, INSTALL_SESSION_PRUNER];
+        let dsh = [INSTALL_CONTEXT_DIFF];
         for t in gh {
             assert!(t.contains("github:"), "GitHub 类要有 github: 源: {t}");
             assert!(
