@@ -205,6 +205,9 @@ fn detect_sdk() -> Option<String> {
         "C:\\Program Files\\Windows Kits\\10\\Lib",
         "D:\\Program Files (x86)\\Windows Kits\\10\\Lib",
         "D:\\Program Files\\Windows Kits\\10\\Lib",
+        // VS installer 可把 SDK 装到盘根（非 Program Files），实测 D:\Windows Kits。
+        "C:\\Windows Kits\\10\\Lib",
+        "D:\\Windows Kits\\10\\Lib",
     ];
     let libroot = candidates
         .iter()
