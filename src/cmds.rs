@@ -370,7 +370,6 @@ fn run_wait_block(
 fn subagent_watch(
     store: &Store,
     project_id: &str,
-    lang: Lang,
 ) -> Result<(), String> {
     if store.load_config().offline() {
         return Err(OFFLINE_ERR.to_string());
@@ -398,7 +397,7 @@ fn subagent_watch(
         match classify_claim_result(claim(store, project_id, None, &agent, true)) {
             SubPoll::Dispatch(c) => {
                 let skills = cached_skills(store, &c.project_id);
-                print!("{}", subagent_brief(store, &c, &c.task_name, &skills, lang));
+                print!("{}", subagent_brief(store, &c, &c.task_name, &skills));
                 eprintln!(
                     "已领到一条并生成子代理简报。后台 job 结束会唤醒主代理：读简报调 subagent 工具派活；派完再挂一条 `tba sub` 继续监听。"
                 );
@@ -426,7 +425,6 @@ fn cap_cmd(
     action: &str,
     name: Option<&str>,
     summary: Option<&str>,
-    summary_en: Option<&str>,
     body: Option<&str>,
     off: bool,
     always: Option<bool>,
@@ -495,10 +493,6 @@ fn cap_cmd(
                 summary: summary
                     .map(|s| s.to_string())
                     .or_else(|| old.as_ref().map(|c| c.summary.clone()))
-                    .unwrap_or_default(),
-                summary_en: summary_en
-                    .map(|s| s.to_string())
-                    .or_else(|| old.as_ref().map(|c| c.summary_en.clone()))
                     .unwrap_or_default(),
                 on: !off,
                 builtin: old.as_ref().map(|c| c.builtin).unwrap_or(false),
@@ -765,12 +759,11 @@ fn onboard(store: &Store) -> Result<(), String> {
 fn claim_and_print(
     store: &Store,
     project: Option<&str>,
-    lang: Lang,
     write_entry: bool,
     guide_tasklists: bool,
 ) -> Result<(), String> {
     use std::io::Write;
-    match go(store, project, lang, write_entry, guide_tasklists)? {
+    match go(store, project, write_entry, guide_tasklists)? {
         GoOutcome::NoBinding { cwd } => {
             println!("NO_BINDING {cwd}");
             eprintln!("当前目录没有绑定 Teambition 项目（缺 .tba/project）。停，不领任务。");
@@ -847,9 +840,8 @@ fn finish_bootstrap(
     dir: &std::path::Path,
     name: &str,
     project: Option<&str>,
-    lang: Lang,
 ) -> Result<(), String> {
-    let r = crate::create::create(store, dir, name, project, lang)?;
+    let r = crate::create::create(store, dir, name, project)?;
     println!(
         "\n项目就绪: {}\t{}{}",
         r.project_id,
@@ -881,7 +873,7 @@ fn finish_bootstrap(
     // 用刚建/复用出来的项目 id，别让 go() 去读 cwd 的 .tba/project：
     // `--dir <别的目录>` 时绑定写在 dir，进程 cwd 里根本没有。
     // create() 已经在 dir 写过入口文件，这里 write_entry=false，别再往 cwd 补一份。
-    claim_and_print(store, Some(r.project_id.as_str()), lang, false, false)
+    claim_and_print(store, Some(r.project_id.as_str()), false, false)
 }
 
 /// 无参数 + 没有 .tba/project 时的一次性自举卡。
@@ -909,7 +901,7 @@ fn auto_bootstrap(store: &Store) -> Result<(), String> {
     if std::io::stdin().is_terminal() {
         let picked = pick_name_interactive(&rows)?;
         println!("\n已选项目名: {picked}");
-        return finish_bootstrap(store, &dir, &picked, None, Lang::Zh);
+        return finish_bootstrap(store, &dir, &picked, None);
     }
 
     // agent 场景：不能替用户拍板，给一条收尾命令把剩下的全做完。
@@ -946,7 +938,6 @@ pub fn run() -> Result<(), String> {
             if crate::ops::read_project_binding().is_some() {
                 Cmd::Go {
                     project: None,
-                    lang: "zh".to_string(),
                     no_entry: false,
                     off: false,
                     task: Vec::new(),
@@ -1254,10 +1245,7 @@ pub fn run() -> Result<(), String> {
             project,
             dry,
             go,
-            lang,
         } => {
-            let lang = Lang::parse(&lang)
-                .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
             let target = match dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 Some(d) => std::path::PathBuf::from(d),
                 None => std::env::current_dir().map_err(|e| format!("拿不到当前目录: {e}"))?,
@@ -1294,9 +1282,9 @@ pub fn run() -> Result<(), String> {
                 // 自举一条龙：建项目 + 写 MCP + 当场领任务。
                 // 留在 Create 分支内部调用，天然走 Create 的 GitButler 豁免，
                 // 全新设备缺 but.exe 也不会被「领任务」这一环拦住。
-                return finish_bootstrap(&store, &target, &picked, project.as_deref(), lang);
+                return finish_bootstrap(&store, &target, &picked, project.as_deref());
             }
-            let r = crate::create::create(&store, &target, &picked, project.as_deref(), lang)?;
+            let r = crate::create::create(&store, &target, &picked, project.as_deref())?;
             print!("{}", r.report());
         }
         Cmd::Skills { project } => {
@@ -1369,7 +1357,6 @@ pub fn run() -> Result<(), String> {
             action,
             name,
             summary,
-            summary_en,
             body,
             off,
             always,
@@ -1382,7 +1369,6 @@ pub fn run() -> Result<(), String> {
                     action.as_deref().unwrap_or("list"),
                     name.as_deref(),
                     summary.as_deref(),
-                    summary_en.as_deref(),
                     body.as_deref(),
                     off,
                     if always {
@@ -1486,14 +1472,11 @@ pub fn run() -> Result<(), String> {
         }
         Cmd::Go {
             project,
-            lang,
             no_entry,
             off,
             task,
         } => {
             use std::io::Write;
-            let lang = Lang::parse(&lang)
-                .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
             // 跟了文字又不带 --off：在 Teambition 新建一条任务（标题=文字），
             // 置「进行中」+ 看板列「进行中」。多词直接写，不用引号。
             // 例：tba go 把侧栏改窄一点
@@ -1557,7 +1540,7 @@ pub fn run() -> Result<(), String> {
                 };
                 print!(
                     "{}",
-                    direct_prompt(&store, &pid, &pname, &skills, draft.as_ref(), lang)
+                    direct_prompt(&store, &pid, &pname, &skills, draft.as_ref())
                 );
                 eprintln!(
                     "直连模式（--off）：没领任务、没写 Teambition。有疑问直接在对话里问用户，干完直接说结论。"
@@ -1565,13 +1548,10 @@ pub fn run() -> Result<(), String> {
                 let _ = std::io::stdout().flush();
                 return Ok(());
             }
-            claim_and_print(&store, project.as_deref(), lang, !no_entry, true)?;
+            claim_and_print(&store, project.as_deref(), !no_entry, true)?;
         }
-        Cmd::Subagent { target, project, lang, agent_tag, task } => {
+        Cmd::Subagent { target, project, agent_tag, task } => {
             use std::io::Write;
-            let lang = Lang::parse(&lang)
-                .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
-            let zh = lang == Lang::Zh;
             // 跟了文字：新建一条任务并开工，不再派子代理。
             // 标题即文字，置「进行中」+ 看板列「进行中」。
             if !task.is_empty() {
@@ -1624,7 +1604,7 @@ pub fn run() -> Result<(), String> {
                 // 裸 `tba sub`：常驻监听「未完成」列。空队列继续等，领到才退出唤醒。
                 // 简报由 subagent_watch 打印后返回，不走下面单次派发的打印。
                 let pid = resolve_project(project.as_deref())?;
-                subagent_watch(&store, &pid, lang)?;
+                subagent_watch(&store, &pid)?;
                 return Ok(());
             };
             // 主代理给了子代理序号（如 agent-21）就落标记：写 claim.note、
@@ -1636,14 +1616,10 @@ pub fn run() -> Result<(), String> {
             // 正文由子代理按 task_id 链接自己读（见简报末尾），避免为取正文联网。
             // 领新任务时 go() 已经联网，这里沿用同一条 claim，不二次联网。
             let skills = cached_skills(&store, &claim.project_id);
-            print!("{}", subagent_brief(&store, &claim, &claim.task_name, &skills, lang));
-            if zh {
-                eprintln!(
-                    "已生成子代理简报。主代理读这份简报、调 subagent 工具派活；干完按末尾指引收尾（不要自己 done）。"
-                );
-            } else {
-                eprintln!("Subagent brief printed. Main agent dispatches via the subagent tool; close per the footer.");
-            }
+            print!("{}", subagent_brief(&store, &claim, &claim.task_name, &skills));
+            eprintln!(
+                "已生成子代理简报。主代理读这份简报、调 subagent 工具派活；干完按末尾指引收尾（不要自己 done）。"
+            );
             let _ = std::io::stdout().flush();
         }
         Cmd::Claim { project, name } => {
@@ -1827,6 +1803,62 @@ pub fn run() -> Result<(), String> {
                 );
             }
         }
+        Cmd::Lead { action, text, file } => {
+            if action == "start" {
+                let topic = text.ok_or("lead start 要给 --text \"<当前任务名，≤20字>\"")?;
+                let topic: String = topic.trim().chars().take(20).collect();
+                if topic.is_empty() {
+                    return Err("lead start 的主题不能为空".into());
+                }
+                let title = format!("lead: {}", topic);
+                // start 的幂等键只有 title（不比 agent）。别的会话占着同名 lead 任务时
+                // 加会话后缀，避免跨会话复用同一条 lead task；同会话重跑仍复用。
+                let agent = current_agent();
+                let title = if store.active_claims().into_iter().any(|c| {
+                    c.task_name == title && c.agent != agent
+                }) {
+                    format!("{title} [{agent}]")
+                } else {
+                    title
+                };
+                let r = lead_start(&store, &title)?;
+                for w in &r.warnings {
+                    eprintln!("警告: {w}");
+                }
+                println!(
+                    "已建 lead 任务：{}  claim_id: {}  链接: {}",
+                    r.claim.task_name,
+                    r.claim.claim_id,
+                    crate::ops::task_url(&r.claim.task_id)
+                );
+            } else if matches!(action.as_str(), "report" | "say" | "ask") {
+                let content = if let Some(t) = text {
+                    t
+                } else if let Some(path) = file {
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| format!("读 {path} 失败: {e}"))?
+                } else {
+                    let mut s = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut s)
+                        .map_err(|e| format!("读 stdin 失败: {e}"))?;
+                    s
+                };
+                let c = lead_report(&store, &content)?;
+                let cfg = store.load_config();
+                println!(
+                    "lead 汇报已写入任务「{}」，现在是「{}」，看板列「{}」，邮件已发。",
+                    c.task_name, STAGE_WAIT, cfg.tasklist_wait
+                );
+                println!(
+                    "\n回复监听由 tba serve 的聚合器统一托管；别重跑 ask（会重复发邮件）。"
+                );
+            } else {
+                return Err(format!(
+                    "未知 lead 动作 {action:?}。可选：start | report（别名 say/ask）"
+                ));
+            }
+        }
         Cmd::Reply { claim_id } => {
             let (c, replies) = resume(&store, &claim_id)?;
             println!(
@@ -1953,11 +1985,12 @@ pub fn run() -> Result<(), String> {
             let cfg = store.load_config();
             match action.as_str() {
                 "status" => {
-                    println!("SMTP: {}:{} 用户={} 发件人={} 收件人={}",
+                    println!("SMTP: {}:{} 用户={} 发件人显示名={}（地址一律用账号 {}） 收件人={}",
                         if cfg.smtp_host.is_empty() { "(未配)" } else { &cfg.smtp_host },
                         cfg.smtp_port,
                         if cfg.smtp_user.is_empty() { "(未配)" } else { &cfg.smtp_user },
                         if cfg.smtp_from.is_empty() { "(用账号)" } else { &cfg.smtp_from },
+                        if cfg.smtp_user.is_empty() { "(未配)" } else { &cfg.smtp_user },
                         if cfg.mail_to.is_empty() { "(未配)" } else { &cfg.mail_to });
                     println!("IMAP: {}:{}", if cfg.imap_host.is_empty() { "(未配，收不到回信)" } else { &cfg.imap_host }, cfg.imap_port);
                     println!("到「待回复」自动发信: {}", if cfg.mail_on_ask { "开" } else { "关" });
@@ -1968,7 +2001,7 @@ pub fn run() -> Result<(), String> {
                     );
                 }
                 "test" => {
-                    mail::send(&cfg, "[TB] 测试邮件", "这是一封 tba 测试邮件。收到即表示 SMTP 配置可用。")?;
+                    mail::send(&cfg, "[TB] 测试邮件", "这是一封 tba 测试邮件。收到即表示 SMTP 配置可用。", None)?;
                     println!("已发送测试邮件到 {}", cfg.mail_to);
                 }
                 "check" => {
@@ -2120,15 +2153,12 @@ pub fn run() -> Result<(), String> {
             name,
             task,
             task_file,
-            lang,
             init,
         } => {
-            let lang = Lang::parse(&lang)
-                .ok_or_else(|| format!("不认识的文案语言: {lang}（可用 zh / en）"))?;
             // 项目接入文案：只输出指令，不解析、不新建项目——建不建由 agent 自己判断。
             // 不给 --name 就让 agent 用仓库目录名当项目名。
             if init {
-                print!("{}", crate::ops::init_prompt(&store, name.as_deref(), lang));
+                print!("{}", crate::ops::init_prompt(&store, name.as_deref()));
                 return Ok(());
             }
             let mut ctx = Ctx::new(store.clone(), false)?;
@@ -2196,7 +2226,7 @@ pub fn run() -> Result<(), String> {
             };
             print!(
                 "{}",
-                agent_prompt(&store, &project, &name, draft.as_ref(), lang)?
+                agent_prompt(&store, &project, &name, draft.as_ref())?
             );
         }
         Cmd::Memory {

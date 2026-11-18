@@ -683,7 +683,6 @@ tba wait -off                          :: 直接返回（直连下没有「等 T
 补上之后用户说「开工」就够了；换项目、换设备没有入口文件时，`tba` 一个词照样能跑。
 
 - `--no-entry` 不补入口文件。
-- `--lang en` 用英文规则（省 token）。
 - 项目来源优先级：`--project` > `.tba/project` 绑定 > 按目录名去线上找同名项目。
 - 换设备时没有 `.tba/project`：只要目录名和 Teambition 项目同名，自动认回来并补上绑定。
 - 旧目录 `.tbhub/` 第一次被读到时自动改名成 `.tba/`，内容不动。改名失败（权限 / 占用）就继续用旧的。
@@ -736,7 +735,6 @@ tba cap add deploy-web --summary "要部署：打包并上传" --body DEPLOY.md
 tba cap add deploy-web --summary "..." --body -  :: 正文从 stdin 读（可管道/重定向）
 tba cap edit shot --body new.md                :: 改正文（不给 --body 保留原文）
 tba cap on shot  /  tba cap off shot           :: 开关（关掉不进 agent 文案）
-tba cap add deploy-web --summary "..." --summary-en "to deploy: build and upload"
 tba cap add deploy-web --always --summary "..." :: 常驻：开工文案里标【常驻】，先被看见
 tba cap rm shot                                :: 删除
 tba cap restore                                :: 补齐缺失的内置能力
@@ -771,7 +769,7 @@ tba cap path                                   :: 打印 caps.toml 路径
 （`tba cap restore`）。内置清单升级时会自动补进老用户的 `caps.toml`，但**不会**把你删掉的
 条目重新灌回来。
 
-升级只刷新**索引层**（一句话说明 + 英文说明 + 常驻标记）——那是「目录」，跟着版本走才对；
+升级只刷新**索引层**（一句话说明 + 常驻标记）——那是「目录」，跟着版本走才对；
 **正文和开关是你的，一律不动**。自定义条目（非内置）完全不经手。
 
 **每个项目还能单独关**：项目卡片里的「通用 skill」栏，取消勾选 = 这个项目不用，
@@ -889,7 +887,6 @@ tba create --name "MarinIME"        :: 已拍板，直接用这个名字，跳�
 tba create --name "MarinIME" --go    :: 拍板后一条命令做完：建项目 + 写 MCP + 当场领任务
 tba create --dir "D:\code\repo"     :: 给别的目录接入（窗口里用「选目录…」）
 tba create --dry                    :: 只列候选，不建项目、不写文件
-tba create --lang en                :: 开工文案用英文
 ```
 
 `tba create` 会做完全部六步：列候选（编号 + 名字 + 来源 + Teambition 同名情况）、等用户拍板、
@@ -932,23 +929,23 @@ agent 必须把这份**原样列给用户**，由用户挑一个，再跑 `tba e
 窗口左侧「接入项目」页是同一流程的图形版：选目录 → 扫描 → 点一个候选 → 直接建，
 结果框里就是可复制的开工文案。CLI 和窗口共用 `src/create.rs`，行为不会漂移。
 
-### 省 token 设计（英文速查表 + skill 按需读）
+### 省 token 设计（skill 按需读）
 
 文案是发给 agent 的、人基本不读，所以按 token 成本优化过：
 
-- **闭环指令是英文速查表**。实测同义内容中文约 882 token、英文约 540 token（cl100k）——中文字在 BPE 分词里普遍 1 字 1+ token，英文 1 token 能装好几个字母。阶段名（未完成/进行中/…）保持中文，那是 Teambition 上的真实名字，改了 agent 对不上。
+- **闭环指令只有一份中文**。以前维护中英两套文案，既费 token 又容易两边规则不一致；现在只留中文准本，阶段名（未完成/进行中/…）也是中文——那是 Teambition 上的真实名字，改了 agent 对不上。
 - **skill 不内联全文，只列名字**。以前每次发文案都把全部启用 skill 的全文贴进去，skill 越多越大越贵；现在文案只给名字列表 + 一条读取命令，agent 用到哪个读哪个：
 
 ```
-Enabled skills (3): 部署流程, 代码规范, 发布 checklist
-Read one on demand (do NOT read all): `tba skill <name> --project <id>`
+已启用 skill (3): 部署流程, 代码规范, 发布 checklist
+按需读一个（不要全读）：`tba skill <name> --project <id>`
 ```
 
 ```bat
 tba skill 部署流程 --project <id>   :: 打印该 skill 全文
 ```
 
-不变量一条没丢（只经 tba 改状态/列、别自建任务、每条必须终结于 ask/done/close、长操作前后 beat、待回复永不超时、心跳超时退回队列、退出码 0/2/3 语义），由单测 `workflow_keeps_key_invariants` 守着；`prompt_with_huge_skill_stays_small` 防体积回潮。测量脚本：`tools/token_cmp.py`。
+不变量一条没丢（只经 tba 改状态/列、别自建任务、做完必须 ask、长操作前后 beat、待回复永不超时、心跳超时退回队列、退出码语义），由单测守着。
 
 文案含：任务标题/正文、已启用 skill 名字列表、共享记忆目录、开工命令（`claim` 或 `start`）、收尾规则。
 

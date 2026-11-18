@@ -4,7 +4,7 @@
 //! 以前这条链路只存在于「复制项目初始化文案」那段给 agent 读的文字里；
 //! 现在固化成命令，跑完就直接可用。
 
-use crate::ops::{self, Lang};
+use crate::ops;
 use crate::store::Store;
 use std::path::{Path, PathBuf};
 
@@ -100,7 +100,6 @@ pub fn create(
     dir: &Path,
     name: &str,
     project: Option<&str>,
-    lang: Lang,
 ) -> Result<Created, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -125,7 +124,7 @@ pub fn create(
     let binding = ops::write_project_binding_at(dir, &p.id)?;
     let entry = ops::ensure_entry_in(store, dir);
     // 开工文案是附赠：新项目可能还没有 skill 缓存，生成失败不该把「已建好」变成报错。
-    let prompt = ops::agent_prompt(store, &p.id, &p.name, None, lang)
+    let prompt = ops::agent_prompt(store, &p.id, &p.name, None)
         .unwrap_or_else(|e| format!("（开工文案暂时生成不了：{e}。稍后跑 `tba prompt` 即可。）\n"));
     Ok(Created {
         project_id: p.id,

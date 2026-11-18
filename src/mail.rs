@@ -203,22 +203,18 @@ impl Smtp {
 }
 
 // 发一封信。subject/body 允许中文（自动 base64 编码）。
-pub fn send(cfg: &Config, subject: &str, body: &str) -> Result<(), String> {
+// 发件地址一律用 smtp_user（账号）；from_name 是本次显式显示名（子代理 tag / lead）。
+// from_name 为空时回落到 cfg.smtp_from 解析出的显示名；两者都没有就只有地址。
+pub fn send(cfg: &Config, subject: &str, body: &str, from_name: Option<&str>) -> Result<(), String> {
     let host = cfg.smtp_host.trim();
     if host.is_empty() {
         return Err("没配 SMTP 服务器（设置里填 SMTP 主机/端口/账号/密码/收件人）".to_string());
     }
-    let (from_name, from_addr) = if cfg.smtp_from.trim().is_empty() {
-        (None, cfg.smtp_user.trim().to_string())
-    } else {
-        split_from(&cfg.smtp_from)
-    };
-    // 显示名不能单独当地址用。QQ 邮箱（及多数 SMTP）会把 `MAIL FROM:<works on teambition>`
-    // 当成非法输入直接 502，而且错误只落在 stderr 里，很容易被当成「没发信」。
+    let (from_name, from_addr) = resolve_from(cfg, from_name);
+    // 地址来自 smtp_user，合法性由账号本身保证；这里只挡「账号没配 @」的明显错误。
     if !from_addr.contains('@') {
         return Err(format!(
-            "发件地址不合法：`{from_addr}`。smtp_from 要么留空（自动用账号），\
-             要么写 `显示名 <邮箱>` 或纯邮箱——显示名不能单独当地址"
+            "发件地址不合法：`{from_addr}`。smtp_user 要填完整邮箱地址（如 www.3850@qq.com）"
         ));
     }
     let tos = recipients(&cfg.mail_to);
@@ -259,6 +255,30 @@ pub fn send(cfg: &Config, subject: &str, body: &str) -> Result<(), String> {
     }
     let _ = smtp.cmd("QUIT");
     Ok(())
+}
+
+// 定发件显示名与地址。地址一律用账号 smtp_user；显示名优先级：
+// 显式 override（子代理 tag / lead） > cfg.smtp_from 里解析出的名字 > 无显示名。
+// cfg.smtp_from 里的地址永远丢弃，兼容旧写法靠 split_from。
+pub fn resolve_from(cfg: &Config, override_name: Option<&str>) -> (Option<String>, String) {
+    let from_addr = cfg.smtp_user.trim().to_string();
+    let name = override_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let (parsed_name, _) = split_from(&cfg.smtp_from);
+            parsed_name.or_else(|| {
+                // split_from 解析不出名字时：纯地址（含 @）不当显示名；纯显示名
+                // （无 <>、无 @）整体当显示名，兼容旧的 `works on teambition` 写法。
+                let t = cfg.smtp_from.trim();
+                if t.is_empty() || t.contains('@') || t.contains('<') {
+                    None
+                } else {
+                    Some(t.trim_matches('"').trim().to_string())
+                }
+            })
+        });
+    (name, from_addr)
 }
 
 // 解析发件人写法，两种都支持：
@@ -1431,6 +1451,35 @@ mod tests {
         let (n, a) = split_from("works on teambition");
         assert_eq!(n, None);
         assert!(!a.contains('@'));
+    }
+
+    // 地址一律用账号；显示名优先级：显式 override > cfg.smtp_from 解析 > 无。
+    #[test]
+    fn resolve_from_uses_account_and_name_priority() {
+        let mut cfg = Config::default();
+        cfg.smtp_user = "www.3850@qq.com".into();
+
+        // smtp_from 空：无显示名，地址用账号
+        let (n, a) = resolve_from(&cfg, None);
+        assert_eq!(n, None);
+        assert_eq!(a, "www.3850@qq.com");
+
+        // 旧完整写法：取显示名，地址仍是账号（不是 old@qq.com）
+        cfg.smtp_from = "works on teambition <old@qq.com>".into();
+        let (n, a) = resolve_from(&cfg, None);
+        assert_eq!(n.as_deref(), Some("works on teambition"));
+        assert_eq!(a, "www.3850@qq.com");
+
+        // 显式 override 优先于配置
+        let (n, a) = resolve_from(&cfg, Some("agent-21"));
+        assert_eq!(n.as_deref(), Some("agent-21"));
+        assert_eq!(a, "www.3850@qq.com");
+
+        // 纯显示名（无尖括号、无 @）：整体当显示名
+        cfg.smtp_from = "works on teambition".into();
+        let (n, a) = resolve_from(&cfg, None);
+        assert_eq!(n.as_deref(), Some("works on teambition"));
+        assert_eq!(a, "www.3850@qq.com");
     }
 
     // From 头里的地址必须包在 <> 里，显示名走 RFC2047。

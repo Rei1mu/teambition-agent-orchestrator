@@ -1,6 +1,6 @@
 use crate::ops::{
     agent_prompt_from, archive_skill, draft_for_mode, ensure_memory_state, export_skill_mem,
-    list_skills, open_folder, push_skill, CopyMode, Lang, SkillItem,
+    list_skills, open_folder, push_skill, CopyMode, SkillItem,
 };
 use crate::caps::{self, Cap};
 use crate::oauth::TOKEN_PAGE;
@@ -288,7 +288,6 @@ struct SkillEdit {
 struct CapEdit {
     name: String,
     summary: String,
-    summary_en: String,
     body: String,
     on: bool,
     builtin: bool,
@@ -302,7 +301,6 @@ impl CapEdit {
         CapEdit {
             name: String::new(),
             summary: String::new(),
-            summary_en: String::new(),
             body: String::new(),
             on: true,
             builtin: false,
@@ -316,7 +314,6 @@ impl CapEdit {
         CapEdit {
             name: c.name.clone(),
             summary: c.summary.clone(),
-            summary_en: c.summary_en.clone(),
             body: c.body.clone(),
             on: c.on,
             builtin: c.builtin,
@@ -740,7 +737,7 @@ impl App {
         self.create_busy = true;
         self.status = format!("正在接入「{name}」...");
         thread::spawn(move || {
-            let r = crate::create::create(&store, &dir, &name, None, Lang::Zh)
+            let r = crate::create::create(&store, &dir, &name, None)
                 .map(|c| c.report());
             let _ = tx.send(Ev::Created(r));
         });
@@ -1641,7 +1638,7 @@ impl eframe::App for App {
                         )
                         .clicked()
                     {
-                        let text = crate::ops::init_prompt(&self.store, None, Lang::Zh);
+                        let text = crate::ops::init_prompt(&self.store, None);
                         ui.ctx().copy_text(text);
                         self.status = "已复制项目初始化文案：发给 agent，它会先扫仓库列出候选项目名，\
                                        等你拍板后 `tba ensure-project --name <你选的名字>`。"
@@ -1731,11 +1728,10 @@ impl eframe::App for App {
                     .cloned()
                     .collect();
                 let mut to_load: Option<String> = None;
-                // Option 四元组: 项目id, 项目名, 复制模式, 文案语言。
+                // Option 三元组: 项目id, 项目名, 复制模式。
                 // CopyMode::Queue => 复制「领列1任务」文案（忽略本次任务草稿）；
                 // CopyMode::ThisTask => 复制「本次任务」文案（有草稿就带草稿）。
-                // Lang::Zh 是准本（内容完整），Lang::En 是压缩英文版（省 token）。
-                let mut to_copy: Option<(String, String, CopyMode, Lang)> = None;
+                let mut to_copy: Option<(String, String, CopyMode)> = None;
                 for (pid, pname) in projects {
                     let pid = pid.clone();
                     let pname = pname.clone();
@@ -1895,41 +1891,22 @@ impl eframe::App for App {
                                 );
                             }
                             ui.add_space(4.0);
-                            // 两行四按钮：模式（本次任务 / 领列1）× 语言（中文准本 / 英文省 token）。
-                            // 中文是准本，英文由中文压缩而来；两份规则一致，只是长度不同。
+                            // 两行两按钮：模式（本次任务 / 领列1）。文案只有中文准本。
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button("复制文案(本次任务·中文)").clicked() {
+                                if ui.button("复制文案(本次任务)").clicked() {
                                     to_copy = Some((
                                         pid.clone(),
                                         pname.clone(),
                                         CopyMode::ThisTask,
-                                        Lang::Zh,
-                                    ));
-                                }
-                                if ui.button("复制文案(本次任务·英文)").clicked() {
-                                    to_copy = Some((
-                                        pid.clone(),
-                                        pname.clone(),
-                                        CopyMode::ThisTask,
-                                        Lang::Zh,
                                     ));
                                 }
                             });
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button("复制文案(领列1·中文)").clicked() {
+                                if ui.button("复制文案(领列1)").clicked() {
                                     to_copy = Some((
                                         pid.clone(),
                                         pname.clone(),
                                         CopyMode::Queue,
-                                        Lang::Zh,
-                                    ));
-                                }
-                                if ui.button("复制文案(领列1·英文)").clicked() {
-                                    to_copy = Some((
-                                        pid.clone(),
-                                        pname.clone(),
-                                        CopyMode::Queue,
-                                        Lang::Zh,
                                     ));
                                 }
                             });
@@ -1960,12 +1937,11 @@ impl eframe::App for App {
                 if let Some(pid) = to_load {
                     self.load_skills(&pid);
                 }
-                if let Some((pid, pname, mode, lang)) = to_copy {
-                    let (text, has_task) = self.copy_prompt(&pid, &pname, mode, lang);
+                if let Some((pid, pname, mode)) = to_copy {
+                    let (text, has_task) = self.copy_prompt(&pid, &pname, mode);
                     ui.ctx().copy_text(text);
                     self.status = format!(
-                        "已复制 Agent 文案（{}，{}）。",
-                        lang.label(),
+                        "已复制 Agent 文案（{}）。",
                         if has_task {
                             "含本次任务，agent 会新建任务开工"
                         } else {
@@ -2128,13 +2104,6 @@ impl App {
                         .hint_text("例如 要部署：一条命令打包并上传"),
                 );
                 ui.add_space(6.0);
-                ui.label("英文说明（可选：英文开工文案用，空着就用上面那句）:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut ed.summary_en)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("e.g. to deploy: one command to build and upload"),
-                );
-                ui.add_space(6.0);
                 ui.checkbox(&mut ed.always, "常驻：开工文案里标出来，先被看见")
                     .on_hover_text(
                         "只给「动手前就得知道、等踩了坑再读已经晚了」的红线用（比如禁止弹命令行）。\
@@ -2206,7 +2175,6 @@ impl App {
         let cap = Cap {
             name,
             summary: ed.summary.trim().to_string(),
-            summary_en: ed.summary_en.trim().to_string(),
             on: ed.on,
             builtin: ed.builtin,
             always: ed.always,
@@ -2354,11 +2322,10 @@ impl App {
         }
     }
 
-    // 四个「复制 agent 文案」按钮共用的动作。
+    // 「复制 agent 文案」按钮共用的动作。
     //
     // 抽成方法是为了能直接测：按钮本身只负责把返回值塞进剪贴板，
-    // 「本次任务 vs 领列1任务」的行为差异全在这里，一处说了算；
-    // 语言差异（中文准本 / 英文压缩版）由 agent_prompt_from 按 lang 选，UI 不重复。
+    // 「本次任务 vs 领列1任务」的行为差异全在这里，一处说了算。
     //
     // 返回 (文案, 是否带上了「本次任务」)，第二个值用来决定底部状态提示。
     fn copy_prompt(
@@ -2366,7 +2333,6 @@ impl App {
         pid: &str,
         pname: &str,
         mode: CopyMode,
-        lang: Lang,
     ) -> (String, bool) {
         let rows = self.skills.get(pid).cloned().unwrap_or_default();
         // 草稿的组装交给 draft_for_mode：Queue 模式强制丢弃界面里的草稿，
@@ -2374,7 +2340,7 @@ impl App {
         let raw = self.task_drafts.get(pid).cloned().unwrap_or_default();
         let draft = draft_for_mode(&self.store, &raw, mode);
         let has_task = draft.is_some();
-        let text = agent_prompt_from(&self.store, pid, pname, &rows, draft.as_ref(), lang);
+        let text = agent_prompt_from(&self.store, pid, pname, &rows, draft.as_ref());
         (text, has_task)
     }
 
@@ -2816,11 +2782,11 @@ impl App {
                 );
                 ui.end_row();
 
-                ui.label("发件人");
+                ui.label("发件人显示名");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.mail.smtp_from)
                         .desired_width(380.0)
-                        .hint_text("留空 = 用账号"),
+                        .hint_text("只填显示名，地址自动用账号（如 works on teambition）"),
                 );
                 ui.end_row();
 
@@ -2875,6 +2841,7 @@ impl App {
                         &cfg,
                         "[TB] 测试邮件",
                         "这是一封 tba 测试邮件，收到即表示 SMTP 配置可用。",
+                        None,
                     );
                     let _ = tx.send(Ev::MailSent(r));
                 });
@@ -3195,21 +3162,21 @@ mod tests {
         assert_eq!(back.mail_poll_secs, 30);
     }
 
-    // 「复制文案(本次任务·中文)」：界面里有草稿 -> 文案带草稿 + 走 start。
+    // 「复制文案(本次任务)」：界面里有草稿 -> 文案带草稿 + 走 start。
     #[test]
     fn copy_prompt_this_task_includes_draft() {
         let mut app = tmp_app("this");
         let pid = "p-1";
         app.task_drafts
             .insert(pid.to_string(), "# 界面里的任务标题\n正文第二行".to_string());
-        let (text, has_task) = app.copy_prompt(pid, "项目一", CopyMode::ThisTask, Lang::Zh);
+        let (text, has_task) = app.copy_prompt(pid, "项目一", CopyMode::ThisTask);
         assert!(has_task, "填了草稿就该带上本次任务");
         assert!(text.contains("本次任务"), "文案应有本次任务段");
         assert!(text.contains("start"), "应让 agent 跑 start");
         assert!(text.contains("界面里的任务标题"), "标题应进文案");
     }
 
-    // 「复制文案(领列1·中文)」：即使界面里还留着草稿，也必须丢掉。
+    // 「复制文案(领列1)」：即使界面里还留着草稿，也必须丢掉。
     // 否则 agent 会新建任务，而不是去队列领，行为跑偏。
     #[test]
     fn copy_prompt_queue_ignores_leftover_draft() {
@@ -3217,7 +3184,7 @@ mod tests {
         let pid = "p-2";
         app.task_drafts
             .insert(pid.to_string(), "# 残留草稿\n不该出现".to_string());
-        let (text, has_task) = app.copy_prompt(pid, "项目二", CopyMode::Queue, Lang::Zh);
+        let (text, has_task) = app.copy_prompt(pid, "项目二", CopyMode::Queue);
         assert!(!has_task, "领列1任务 不该带草稿");
         assert!(text.contains("claim"), "应让 agent 跑 claim");
         assert!(!text.contains("残留草稿"), "残留草稿不该进文案");
@@ -3231,36 +3198,34 @@ mod tests {
         let pid = "p-3";
         app.task_drafts
             .insert(pid.to_string(), "# 差异任务\n正文".to_string());
-        let (a, _) = app.copy_prompt(pid, "项目三", CopyMode::ThisTask, Lang::Zh);
-        let (b, _) = app.copy_prompt(pid, "项目三", CopyMode::Queue, Lang::Zh);
+        let (a, _) = app.copy_prompt(pid, "项目三", CopyMode::ThisTask);
+        let (b, _) = app.copy_prompt(pid, "项目三", CopyMode::Queue);
         assert_ne!(a, b, "两个按钮不该产出同一份文案");
     }
 
-    // 中英两版：规则都在（命令 / 阶段名 / 禁自建任务），但英文必须更短（省 token）。
+    // 文案必须守住规则（命令 / 阶段名 / 禁自建任务）。
     #[test]
-    fn language_variants_differ_but_keep_rules() {
+    fn copy_prompt_keeps_key_rules() {
         let mut app = tmp_app("lang");
         let pid = "p-5";
-        let (zh, _) = app.copy_prompt(pid, "项目五", CopyMode::Queue, Lang::Zh);
-        let (en, _) = app.copy_prompt(pid, "项目五", CopyMode::Queue, Lang::Zh);
-        // EN 文案已废弃（ops.rs）：Lang::En 复用中文准本，两版相同，不再断言差异。
-        for t in [&zh, &en] {
-            for cmd in ["claim --project", "take <", "beat <claim_id>", "ask <claim_id>"] {
-                assert!(t.contains(cmd), "两版都必须有命令: {cmd}");
-            }
-            // 阶段名两版都保持中文（Teambition 上的真实名字）
-            assert!(t.contains("未完成"), "两版都要写清领的是「未完成」");
-            assert!(t.contains("待回复"), "两版都要有「待回复」");
-            assert!(t.contains("已解决") && t.contains("已完成"), "两版都要有收尾状态名");
+        let (zh, _) = app.copy_prompt(pid, "项目五", CopyMode::Queue);
+        for cmd in ["claim --project", "take <", "beat <claim_id>", "ask <claim_id>"] {
+            assert!(zh.contains(cmd), "文案必须有命令: {cmd}");
         }
-        // 长度差异由 ops 的 est_tokens 断言守着（中文一字符信息量大，比字符数没意义）。
+        // 阶段名保持中文（Teambition 上的真实名字）
+        assert!(zh.contains("未完成"), "要写清领的是「未完成」");
+        assert!(zh.contains("待回复"), "要有「待回复」");
+        assert!(
+            zh.contains("已解决") && zh.contains("已完成"),
+            "要有收尾状态名"
+        );
     }
 
     // 空草稿时，「本次任务」按钮退化成「去队列领」，不报错。
     #[test]
     fn copy_prompt_empty_draft_falls_back_to_queue() {
         let mut app = tmp_app("empty");
-        let (text, has_task) = app.copy_prompt("p-4", "项目四", CopyMode::ThisTask, Lang::Zh);
+        let (text, has_task) = app.copy_prompt("p-4", "项目四", CopyMode::ThisTask);
         assert!(!has_task);
         assert!(text.contains("claim"));
     }
@@ -3350,7 +3315,7 @@ mod tests {
     fn disabled_cap_is_not_in_prompt() {
         let app = tmp_app("capprompt");
         caps::set_on(&app.store, "shot", false).unwrap();
-        let text = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None, Lang::Zh);
+        let text = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None);
         // 能力现在是「标题 + 一行一条」，所以按段落取，不按单行取。
         let seg = text
             .split("
@@ -3372,7 +3337,7 @@ mod tests {
     fn project_cap_off_hides_it_from_prompt() {
         let app = tmp_app("capprompt2");
         app.store.set_cap_off("p1", "shot", true).unwrap();
-        let text = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None, Lang::Zh);
+        let text = crate::ops::agent_prompt_from(&app.store, "p1", "proj", &[], None);
         let seg = text
             .split("
 
@@ -3383,7 +3348,7 @@ mod tests {
         assert!(seg.contains("git-main"), "其他能力照旧: {seg}");
 
         // 另一个项目不受影响（项目级，不是全局）
-        let other = crate::ops::agent_prompt_from(&app.store, "p2", "proj2", &[], None, Lang::Zh);
+        let other = crate::ops::agent_prompt_from(&app.store, "p2", "proj2", &[], None);
         let seg2 = other
             .split("
 

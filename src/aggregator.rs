@@ -470,6 +470,15 @@ fn dispatch_reply(store: &Store, claim_id: &str, text: &str, _source: &str) {
         }
     }
     if action == ReplyAction::Closed {
+        // lead task 回 1：先把同会话的待回复/僵尸 peer 一起收尾，再 finish lead 自己。
+        // 普通任务回 1 时 lead_finalize_peers 直接返回空，行为不变。
+        match crate::ops::lead_finalize_peers(store, claim_id) {
+            Ok(peers) if !peers.is_empty() => {
+                eprintln!("… {claim_id} lead 联动收尾: {}", peers.join("；"));
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("… {claim_id} lead 联动收尾失败: {e}"),
+        }
         if let Err(e) = finish(store, claim_id, STAGE_DONE) {
             eprintln!("… 聚合收尾 {claim_id} 失败: {e}");
         }

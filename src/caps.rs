@@ -24,9 +24,6 @@ pub struct Cap {
     pub name: String,
     #[serde(default)]
     pub summary: String,
-    /// 英文说明：英文开工文案用。空着就回落到 summary（用户自建的能力多半只写中文）。
-    #[serde(default)]
-    pub summary_en: String,
     #[serde(default = "default_on")]
     pub on: bool,
     /// 内置条目：正文可改、可删，但删了能用 `tba cap restore` 找回来。
@@ -259,47 +256,41 @@ pub const BODY_NO_CONSOLE: &str = "\
 // 索引说明写「**什么时候用**」而不是「是什么」：开工文案只列这一行，
 // agent 靠它判断要不要去读正文。写「截图：一条命令出 png」它看不出该在
 // 什么场合用；写「看界面/验收 UI」才是一个触发条件。
-pub const BUILTIN: &[(&str, &str, &str, bool, &str)] = &[
+pub const BUILTIN: &[(&str, &str, bool, &str)] = &[
     // 不放重载：编译 & 重载能力已移除。
     (
         "no-console",
         "绝不弹黑框：所有命令都隐藏窗口调用",
-        "never pop a console: hide every child window",
         true,
         BODY_NO_CONSOLE,
     ),
     (
         "shot",
         "看界面/验收 UI：一条命令出 png，后台窗口也能截",
-        "to see the UI: one command -> png, background windows OK",
         false,
         BODY_SHOT,
     ),
     (
         "git-main",
         "要提交推送：GitButler 项目自动走 but",
-        "commit & push: `but` automatically for GitButler projects",
         false,
         BODY_GIT,
     ),
     (
         "git-create",
         "要新建/连接 GitHub 仓库：一条命令建好并推送，别装 gh",
-        "create/attach a GitHub repo: one command, no `gh` needed",
         false,
         BODY_GIT_CREATE,
     ),
     (
         "release",
         "要发版：生成 workflow / 打 tag / 等 CI",
-        "cut a release: workflow / tag / wait CI",
         false,
         BODY_RELEASE,
     ),
     (
         "gui-notes",
         "改 GUI 前先读：字体、黑体、别出豆腐块",
-        "before touching GUI: fonts, bold, no tofu boxes",
         false,
         BODY_GUI,
     ),
@@ -312,10 +303,9 @@ pub fn path(store: &Store) -> PathBuf {
 fn builtin_caps() -> Vec<Cap> {
     BUILTIN
         .iter()
-        .map(|(name, summary, summary_en, always, body)| Cap {
+        .map(|(name, summary, always, body)| Cap {
             name: (*name).to_string(),
             summary: (*summary).to_string(),
-            summary_en: (*summary_en).to_string(),
             on: true,
             builtin: true,
             always: *always,
@@ -347,19 +337,17 @@ pub fn load(store: &Store) -> CapsFile {
             // 跟着版本走才对。用户真正会改的是正文和开关，这两样一律不动。
             // 自定义条目（builtin=false）完全不经手。
             if f.seeded < SEED {
-                for (name, summary, summary_en, always, body) in BUILTIN {
+                for (name, summary, always, body) in BUILTIN {
                     match f.caps.iter_mut().find(|c| c.name == *name) {
                         Some(c) => {
                             if c.builtin {
                                 c.summary = (*summary).to_string();
-                                c.summary_en = (*summary_en).to_string();
                                 c.always = *always;
                             }
                         }
                         None => f.caps.push(Cap {
                             name: (*name).to_string(),
                             summary: (*summary).to_string(),
-                            summary_en: (*summary_en).to_string(),
                             on: true,
                             builtin: true,
                             always: *always,
@@ -506,7 +494,7 @@ pub fn remove(store: &Store, name: &str) -> Result<String, String> {
 pub fn restore(store: &Store, name: Option<&str>) -> Result<String, String> {
     let mut f = load(store);
     let mut done = Vec::new();
-    for (n, summary, summary_en, always, body) in BUILTIN {
+    for (n, summary, always, body) in BUILTIN {
         if let Some(want) = name {
             if want != *n {
                 continue;
@@ -517,7 +505,6 @@ pub fn restore(store: &Store, name: Option<&str>) -> Result<String, String> {
                 // 已存在：正文、说明、常驻标记一起拉回默认；开关留着用户改过的样子。
                 c.body = (*body).to_string();
                 c.summary = (*summary).to_string();
-                c.summary_en = (*summary_en).to_string();
                 c.always = *always;
                 c.builtin = true;
                 done.push(format!("已重置 {n}"));
@@ -526,7 +513,6 @@ pub fn restore(store: &Store, name: Option<&str>) -> Result<String, String> {
                 f.caps.push(Cap {
                     name: (*n).to_string(),
                     summary: (*summary).to_string(),
-                    summary_en: (*summary_en).to_string(),
                     on: true,
                     builtin: true,
                     always: *always,
@@ -655,7 +641,6 @@ mod tests {
             Cap {
                 name: "my-cap".into(),
                 summary: "自用".into(),
-                summary_en: String::new(),
                 on: true,
                 builtin: false,
                 always: false,
@@ -732,7 +717,6 @@ mod tests {
             Cap {
                 name: "shot".into(),
                 summary: "改过的说明".into(),
-                summary_en: String::new(),
                 on: true,
                 builtin: false,
                 always: false,

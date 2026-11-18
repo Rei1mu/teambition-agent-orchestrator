@@ -2419,6 +2419,78 @@ pub fn append_note(store: &Store, claim_id: &str, text: &str) -> Result<String, 
     Ok("已追加到任务备注".to_string())
 }
 
+// lead 单任务：开工建一条带 `lead:` 前缀的任务，绑本次会话。
+// project 从本地 .tba/project 绑定读；没绑定就报错（先 tba create）。
+pub fn lead_start(store: &Store, title: &str) -> Result<TakeResult, String> {
+    if !title.starts_with("lead:") {
+        return Err("lead 任务标题必须以 lead: 开头".into());
+    }
+    let pid = read_project_binding().ok_or("没绑定项目，先 tba create")?;
+    // start 内部已 sweep 回收死会话；幂等键是 title，同标题不同会话的冲突
+    // 由调用方（cmds）在标题里加会话后缀处理。
+    start(store, &pid, title, "", &current_agent())
+}
+
+// lead 汇报：内容写进 lead task 备注（append_note 会同步存 last_note），
+// 再用标准收尾问题调 ask——邮件和「待回复」镜像字段都带汇报正文，且不会
+// 触发自定义问题里 1/2 保留号的校验。
+pub fn lead_report(store: &Store, content: &str) -> Result<Claim, String> {
+    let content = content.trim();
+    if content.is_empty() {
+        return Err("lead 汇报内容不能为空".into());
+    }
+    let agent = current_agent();
+    let lead = store
+        .active_claims()
+        .into_iter()
+        .find(|c| c.agent == agent && c.task_name.starts_with("lead:"))
+        .ok_or("找不到本次会话的 lead 任务，先跑 tba lead start \"<任务名>\"")?;
+    let body = format!(
+        "**📋 lead 汇报（回 1 收尾本任务，并连带收尾同会话的待回复/僵尸任务）**\n\n{content}"
+    );
+    append_note(store, &lead.claim_id, &body)?;
+    ask(store, &lead.claim_id, DONE_QUESTION)
+}
+
+// 回 1 收尾 lead task 时联动：把同会话（claim.agent 相同）的其他活动 claim 一起收尾。
+//   waiting            -> finish 到 STAGE_DONE（等用户回 1 的子代理任务）
+//   running / claimed  -> 心跳老化（僵尸）-> finish 到 STAGE_CLOSED
+// 僵尸只看 claim 自己的 heartbeat：子代理 claim.agent 是主会话名，没有独立
+// session 心跳文件，用 session_age 豁免会把 lead 活着时的僵尸全都漏掉。
+// 动作是 finish 而不是 sweep 的 revert。lead claim 自己不入列，由 aggregator 正常 finish。单个 finish 失败只记错误继续。
+pub fn lead_finalize_peers(store: &Store, lead_claim_id: &str) -> Result<Vec<String>, String> {
+    let lead = match store.get_claim(lead_claim_id) {
+        Some(c) if c.task_name.starts_with("lead:") => c,
+        _ => return Ok(Vec::new()), // 普通任务回 1 不联动
+    };
+    let cfg = store.load_config();
+    let timeout = cfg.heartbeat_timeout_secs as i64;
+    let mut out = Vec::new();
+    for c in store.active_claims() {
+        if c.claim_id == lead_claim_id || c.agent != lead.agent {
+            continue;
+        }
+        let (stage, label) = if c.state == "waiting" {
+            (STAGE_DONE, "已解决")
+        } else if c.is_running() {
+            // 子代理的 claim.agent 就是主会话名，没有自己的 session 心跳文件；
+            // session_age 只代表 lead 会话，lead 活着时永远新鲜。所以僵尸只看
+            // claim 自己的心跳：由子代理调 tba beat 刷新，子代理会话一断就老化。
+            if crate::store::age_secs(c.heartbeat()) <= timeout {
+                continue;
+            }
+            (STAGE_CLOSED, "已完成")
+        } else {
+            continue;
+        };
+        match finish(store, &c.claim_id, stage) {
+            Ok(_) => out.push(format!("{label}: {}", c.task_name)),
+            Err(e) => out.push(format!("收尾 {}（{}）失败: {e}", c.claim_id, c.task_name)),
+        }
+    }
+    Ok(out)
+}
+
 // 到「待回复」时给客户发邮件。
 //
 // 主题里带 `[TB <claim_id>]` 是收信侧的匹配标记：客户直接回复（保留主题）时，
@@ -2458,13 +2530,25 @@ pub fn resend_mail(store: &Store, claim_id: &str) -> Result<String, String> {
 // ops::strip_reply_noise 在这里截断，引用里的数字不会被误认成用户的选择。
 fn mail_body(claim: &Claim, question: &str, work: &str) -> String {
     let work = work.trim();
+    // 首行必须是 --- 标题行：strip_reply_noise 靠它截断回信里的引用。
+    // 用户看邮件主题时能分清是哪个子代理在等他，正文再标一次来源。
+    let source = mail_source_tag(claim);
+    let source_line = if source.is_empty() {
+        if claim.task_name.starts_with("lead:") {
+            "---------- 来源 ----------\n\nlead 单任务\n\n".to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        format!("---------- 来源 ----------\n\n{source}\n\n")
+    };
     let block = if work.is_empty() {
         String::new()
     } else {
         format!("---------- 本次处理内容 ----------\n\n{work}\n\n")
     };
     format!(
-        "{block}---------- 需要你回复 ----------\n\n{q}\n\n\
+        "{source_line}{block}---------- 需要你回复 ----------\n\n{q}\n\n\
          请只回一个数字 1/2/3+。不要保留引用原文，不要写其它内容。\n\n\
          链接：https://www.teambition.com/task/{task}\n\n\
          直接回复本邮件即可（请保留标题里的 [TB {cid}]，否则认不出是哪条任务）。",
@@ -2473,6 +2557,50 @@ fn mail_body(claim: &Claim, question: &str, work: &str) -> String {
         task = claim.task_id,
         cid = claim.claim_id,
     )
+}
+
+// 子代理 tag 只写在 claim.note（apply_agent_tag），本地 task_name 不带 agent-N。
+// 邮件主题/正文靠这里把 tag 拼回去，用户回信时才知道是哪个子代理在等。
+// 只认形如 agent-N 的 tag，别的备注内容不当来源。
+fn mail_source_tag(claim: &Claim) -> &str {
+    let t = claim.note.trim();
+    if t.starts_with("agent-") && t.len() > "agent-".len() {
+        t
+    } else {
+        ""
+    }
+}
+
+// 发件显示名：子代理 tag > lead: > 无（回落 cfg.smtp_from）。
+// lead 单任务不会被打 agent tag，两者互斥；这里仍按 tag 优先写，稳。
+fn mail_from_name(claim: &Claim) -> Option<&str> {
+    let tag = mail_source_tag(claim);
+    if !tag.is_empty() {
+        return Some(tag);
+    }
+    if claim.task_name.starts_with("lead:") {
+        return Some("lead:");
+    }
+    None
+}
+
+// 主题里的 [TB <claim_id>] 是收信侧路由 marker，绝不能动；只在短名前面加 tag。
+fn mail_subject(claim: &Claim) -> String {
+    let short: String = claim
+        .task_name
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(40)
+        .collect();
+    let tag = mail_source_tag(claim);
+    let prefix = if tag.is_empty() {
+        String::new()
+    } else {
+        format!("{tag}: ")
+    };
+    format!("[TB {}] 需要你回复：{prefix}{short}", claim.claim_id)
 }
 
 fn notify_by_mail(
@@ -2488,18 +2616,10 @@ fn notify_by_mail(
     if !crate::mail::can_send(cfg) {
         return Err("邮件没配全：缺 SMTP 主机或收件人".to_string());
     }
-    // 主题只带短名。task_name 常常就是整条任务正文，塞进主题会变成一大段「总的」描述。
-    let short: String = claim
-        .task_name
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(40)
-        .collect();
-    let subject = format!("[TB {}] 需要你回复：{}", claim.claim_id, short);
+    let subject = mail_subject(claim);
     let body = mail_body(claim, question, work);
-    match crate::mail::send(cfg, &subject, &body) {
+    let from_name = mail_from_name(claim);
+    match crate::mail::send(cfg, &subject, &body, from_name) {
         Ok(()) => {
             eprintln!("已发邮件通知: {}", cfg.mail_to);
             Ok(())
@@ -2991,11 +3111,9 @@ pub fn subagent_brief(
     claim: &Claim,
     body: &str,
     skills: &[SkillItem],
-    lang: Lang,
 ) -> String {
     let cfg = store.load_config();
     let exe = prompt_exe_of(&cfg);
-    let zh = lang == Lang::Zh;
     let proj_name = store
         .load_projects_cache()
         .into_iter()
@@ -3003,15 +3121,9 @@ pub fn subagent_brief(
         .map(|(_, n)| n)
         .unwrap_or_else(|| claim.project_id.clone());
     let mut s = String::new();
-    if zh {
-        s.push_str(r#"===== 给子代理的任务简报（自包含，直接贴给 subagent）=====
+    s.push_str(r#"===== 给子代理的任务简报（自包含，直接贴给 subagent）=====
 
 "#);
-    } else {
-        s.push_str(r#"===== Subagent brief (self-contained, paste to subagent) =====
-
-"#);
-    }
     s.push_str(&format!("## 子任务：{}
 
 ", claim.task_name));
@@ -3024,62 +3136,45 @@ pub fn subagent_brief(
         claim.claim_id, claim.project_id, claim.task_id
     ));
     if !body.trim().is_empty() {
-        s.push_str(if zh { "## 任务正文
-" } else { "## Task body
-" });
+        s.push_str("## 任务正文
+");
         s.push_str(body.trim());
         s.push_str("
 
 ");
     }
     // 项目上下文（能力 + skill 索引）复用开工文案的同款内容，本地就能生成。
-    s.push_str(&prompt_head(store, &claim.project_id, &proj_name, skills, None, lang, false));
-    s.push_str(&subagent_workflow_text(&exe, &claim.claim_id, lang));
+    s.push_str(&prompt_head(store, &claim.project_id, &proj_name, skills, None, false));
+    s.push_str(&subagent_workflow_text(&exe, &claim.claim_id));
     // 主代理收尾指引：子代理自己 note+ask；主代理提问也走 tba ask，不直接在聊天里问。
-    s.push_str(&main_agent_tail_text(&exe, &claim.claim_id, lang));
+    s.push_str(&main_agent_tail_text(&exe, &claim.claim_id));
     // 常驻监听唤醒主代理后就退出了；派完子代理得再挂一条，否则队列没人盯。
     // v0.2.50：派活打 tag 的强制规范写进简报末尾，主代理一眼能看到。
     // v0.2.51：序号规则见 main_agent_tail_text——list_agents 当前最大序号 +1，不从 agent-1 重来。
-    s.push_str(if zh {
-        "\\n===== 主代理：收到本简报先跑 `list_agents` 看当前最大 agent-N（含 inactive），取最大序号 +1（不要从 agent-1 重新开始），再 `tba sub <claim_id> --agent-tag agent-N` 打 tag，然后用 subagent 工具派活；派完再挂一条 `tba sub` 后台监听继续等新任务（裸命令即可，不用开关）。收到用户回复先 reply+events 读回，再自己判断「继续当前子代理」还是「新任务派新子代理」并据此分派=====\\n"
-    } else {
-        "\\n===== Main agent: on receiving this brief, first run `list_agents` for current max agent-N (including inactive), take max number + 1 (do not restart from agent-1), then run `tba sub <claim_id> --agent-tag agent-N`, then dispatch via the subagent tool; after dispatch re-hang one `tba sub` (bare command, no flags). On a user reply run reply+events first, then decide yourself whether to continue the current subagent or dispatch a new one, and act accordingly =====\\n"
-    });
+    s.push_str(
+        "\\n===== 主代理：收到本简报先跑 `list_agents` 看当前最大 agent-N（含 inactive），取最大序号 +1（不要从 agent-1 重新开始），再 `tba sub <claim_id> --agent-tag agent-N` 打 tag，然后用 subagent 工具派活；派完再挂一条 `tba sub` 后台监听继续等新任务（裸命令即可，不用开关）。收到用户回复先 reply+events 读回，再自己判断「继续当前子代理」还是「新任务派新子代理」并据此分派=====\n",
+    );
     s
 }
 
 /// 主代理侧指引。单独抽出来是为了能单测「主代理提问也走 tba ask、不弹选择框」。
-fn main_agent_tail_text(exe: &str, claim_id: &str, lang: Lang) -> String {
-    if lang == Lang::Zh {
-        format!(
-            r#"
+fn main_agent_tail_text(exe: &str, claim_id: &str) -> String {
+    format!(
+        r#"
 ===== 主代理收尾指引（你来做，别让子代理做）=====
 **派活先打 tag，再调 subagent 工具**：收到简报后先跑 DSH 的 `list_agents` 看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。然后跑 `{exe} sub {id} --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题和 claim.note；再用 subagent 工具把这份简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `{exe} sub` 继续监听。
 子代理已用 CLI `{exe} ask`/`{exe} reply`/`{exe} events` 走完待回复交互并把结论写进任务备注。你只做最终确认：读回备注与回复，核对产物。done/close 仍只由用户回 1 触发聚合器 finish，主代理不自己 done/close。
 **用户回复后的分派**：发出 `tba sub` 进监听后，用户可能在本会话或其他渠道回复。收到回复先 `{exe} reply <claim_id>` + `{exe} events --claim <claim_id>` 读回原话，再**自己判断**这条回复是「继续当前子代理任务」还是「新任务要派新子代理」：前者用 `send_message` 把回复转给现有子代理接着干；后者按上面的打 tag 规范新起 agent-N 派新子代理。别把两种情况都当新任务，也别把新任务硬塞回旧子代理。
 **你要用户拍板时也走 `tba ask` 转「待回复」：手上没有现成 claim 就直接 `{exe} ask -q "问题（纯文本选项，从 3 起编号；1/2 系统保留）"`，tba 会自动新建一条 task 并转「待回复」；有 claim 就带上 `{exe} ask {id} -q "..."`。不要直接在聊天框给选项、不要弹 DSH 的 ask_user_question 选择框、不要用 MCP `{exe} ask_user`。** 收到回复先 `{exe} reply <claim_id>`，再 `{exe} events --claim <claim_id>` 读回原话。
 "#,
-            exe = exe, id = claim_id
-        )
-    } else {
-        format!(
-            r#"
-===== Main agent closing notes (you do this, not the subagent) =====
-**Tag before dispatch**: on receiving the brief, first run DSH's `list_agents` to see existing agent-N entries (including inactive history), take the max number + 1 as this run's tag; e.g. if the list has agent-1..24, use agent-25. Do not restart from agent-1. Then run `{exe} sub {id} --agent-tag agent-N` so the `agent-N:` prefix lands in the Teambition title and claim.note; only then use the subagent tool with this brief as the prompt. Never dispatch via subagent without tagging first. After dispatch re-hang one `{exe} sub` to keep listening.
-The subagent drives the waiting-reply loop via CLI `{exe} ask`/`{exe} reply`/`{exe} events` and writes results into the task note. You only confirm: read the note and replies, check artifacts. done/close still happens only when the user replies 1 (aggregator finish); main agent never runs done/close itself.
-**Dispatch after a user reply**: once you send `tba sub` and start listening, the user may reply in this session or another channel. On a reply run `{exe} reply <claim_id>` + `{exe} events --claim <claim_id>` first, then **decide yourself** whether it means "continue the current subagent task" or "a new task needing a new subagent": for the former use `send_message` to forward the reply to the existing subagent; for the latter dispatch a fresh agent-N following the tag rule above. Do not treat both cases as new tasks, and do not stuff a new task into the old subagent.
-**When YOU need a decision, route it through `{exe} ask` too: with no claim at hand run `{exe} ask -q "question (plain-text options numbered from 3; 1/2 reserved)"` and tba creates a new task and moves it to waiting-reply; with a claim use `{exe} ask {id} -q "..."`. NEVER give options directly in chat, NEVER use DSH's ask_user_question picker/modal, NEVER use MCP `{exe} ask_user`.** On a reply run `{exe} reply <claim_id>` then `{exe} events --claim <claim_id>`.
-"#,
-            exe = exe, id = claim_id
-        )
-    }
+        exe = exe, id = claim_id
+    )
 }
 
 /// 子代理专属流程说明：任务已认领，它自己用 CLI 走待回复交互 + 写备注 + 回报，不碰 done/close。
-fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
-    if lang == Lang::Zh {
-        return format!(
-            r##"## 你的职责
+fn subagent_workflow_text(exe: &str, claim_id: &str) -> String {
+    format!(
+        r##"## 你的职责
 1. 只改完成这个任务必须改的，遵循项目编码纪律（见上方上下文）。
 2. 干完把「改了什么/怎么验」写进任务备注（不是评论）：
   {exe} note {id} --text "改了什么/怎么验"
@@ -3098,29 +3193,6 @@ fn subagent_workflow_text(exe: &str, claim_id: &str, lang: Lang) -> String {
 
 ## 交回主代理
 回报：改了什么、验证了什么、还剩什么、有什么疑问。主代理用 claim_id（{id}）收尾并视情况提问。"##,
-            exe = exe, id = claim_id
-        );
-    }
-    format!(
-        r##"## Your job
-1. Change only what this task requires; follow the project coding rules above.
-2. When done, write "what changed / how verified" to the task note (not a comment):
-  {exe} note {id} --text "what changed / how verified"
-   For project memory use `{exe} memory --project <id> --append "..." --section 踩坑`; NOT a local note.md, and `tba mem` is only a task state.
-3. Drive the waiting-reply loop yourself via CLI: `{exe} ask {id} -q "question (plain-text options numbered from 3; 1/2 reserved)"` or `{exe} ask {id} --done` for the final check; on a reply run `{exe} reply {id}` (back to in-progress) then `{exe} events --claim {id}` to read it. NEVER use DSH's ask_user_question picker/modal (禁用 DSH 选择框/ask_user), NEVER use MCP `{exe} ask_user` (serve has no DSH_SESSION_ID and may wake the old main session). CLI only; the reply wakes your own session.
-4. Do NOT done / close yourself - user reply 1 makes the tba serve aggregator finish it; closing is not delegated to subagents. Main agent keeps re-hanging `tba sub`, dispatching, and final confirmation.
-5. If unsure, ask the user yourself with `tba ask -q` (plain-text options from 3), and also write the question into the note and report back to the main agent. Do not guess and plow ahead.
-6. **Before exploring a large file, check its line count and grep to locate, then read in line ranges. Never read a several-thousand-line file in full up front** - tokens run out during exploration, with zero changes and zero conclusions.
-
-## Commit / push / upload to GitHub: tba only
-- To commit & push run only `{exe} git main -m "what changed"`; check `{exe} git status` first; add `--dry` to preview.
-- To create/attach a repo or update GitHub run only `{exe} git create [--name repo]` (idempotent, pushes when a remote exists).
-- To cut a release run only `{exe} publish --tag vX.Y.Z` (bump Cargo.toml version and cargo build to sync Cargo.lock first). No `--watch` by default: CI usually passes and the user reports failures; don't wait on CI.
-- NEVER hand-roll git remote/push, `git -c http.extraHeader`, hunt for a GitHub token, set GH_TOKEN, set up SSH keys, install gh, or send the user to the web to create a repo. tba reads credentials from the git credential store; if it can't, report back to the main agent - do not switch tactics.
-- Details on demand: `{exe} cap git-main` / `{exe} cap git-create` / `{exe} cap release`.
-
-## Hand back to main agent
-Report: what changed, what you verified, what remains, and any open questions. Main agent closes via claim_id ({id}) and asks the user if needed."##,
         exe = exe, id = claim_id
     )
 }
@@ -4531,41 +4603,9 @@ pub fn draft_for_mode(store: &Store, raw: &str, mode: CopyMode) -> Option<TaskDr
     })
 }
 
-// 文案语言。
-//
-// **中文版是准本**：内容逐条对齐需求，改动先改中文。
-// **英文版据中文压缩改写**：同义内容中文 ~880 token、英文 ~540（cl100k_base），
-// 英文版只为省 token，不许比中文版多出规则、也不许少掉任何不变量。
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Lang {
-    #[default]
-    Zh,
-    En,
-}
-
-impl Lang {
-    // CLI 用 --lang 收字符串，这里做一次宽松解析。
-    pub fn parse(s: &str) -> Option<Lang> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "zh" | "cn" | "zh-cn" | "chinese" | "中文" => Some(Lang::Zh),
-            "en" | "eng" | "english" | "英文" => Some(Lang::En),
-            _ => None,
-        }
-    }
-
-    // UI 按钮/状态提示里的短标签。
-    pub fn label(self) -> &'static str {
-        match self {
-            Lang::Zh => "中文",
-            Lang::En => "英文",
-        }
-    }
-}
-
 // 中文版工作流程（准本）。
 //
-// 与英文版一一对应：中文是完整表达，英文并句压缩。
-// 改规则先改这里，再同步英文版——单测会两种语言都跑一遍不变量。
+// 单测会跑一遍不变量，保证规则不被改坏。
 //
 // **写得短是硬指标**：文案每次开工都要整段贴给 agent，越长越贵。
 // 所以 exit 码只讲一次、收尾规则不重复陈述、能省的括号解释全省。
@@ -4653,9 +4693,8 @@ fn workflow_text_zh(
 // draft 有值 = 用户在文案里派了活（走 start 新建）；
 // draft 为空 = 让 agent 去队列领（走 claim）。
 //
-// **中文准本在 workflow_text_zh**；这里只剩英文版（省 token 用）。
-// 英文版据中文压缩，规则一条不多一条不少——单测两种语言都跑。
-// 阶段名（未完成/进行中/...）两种语言都保持中文——那是 Teambition 上的真实名字，改了 agent 对不上。
+// **中文准本在 workflow_text_zh**，这里直接转调。
+// 阶段名（未完成/进行中/...）保持中文——那是 Teambition 上的真实名字，改了 agent 对不上。
 // 关键不变量一条不许丢（有单测守着）：只经 tb 改状态/列、别自建任务、
 // 方案1 = agent 永不自动收尾（done/close 只能用户显式触发）、做完停在进行中边等边 beat、
 // 等用户手动收尾；长操作前后 beat、待回复永不超时、心跳超时退回队列、退出码 0/2/3。
@@ -4665,115 +4704,38 @@ fn workflow_text(
     cfg: &Config,
     draft: Option<&TaskDraft>,
     claimed: Option<&Claim>,
-    lang: Lang,
     memory_on: bool,
 ) -> String {
-    if lang == Lang::Zh {
-        return workflow_text_zh(exe, project_id, cfg, draft, claimed, memory_on);
-    }
-    let t = cfg.heartbeat_timeout_secs / 60;
-    let mut s = String::new();
-    let has_task = draft.map(|d| !d.is_empty()).unwrap_or(false);
-    s.push_str("## Workflow (mandatory; never edit task state or board columns yourself)\n");
-
-    // 已领分支（tb go 专用）：任务已经落账，别再 claim 一次。
-    if let Some(c) = claimed {
-        s.push_str(&format!(
-            "1. Already claimed: claim_id `{}`, task \"{}\" (status {} -> {}). Do NOT claim again.\n",
-            c.claim_id, c.task_name, STAGE_TODO, STAGE_DOING
-        ));
-    } else if has_task {
-        let d = draft.unwrap();
-        if d.body_path.is_empty() {
-            s.push_str(&format!(
-                "1. Register first (do NOT claim from the queue): `{exe} start --project {project_id} --title \"{}\" --note \"<body above>\"`, ",
-                d.title.replace('"', "'")
-            ));
-        } else {
-            s.push_str(&format!(
-                "1. Register first (do NOT claim from the queue): `{exe} start --project {project_id} --file \"{}\"`, ",
-                d.body_path
-            ));
-        }
-        s.push_str(&format!(
-            "it creates a {0} task in column \"{1}\" and prints claim_id; on \"already started, reusing claim\" reuse it, never create extra tasks.\n",
-            STAGE_DOING, cfg.tasklist_claim
-        ));
-    } else {
-        s.push_str(&format!(
-            "1. Claim: `{exe} claim --project {project_id}` (oldest task in status {0} + column \"{1}\"). Link given -> `{exe} take <link>`. Nothing to claim -> tell the user and stop; never invent tasks.\n",
-            STAGE_TODO, cfg.tasklist_queue
-        ));
-    }
-
-    if memory_on {
-        s.push_str(&format!(
-            "2. Read memory first: `{exe} memory --project {project_id}`. Work; findings -> **task note** (`{exe} note <claim_id> --text \"...\"`). Write project memory with `{exe} memory --project {project_id} --append \"...\" --section 踩坑`; NOT a local note.md, and `tba mem` is only a task state. NEVER post comments - that's the user's channel. `{exe} beat <claim_id>` before/after long ops.\n"
-        ));
-    } else {
-        s.push_str(&format!(
-            "2. Work; findings -> **task note** (`{exe} note <claim_id> --text \"...\"`). NEVER post comments - that's the user's channel. `{exe} beat <claim_id>` before/after long ops.\n"
-        ));
-    }
-
-    s.push_str(&format!(
-        "3. User input (main + subagent): `{exe} ask <claim_id> -q \"question (options from 3)\"` -> {0} + col \"{1}\", mail sent; aggregator owns replies. **Main agent with no claim: `{exe} ask -q \"...\"` creates a task in waiting-reply. Never give options in chat, NEVER use DSH ask_user_question or MCP `{exe} ask_user`.** tb handles numbers: 1=solved -> col {3}, closed; 2=write project memory first -> col {2}, then ask again; 3+=problem -> col {2}; non-number=read as text -> col {2}; 0 deprecated, read as text, never closes. ONLY 1 closes; others return to col {2}. In a custom question, number your own options from 3 (3/4/5...): 1/2 are reserved system actions (1=close 2=memory, executed by tb), using them as your options would mis-close the task on reply 1, and tba rejects such questions. Plain numbered options; main agent also uses `{exe} ask`, never chat; NEVER use DSH ask_user_question or MCP `{exe} ask_user`.\n",
-        STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
-    ));
-
-    let handoff = format!(
-        "Hand back in 2 steps: (a) `{exe} note <claim_id> --text \"what changed / how to verify\")`; (b) `{exe} ask <claim_id> --done` (1=close/2=memory first/3+=still broken, custom options numbered from 3; -> {0} + column \"{1}\", mail sent). `tba ask` writes the note, moves to waiting and sends mail, then returns at once; reply listening is owned by the tba serve WatchAggregator. New mail/comment replies are written to `data/wakes/<sessionId>.json` and dsh-tba-bridge injects them into the session immediately. Do NOT use a background waiter, a foreground waiter, or `--no-wait`; do NOT rerun ask (resends mail). Use `tba events --claim <claim_id>` for replies received during execution; on a chat-box reply run `tba reply <claim_id>` first. Only reply 1 finishes the task (aggregator finish); agents never done/close. ",
-        STAGE_WAIT, cfg.tasklist_wait
-    );
-
-    let close_rule = format!(
-        "Do NOT run `{exe} done`/`{exe} close` - only the user closes. exit 0=reply / exit 2=timeout, rerun with `{exe} wait <claim_id>` (not ask - resends mail), don't end the session / exit 3=user already closed it ({0}/{1} or column \"{2}\"/\"{3}\"), stop. Explicit order: `{exe} done <claim_id>` / `{exe} close <claim_id>`. Give up: `{exe} release <claim_id>`. No heartbeat {t} min -> auto-return to {4} + column \"{5}\"; {6} never times out. Multi-session: `{exe} hello --name <name>`.\n",
-        STAGE_DONE, STAGE_CLOSED, cfg.tasklist_done, cfg.tasklist_closed, STAGE_TODO, cfg.tasklist_queue, STAGE_WAIT
-    );
-    if memory_on {
-        s.push_str(&format!(
-            "4. {handoff}Ask yourself: any pitfall the next agent would hit? If yes: `{exe} memory --project {project_id} --append \"...\"`. {close_rule}"
-        ));
-    } else {
-        s.push_str(&format!("4. {handoff}{close_rule}"));
-    }
-    s
+    workflow_text_zh(exe, project_id, cfg, draft, claimed, memory_on)
 }
 
 // 文案里「本次任务」那一段。放在 header 之后、skill 之前——
 // agent 第一眼就该知道这次要干什么，而不是先读一堆 skill 再去找任务。
-// 结构标签用英文（省 token）；标题/正文是用户自己的内容，原样保留。
-fn task_section(d: &TaskDraft, lang: Lang) -> String {
-    let zh = lang == Lang::Zh;
+// 结构标签用中文；标题/正文是用户自己的内容，原样保留。
+fn task_section(d: &TaskDraft) -> String {
     let mut s = String::new();
-    s.push_str(if zh {
-        "## 本次任务（用户派的活 —— 不要去队列领）\n"
-    } else {
-        "## This task (assigned by the user - do NOT claim from the queue)\n"
-    });
+    s.push_str(
+        "## 本次任务（用户派的活 —— 不要去队列领）\n",
+    );
     s.push_str(&format!(
-        "{}: {}\n",
-        if zh { "标题" } else { "Title" },
+        "标题: {}\n",
         d.title.trim()
     ));
     if !d.body_path.is_empty() {
         s.push_str(&format!(
-            "{}: {}\n",
-            if zh { "正文文件" } else { "Body file" },
+            "正文文件: {}\n",
             d.body_path
         ));
     }
     let body = d.body.trim();
     if !body.is_empty() {
-        s.push_str(if zh { "\n正文:\n" } else { "\nBody:\n" });
+        s.push_str("\n正文:\n");
         if body.chars().count() > 4000 {
             let head: String = body.chars().take(4000).collect();
             s.push_str(&head);
-            s.push_str(if zh {
-                "\n\n...(正文过长已截断，完整内容见上面的正文文件)\n"
-            } else {
-                "\n\n...(body truncated, full text in the body file above)\n"
-            });
+            s.push_str(
+                "\n\n...(正文过长已截断，完整内容见上面的正文文件)\n",
+            );
         } else {
             s.push_str(body);
             s.push('\n');
@@ -4795,14 +4757,13 @@ fn prompt_body(
     skills: &[SkillItem],
     draft: Option<&TaskDraft>,
     claimed: Option<&Claim>,
-    lang: Lang,
 ) -> String {
     let cfg = store.load_config();
-    let mut s = prompt_head(store, project_id, project_name, skills, draft, lang, false);
+    let mut s = prompt_head(store, project_id, project_name, skills, draft, false);
     let memory_on = store.load_tb_memory(project_id).enabled;
     let exe = prompt_exe_of(&cfg);
     s.push_str(&workflow_text(
-        &exe, project_id, &cfg, draft, claimed, lang, memory_on,
+        &exe, project_id, &cfg, draft, claimed, memory_on,
     ));
     s
 }
@@ -4818,10 +4779,8 @@ fn prompt_head(
     project_name: &str,
     skills: &[SkillItem],
     draft: Option<&TaskDraft>,
-    lang: Lang,
     local_only: bool,
 ) -> String {
-    let zh = lang == Lang::Zh;
     let cfg = store.load_config();
     // 文案里路径要出现十几次，所以允许配一个短路径（如目录联接 D:\tb\tba.exe）。
     // 没配就用真实 exe 路径，行为跟以前一致。
@@ -4837,74 +4796,47 @@ fn prompt_head(
     // 「项目 ID: 」，也别给一条指向不存在目录的记忆路径——看着像坏了。
     let bound = !project_id.trim().is_empty();
     if bound {
-        s.push_str(&format!(
-            "# {}: {project_name}\n",
-            if zh { "项目" } else { "Project" }
-        ));
-        s.push_str(&format!(
-            "{}: {project_id}\n",
-            if zh { "项目 ID" } else { "Project ID" }
-        ));
+        s.push_str(&format!("# 项目: {project_name}\n"));
+        s.push_str(&format!("项目 ID: {project_id}\n"));
         if memory_on {
             s.push_str(&format!(
-                "{}: `{exe} memory --project {project_id}`\n",
-                if zh {
-                    "项目记忆（云端，存状态为 mem 的任务备注）"
-                } else {
-                    "Project memory (cloud, note of mem-state tasks)"
-                }
+                "项目记忆（云端，存状态为 mem 的任务备注）: `{exe} memory --project {project_id}`\n"
             ));
         } else {
             s.push_str(&format!(
-                "{}: {}\n",
-                if zh { "共享记忆目录" } else { "Shared memory dir" },
+                "共享记忆目录: {}\n",
                 mem.display()
             ));
         }
     } else {
         s.push_str(&format!(
-            "# {}: {project_name}（{}）\n",
-            if zh { "项目" } else { "Project" },
-            if zh {
-                "本地目录，没接 Teambition"
-            } else {
-                "local dir, not linked to Teambition"
-            }
+            "# 项目: {project_name}（本地目录，没接 Teambition）\n"
         ));
     }
     s.push_str(&format!(
-        "{}: {exe}\n\n",
-        if zh { "工具路径" } else { "Tool path" }
+        "工具路径: {exe}\n\n"
     ));
 
     if let Some(d) = draft {
         if !d.is_empty() {
-            s.push_str(&task_section(d, lang));
+            s.push_str(&task_section(d));
         }
     }
 
     let enabled: Vec<&SkillItem> = skills.iter().filter(|k| k.on).collect();
     if enabled.is_empty() {
-        s.push_str(if zh {
-            "已启用 skill: 无\n\n"
-        } else {
-            "Enabled skills: none\n\n"
-        });
+        s.push_str(
+            "已启用 skill: 无\n\n",
+        );
     } else {
         let names: Vec<&str> = enabled.iter().map(|k| k.name.as_str()).collect();
         s.push_str(&format!(
-            "{} ({}): {}\n",
-            if zh { "已启用 skill" } else { "Enabled skills" },
+            "已启用 skill ({}): {}\n",
             enabled.len(),
             names.join(", ")
         ));
         s.push_str(&format!(
-            "{} `{exe} skill <name> --project {project_id}`\n\n",
-            if zh {
-                "按需读一个（不要全读）："
-            } else {
-                "Read one on demand (do NOT read all):"
-            }
+            "按需读一个（不要全读）: `{exe} skill <name> --project {project_id}`\n\n"
         ));
     }
     // 通用能力：本地、跨项目，和项目 skill 是两套东西（skill 存在云端、按项目隔离）。
@@ -4923,31 +4855,11 @@ fn prompt_head(
             .map(|c| c.name.chars().count())
             .max()
             .unwrap_or(4);
-        // 括号按语言分开写：英文里塞全角括号会很扎眼。
-        if zh {
-            s.push_str(&format!("通用能力，用到才读正文（`{exe} cap <名字>`）\n"));
-        } else {
-            s.push_str(&format!(
-                "Capabilities, read body on demand (`{exe} cap <name>`)\n"
-            ));
-        }
+        s.push_str(&format!("通用能力，用到才读正文（`{exe} cap <名字>`）\n"));
         for c in &caps {
             let pad = " ".repeat(w.saturating_sub(c.name.chars().count()));
-            let mark = if c.always {
-                if zh {
-                    "【常驻】"
-                } else {
-                    "[ALWAYS] "
-                }
-            } else {
-                ""
-            };
-            // 英文文案优先用英文说明；用户自建的能力没填就回落到中文那条。
-            let why = if zh || c.summary_en.trim().is_empty() {
-                c.summary.as_str()
-            } else {
-                c.summary_en.as_str()
-            };
+            let mark = if c.always { "【常驻】" } else { "" };
+            let why = c.summary.as_str();
             s.push_str(&format!("- {}{}  {}{}\n", c.name, pad, mark, why));
         }
         s.push('\n');
@@ -4963,12 +4875,11 @@ pub fn direct_prompt(
     project_name: &str,
     skills: &[SkillItem],
     draft: Option<&TaskDraft>,
-    lang: Lang,
 ) -> String {
     let cfg = store.load_config();
     let exe = prompt_exe_of(&cfg);
-    let mut s = prompt_head(store, project_id, project_name, skills, draft, lang, true);
-    s.push_str(&direct_workflow_text(&exe, project_id, lang));
+    let mut s = prompt_head(store, project_id, project_name, skills, draft, true);
+    s.push_str(&direct_workflow_text(&exe, project_id));
     s
 }
 
@@ -4976,40 +4887,23 @@ pub fn direct_prompt(
 ///
 /// 为什么单独写一份而不是给 workflow_text 加开关：那一份通篇是 claim/take/beat/ask/wait，
 /// 直连模式下这些一条都不该出现——留着只会让 agent 照着做然后卡住。
-fn direct_workflow_text(exe: &str, project_id: &str, lang: Lang) -> String {
-    if lang == Lang::Zh {
-        let mem = if project_id.trim().is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n需要记下来的东西写本地：`{exe} memory --project {project_id} --write \"...\"`。\n"
-            )
-        };
-        return format!(
-            "## 交互方式（直连模式：不走 Teambition）\n\
-             这次是 `--off`：**不领任务、不写备注、不改状态、不发邮件、不等回复**。\
-             所有交流都在当前对话里完成。\n\n\
-             1. 有拿不准的地方，直接问用户一句话，然后停下等回答。不要自己假设完就硬干。\n\
-             2. 干完直接说结论：改了什么、验证了什么、还剩什么没做。不需要 `{exe} done` / `{exe} close`。\n\
-             3. 不要调用 `{exe} claim / take / start / ask / wait / beat / done / close / note` ——\
-             这些都要联网写 Teambition，直连模式下没有意义。\n\
-             4. 分支、提交照常用 `{exe} git ...`（本地 git / GitButler）。\n\
-             {mem}"
-        );
-    }
+fn direct_workflow_text(exe: &str, project_id: &str) -> String {
     let mem = if project_id.trim().is_empty() {
         String::new()
     } else {
-        format!("\nSave anything worth keeping locally: `{exe} memory --project {project_id} --write \"...\"`.\n")
+        format!(
+            "\n需要记下来的东西写本地：`{exe} memory --project {project_id} --write \"...\"`。\n"
+        )
     };
     format!(
-        "## Interaction (direct mode: no Teambition)\n\
-         This run used `--off`: **do NOT claim tasks, write notes, change states, send mail, or wait for replies**. \
-         Everything happens in this conversation.\n\n\
-         1. If anything is unclear, ask the user one short question and stop for the answer. Do not guess and plow ahead.\n\
-         2. When done, report directly: what changed, what you verified, what is left. No `{exe} done` / `{exe} close`.\n\
-         3. Do not call `{exe} claim / take / start / ask / wait / beat / done / close / note` - they all write to Teambition.\n\
-         4. Branches and commits still go through `{exe} git ...` (local git / GitButler).\n\
+        "## 交互方式（直连模式：不走 Teambition）\n\
+         这次是 `--off`：**不领任务、不写备注、不改状态、不发邮件、不等回复**。\
+         所有交流都在当前对话里完成。\n\n\
+         1. 有拿不准的地方，直接问用户一句话，然后停下等回答。不要自己假设完就硬干。\n\
+         2. 干完直接说结论：改了什么、验证了什么、还剩什么没做。不需要 `{exe} done` / `{exe} close`。\n\
+         3. 不要调用 `{exe} claim / take / start / ask / wait / beat / done / close / note` ——\
+         这些都要联网写 Teambition，直连模式下没有意义。\n\
+         4. 分支、提交照常用 `{exe} git ...`（本地 git / GitButler）。\n\
          {mem}"
     )
 }
@@ -5023,7 +4917,7 @@ fn direct_workflow_text(exe: &str, project_id: &str, lang: Lang) -> String {
 // 所以文案里让它先跑 `ensure-project --dry-run` 扫候选，再交用户拍板。
 // 不这么做的后果是实打实踩过的：agent 拿目录名（甚至界面上的工具名 TBHub）当项目名，
 // 一建就是个错名字的项目，后面还得删。
-pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> String {
+pub fn init_prompt(store: &Store, project_name: Option<&str>) -> String {
     let cfg = store.load_config();
     // 跟开工文案同一套路径策略：配了短命令就用短的（现在默认裸 `tba`）。
     let exe = if cfg.tool_path.trim().is_empty() {
@@ -5035,117 +4929,57 @@ pub fn init_prompt(store: &Store, project_name: Option<&str>, lang: Lang) -> Str
     };
     // 有名字就固定用它；没有就走「先扫候选、用户拍板」的流程。
     let given = project_name.map(str::trim).filter(|s| !s.is_empty());
-    let zh = lang == Lang::Zh;
     let mut s = String::new();
-    if zh {
-        s.push_str(
-            "# 给当前仓库接入 Teambition\n\
-             「TBHub / tba」是工具名，**不是项目名**，不要拿它当项目名。\n\
-             这个仓库还没接 Teambition。建项目之前先搞清楚它该叫什么：\n\n",
-        );
-        match given {
-            Some(n) => s.push_str(&format!("1. 跑 `{exe} ensure-project --name \"{n}\"`\n")),
-            None => {
-                s.push_str(&format!("1. 在仓库根目录跑 `{exe} ensure-project --dry-run`\n"));
-                s.push_str(
-                    "   它会扫这个目录（git remote、Cargo.toml / package.json / pyproject.toml / go.mod、\
-                     子目录里的项目），把候选项目名连来源一起列出来，并标出 Teambition 里是否已有同名。\n\n",
-                );
-                s.push_str(
-                    "2. **把候选原样列给用户，让用户拍板**（编号 + 名字 + 来源）。\n  \
-                     - 不要自己挑一个就用，也不要默认拿目录名。\n  \
-                     - 只有一个候选也要问一次。\n  \
-                     - 候选都不对（新仓库、目录名没意义）就问用户要叫什么；\
-                     他要是只给了一句描述，你据此起 2~3 个名字再让他选。\n\n",
-                );
-                s.push_str(&format!(
-                    "3. 用户确认后（假设他选了 `<名字>`）：`{exe} ensure-project --name \"<名字>\"`\n"
-                ));
-            }
+    s.push_str(
+        "# 给当前仓库接入 Teambition\n\
+         「TBHub / tba」是工具名，**不是项目名**，不要拿它当项目名。\n\
+         这个仓库还没接 Teambition。建项目之前先搞清楚它该叫什么：\n\n",
+    );
+    match given {
+        Some(n) => s.push_str(&format!("1. 跑 `{exe} ensure-project --name \"{n}\"`\n")),
+        None => {
+            s.push_str(&format!("1. 在仓库根目录跑 `{exe} ensure-project --dry-run`\n"));
+            s.push_str(
+                "   它会扫这个目录（git remote、Cargo.toml / package.json / pyproject.toml / go.mod、\
+                 子目录里的项目），把候选项目名连来源一起列出来，并标出 Teambition 里是否已有同名。\n\n",
+            );
+            s.push_str(
+                "2. **把候选原样列给用户，让用户拍板**（编号 + 名字 + 来源）。\n  \
+                 - 不要自己挑一个就用，也不要默认拿目录名。\n  \
+                 - 只有一个候选也要问一次。\n  \
+                 - 候选都不对（新仓库、目录名没意义）就问用户要叫什么；\
+                 他要是只给了一句描述，你据此起 2~3 个名字再让他选。\n\n",
+            );
+            s.push_str(&format!(
+                "3. 用户确认后（假设他选了 `<名字>`）：`{exe} ensure-project --name \"<名字>\"`\n"
+            ));
         }
-        s.push_str(
-            "   有同名项目就复用，没有就新建；两种都会补齐 7 个工作流状态\
-             （未完成/进行中/待回复/已解决/已完成 + skill/mem）。\n",
-        );
-        s.push_str("   成功最后一行是 `项目就绪: <id>  <名字>（新建/复用）`。\n");
-        s.push_str(&format!(
-            "4. 用那个 id 继续：`{exe} prompt --project <id>`，照输出开工。\n\n"
-        ));
-        s.push_str(&format!(
-            "之后在本目录直接跑 `{exe} prompt`（不带 --project）即可，id 已写进 .tba/project。\n\
-             出错就把 stdout 原样报给用户：不要改 data/config.toml，不要自己拼 Teambition 接口。\n"
-        ));
-        s.push_str(&format!(
-            "\n**更省事（陌生 agent）**：项目目录跑 `{exe}`（不带参数）扫候选，把候选交用户拍板；\
-             之后只跑一条 `{exe} create --name \"<选定的>\" --go`，\
-             建项目 + 写 MCP 配置 + 当场领任务一次做完。\n"
-        ));
-        s.push_str(&format!(
-            "\n**建完项目要给用户的东西**：输出里的「项目链接」（`https://www.teambition.com/project/<id>`）。\n\
-             5 个看板列直接用中文状态名：未完成、进行中、待回复、已解决、已完成，\n\
-             由 tba 用新版 MCP 自动补齐（老项目的数字列 1~5 会自动改名），正常不用人管；\n\
-             只有输出里出现「✗ 自动补列没完全成功」和「兜底：手动补这 5 个看板列」时，\n\
-             才把链接和那段兜底步骤原样转给用户，让他在链接里补缺的列。不要自己拼接口建列。\n\
-             以后每次 `{exe} go` 都会自动再查再补一次。\n"
-        ));
-    } else {
-        s.push_str(
-            "# Onboard this repo to Teambition\n\
-             \"TBHub / tba\" is the tool name, **not the project name** - do not use it as one.\n\
-             This repo is not linked to Teambition yet. Settle the name before creating anything:\n\n",
-        );
-        match given {
-            Some(n) => s.push_str(&format!("1. Run `{exe} ensure-project --name \"{n}\"`\n")),
-            None => {
-                s.push_str(&format!(
-                    "1. In the repo root run `{exe} ensure-project --dry-run`\n"
-                ));
-                s.push_str(
-                    "   It scans this directory (git remote, Cargo.toml / package.json / pyproject.toml / go.mod, \
-                     projects in subdirectories) and lists candidate project names with their source, \
-                     marking which ones already exist in Teambition.\n\n",
-                );
-                s.push_str(
-                    "2. **Show the candidates to the user and let them decide** (number + name + source).\n  \
-                     - Do not pick one yourself, and do not default to the directory name.\n  \
-                     - Ask even when there is only one candidate.\n  \
-                     - If none fit (new repo, meaningless directory name), ask the user for a name; \
-                     if they only describe the project, propose 2-3 names and let them choose.\n\n",
-                );
-                s.push_str(&format!(
-                    "3. After the user confirms (say they picked `<name>`): `{exe} ensure-project --name \"<name>\"`\n"
-                ));
-            }
-        }
-        s.push_str(
-            "   Reuses the project with that name, creates it otherwise; either way it fills in the \
-             7 workflow states (未完成/进行中/待回复/已解决/已完成 + skill/mem).\n",
-        );
-        s.push_str("   Last line is `项目就绪: <id>  <name> (new/reused)`.\n");
-        s.push_str(&format!(
-            "4. Continue with that id: `{exe} prompt --project <id>` and follow the output.\n\n"
-        ));
-        s.push_str(&format!(
-            "Afterwards just run `{exe} prompt` in this dir (no --project); the id is in .tba/project.\n\
-             On error report stdout as-is: do not edit data/config.toml, do not call Teambition APIs by hand.\n"
-        ));
-        s.push_str(&format!(
-            "\n**Shorter**: after the user picks a name, run just one command \
-             `{exe} create --name \"<picked>\" --go` to link the repo, write the MCP config \
-             and claim one task in a single shot.\n"
-        ));
-        s.push_str(&format!(
-            "\n**After creating a project, always hand the user the project link** \
-             (`https://www.teambition.com/project/<id>`) from the output. The five board columns \
-             use the Chinese status names 未完成 / 进行中 / 待回复 / 已解决 / 已完成; tba creates \
-             missing ones via the newer MCP `task-list-create` and renames legacy numeric columns \
-             1-5 via `task-list-update-name`; no manual work is normally needed. Only when the \
-             output contains \"auto create failed\" plus the manual fallback block should you \
-             forward that block to the user so they can add the missing columns in the web UI. \
-             Never call Teambition APIs by hand.\n\
-             Every later `{exe} go` re-checks and tops the columns up automatically.\n"
-        ));
     }
+    s.push_str(
+        "   有同名项目就复用，没有就新建；两种都会补齐 7 个工作流状态\
+         （未完成/进行中/待回复/已解决/已完成 + skill/mem）。\n",
+    );
+    s.push_str("   成功最后一行是 `项目就绪: <id>  <名字>（新建/复用）`。\n");
+    s.push_str(&format!(
+        "4. 用那个 id 继续：`{exe} prompt --project <id>`，照输出开工。\n\n"
+    ));
+    s.push_str(&format!(
+        "之后在本目录直接跑 `{exe} prompt`（不带 --project）即可，id 已写进 .tba/project。\n\
+         出错就把 stdout 原样报给用户：不要改 data/config.toml，不要自己拼 Teambition 接口。\n"
+    ));
+    s.push_str(&format!(
+        "\n**更省事（陌生 agent）**：项目目录跑 `{exe}`（不带参数）扫候选，把候选交用户拍板；\
+         之后只跑一条 `{exe} create --name \"<选定的>\" --go`，\
+         建项目 + 写 MCP 配置 + 当场领任务一次做完。\n"
+    ));
+    s.push_str(&format!(
+        "\n**建完项目要给用户的东西**：输出里的「项目链接」（`https://www.teambition.com/project/<id>`）。\n\
+         5 个看板列直接用中文状态名：未完成、进行中、待回复、已解决、已完成，\n\
+         由 tba 用新版 MCP 自动补齐（老项目的数字列 1~5 会自动改名），正常不用人管；\n\
+         只有输出里出现「✗ 自动补列没完全成功」和「兜底：手动补这 5 个看板列」时，\n\
+         才把链接和那段兜底步骤原样转给用户，让他在链接里补缺的列。不要自己拼接口建列。\n\
+         以后每次 `{exe} go` 都会自动再查再补一次。\n"
+    ));
     s
 }
 // ---- tb go：一句话开工 ----
@@ -5440,9 +5274,11 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          0+claim_id=干活；0+EMPTY=队列空；3=没绑定项目；4=项目查不到，问用户。\
          别自建任务。\n\n\
          **流转**：进行中 → `ask` 后 待回复 → 用户收尾 已解决。\n\n\
-         **内部任务例外**：项目全部完成、进入收尾时，lead 用 `start` / MCP `start_task` 自建的内部任务\n\
-         （非用户派的队列任务），实质完成后 lead 直接 `{exe} close <claim_id>` 转「已完成」列，\n\
-         不 `ask`、不等用户回 1。下面「只有用户能 done/close」的红线只对用户派的队列任务成立。\n\n\
+         **lead 单任务**：每次开工先跑 `{exe} lead start \"<当前任务名，≤20字>\"` 建一条 lead: 任务（绑本次会话）；\n\
+         所有汇报和提问合一条——用 `{exe} lead report \"<汇报内容>\"`（say / ask 是同义别名）写到这条 lead 任务，\n\
+         会发邮件等你回 1。工作全部做完后，在最后一次 report 里列清所有子任务状态；你回 1 收尾 lead 任务时，\n\
+         系统自动把同会话还在「待回复」的子代理任务收为「已解决」，把已断线的僵尸任务收为「已完成」。\n\
+         不再用 start/start_task 自建多个内部任务，也不自己 done/close。\n\n\
          **交回**：做完两步，不许省：\n\
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
@@ -5451,8 +5287,12 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
           看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；\
           例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。\
           然后跑 `{exe} sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；\
-         然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `{exe} sub` 继续监听。\n\n\
-         **收到用户回复自己判断分派**：发出 `{exe} sub` 进监听后，用户可能在本会话或其他渠道回复；先 `{exe} reply <claim_id>` + `{exe} events --claim <claim_id>` 读回原话，再自己判断是「继续当前子代理任务」（`send_message` 转给现有子代理）还是「新任务派新子代理」（按上面打 tag 规范新起 agent-N）。别都当新任务，也别把新任务塞回旧子代理。\n\n\
+          然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `{exe} sub` 继续监听。\n\n\
+          **主代理不自己写、优先派子代理**：主代理（lead）以**省 token、省时间**为前提，\
+          动手活（改代码、改文件、查文件、调研、跑验证）**尽量不自己干**，合理拆给子代理：\
+          能由子代理独立完成的一律派子代理，只有需要本会话上下文的整合、收尾、拍板、`ask` 才自己来。\
+          派活仍按上面「派子代理先打 tag」规范执行。\n\n\
+          **收到用户回复自己判断分派**：发出 `{exe} sub` 进监听后，用户可能在本会话或其他渠道回复；先 `{exe} reply <claim_id>` + `{exe} events --claim <claim_id>` 读回原话，再自己判断是「继续当前子代理任务」（`send_message` 转给现有子代理）还是「新任务派新子代理」（按上面打 tag 规范新起 agent-N）。别都当新任务，也别把新任务塞回旧子代理。\n\n\
          **回复监听**：`ask` 写问题进备注 + 转「待回复」+ 发邮件后立即返回；监听由 **tba serve 的 WatchAggregator 统一托管**。\
           邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。\
           **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，\
@@ -5525,9 +5365,11 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         // v0.2.51：收到用户回复自己判断继续当前子代理还是派新子代理；老入口缺这句要整段重写一次。
         && old.contains("收到用户回复自己判断分派")
         && old.contains("去邮箱回 1")
-        // v0.2.56：内部任务例外——项目收尾时 lead 自建任务直接 close，不 ask。
+        // lead 单任务：开工建 lead: 任务、report 统一汇报+提问、回 1 联动收尾。
         // 老入口缺这句要整段重写一次。
-        && old.contains("内部任务例外");
+        && old.contains("lead 单任务")
+        // v0.2.57：主代理不自己写、优先派子代理。老入口缺这句要整段重写一次。
+        && old.contains("主代理不自己写、优先派子代理");
     // v0.2.54：编码纪律加第 5 条（大文件按块读）；老规则块缺这句就整段重写一次。
     let rules_ok = old.matches(RULES_MARK).count() == 1
         && old.contains("探查大文件按块读");
@@ -5600,7 +5442,6 @@ fn claim_header(c: &Claim, exe: &str) -> String {
 pub fn go(
     store: &Store,
     project: Option<&str>,
-    lang: Lang,
     write_entry: bool,
     guide_tasklists: bool,
 ) -> Result<GoOutcome, String> {
@@ -5716,7 +5557,7 @@ pub fn go(
         .map(|t| t.content)
         .unwrap_or_default();
     let skills = list_skills(store, &proj.id).unwrap_or_default();
-    let rules = prompt_body(store, &proj.id, &proj.name, &skills, None, Some(&c), lang);
+    let rules = prompt_body(store, &proj.id, &proj.name, &skills, None, Some(&c));
 
     let mut text = claim_header(&c, &entry_cmd(store));
     if !body.trim().is_empty() {
@@ -5740,12 +5581,11 @@ pub fn agent_prompt(
     project_id: &str,
     project_name: &str,
     draft: Option<&TaskDraft>,
-    lang: Lang,
 ) -> Result<String, String> {
     // 不吞错误：读不到 skill 要让用户看到原因，而不是默默生成一份没有 skill 的文案
     let skills = list_skills(store, project_id)?;
     Ok(prompt_body(
-        store, project_id, project_name, &skills, draft, None, lang,
+        store, project_id, project_name, &skills, draft, None,
     ))
 }
 
@@ -5756,9 +5596,8 @@ pub fn agent_prompt_from(
     project_name: &str,
     skills: &[SkillItem],
     draft: Option<&TaskDraft>,
-    lang: Lang,
 ) -> String {
-    prompt_body(store, project_id, project_name, skills, draft, None, lang)
+    prompt_body(store, project_id, project_name, skills, draft, None)
 }
 
 #[cfg(test)]
@@ -6040,32 +5879,17 @@ mod tests {
             body: "把侧栏改窄".to_string(),
             body_path: String::new(),
         };
-        let t = direct_prompt(&store, "p-1", "项目一", &[], Some(&d), Lang::Zh);
+        let t = direct_prompt(&store, "p-1", "项目一", &[], Some(&d));
         assert!(t.contains("把侧栏改窄"), "要带上这次的任务: {t}");
         assert!(t.contains("直连模式"), "要说明是直连: {t}");
         assert!(t.contains("不要调用"), "要明确禁止走 Teambition 流程: {t}");
         assert!(t.contains("交互"), "要交代怎么跟用户交流: {t}");
 
         // 没绑定项目（id 空）也不能写出空的项目 ID 行或半截记忆路径。
-        let t2 = direct_prompt(&store, "", "某个目录", &[], None, Lang::Zh);
+        let t2 = direct_prompt(&store, "", "某个目录", &[], None);
         assert!(t2.contains("没接 Teambition"), "{t2}");
         assert!(!t2.contains("项目 ID:"), "空 id 不该输出项目 ID 行: {t2}");
         assert!(!t2.contains("memory --project  "), "空 id 不该拼出半截命令: {t2}");
-    }
-
-    // 粗估 token（cl100k 量级）：CJK 约 1 字 1 token，其余约 4 字符 1 token。
-    // 用来断言「英文版真的更省」，别拿字符数比——中文一字符信息量大，字符数天然更少。
-    fn est_tokens(s: &str) -> usize {
-        let mut cjk = 0usize;
-        let mut other = 0usize;
-        for c in s.chars() {
-            if ('\u{3000}'..='\u{9fff}').contains(&c) || ('\u{ff00}'..='\u{ffef}').contains(&c) {
-                cjk += 1;
-            } else {
-                other += 1;
-            }
-        }
-        cjk + other / 4
     }
 
     // 项目接入文案：不带名字时必须走「先扫候选、用户拍板」，不能又退回「拿目录名直接建」。
@@ -6073,7 +5897,7 @@ mod tests {
     #[test]
     fn init_prompt_asks_user_to_pick_name() {
         let store = tmp_store("init-prompt");
-        let zh = init_prompt(&store, None, Lang::Zh);
+        let zh = init_prompt(&store, None);
         assert!(zh.contains("ensure-project --dry-run"), "{zh}");
         assert!(zh.contains("拍板"), "{zh}");
         assert!(zh.contains("不要自己挑"), "{zh}");
@@ -6084,7 +5908,7 @@ mod tests {
         assert!(!zh.contains("ensure-project`\n"), "{zh}");
 
         // 给了名字就固定用它，不再让用户挑
-        let named = init_prompt(&store, Some("MarinIME"), Lang::Zh);
+        let named = init_prompt(&store, Some("MarinIME"));
         assert!(named.contains("--name \"MarinIME\""), "{named}");
         assert!(!named.contains("--dry-run"), "{named}");
     }
@@ -6141,15 +5965,15 @@ mod tests {
         let name = "测试项目";
         let skills: Vec<SkillItem> = Vec::new();
         let draft = draft_for_mode(&store, "# 标题一\n正文", CopyMode::ThisTask);
-        let p_this = agent_prompt_from(&store, pid, name, &skills, draft.as_ref(), Lang::Zh);
-        let p_queue = agent_prompt_from(&store, pid, name, &skills, None, Lang::Zh);
+        let p_this = agent_prompt_from(&store, pid, name, &skills, draft.as_ref());
+        let p_queue = agent_prompt_from(&store, pid, name, &skills, None);
         assert!(p_this.contains("本次任务"), "ThisTask 版应带本次任务段");
         assert!(p_this.contains("start"), "ThisTask 版应让 agent 跑 start");
         assert!(p_queue.contains("claim"), "Queue 版应让 agent 跑 claim");
         assert_ne!(p_this, p_queue);
     }
 
-    // 两种语言的关键不变量一条都不许丢。
+    // 中文文案的关键不变量一条都不许丢。
     // 数字回复协议：只有 1 收尾，其余都回列2；0 已废弃，按原文不收尾。
     // 解析必须防歧义——宁可当文本让 agent 读原文，也不猜错（猜错就是收错任务）。
     #[test]
@@ -6244,22 +6068,19 @@ mod tests {
     fn memory_switch_only_toggles_memory_hint() {
         let store = tmp_store("wfmem");
         let cfg = store.load_config();
-        for lang in [Lang::Zh, Lang::En] {
-            let on = workflow_text("tba", "p-1", &cfg, None, None, lang, true);
-            let off = workflow_text("tba", "p-1", &cfg, None, None, lang, false);
-            let tag = lang.label();
-            assert!(on.contains("memory --project"), "{tag}版开关开时缺读记忆命令");
-            assert!(
-                !off.contains("memory --project"),
-                "{tag}版开关关时不该出现记忆命令"
-            );
-            for code in ["exit 0", "exit 2", "exit 3"] {
-                assert!(on.contains(code), "{tag}版开关开时缺 {code}");
-                assert!(off.contains(code), "{tag}版开关关时缺 {code}");
-            }
-            // 开关开时多一句读记忆，必然更长；但不能因此失控
-            assert!(on.chars().count() > off.chars().count(), "{tag}版开关没起作用");
+        let on = workflow_text("tba", "p-1", &cfg, None, None, true);
+        let off = workflow_text("tba", "p-1", &cfg, None, None, false);
+        assert!(on.contains("memory --project"), "开关开时缺读记忆命令");
+        assert!(
+            !off.contains("memory --project"),
+            "开关关时不该出现记忆命令"
+        );
+        for code in ["exit 0", "exit 2", "exit 3"] {
+            assert!(on.contains(code), "开关开时缺 {code}");
+            assert!(off.contains(code), "开关关时缺 {code}");
         }
+        // 开关开时多一句读记忆，必然更长；但不能因此失控
+        assert!(on.chars().count() > off.chars().count(), "开关没起作用");
     }
 
     // 这些是「agent 跑偏」的防线：改 workflow_text(_zh) 时先跑这个测试。
@@ -6267,66 +6088,46 @@ mod tests {
     fn workflow_keeps_key_invariants() {
         let store = tmp_store("wf");
         let cfg = store.load_config();
-        for lang in [Lang::Zh, Lang::En] {
-            let wf = workflow_text("tba", "p-1", &cfg, None, None, lang, false);
-            let tag = lang.label();
-            // 闭环命令一个不能少（命令本身两种语言完全一致）
-            for cmd in [
-                "claim --project",
-                "take <",
-                "beat <claim_id>",
-                "note <claim_id>",
-                "ask <claim_id>",
-                "wait <claim_id>",
-                "done <claim_id>",
-                "close <claim_id>",
-                "release <claim_id>",
-            ] {
-                assert!(wf.contains(cmd), "{tag}版缺命令: {cmd}");
-            }
-            // 五个阶段名一个都不能漏（曾经漏了「未完成」）
-            for st in ALL_STAGES {
-                assert!(wf.contains(st), "{tag}版缺阶段名: {st}");
-            }
-            // 退出码语义
-            for code in ["exit 0", "exit 2", "exit 3"] {
-                assert!(wf.contains(code), "{tag}版缺 {code} 语义");
-            }
-            assert!(wf.contains("hello --name"), "{tag}版缺多会话命名提示");
+        let wf = workflow_text("tba", "p-1", &cfg, None, None, false);
+        // 闭环命令一个不能少
+        for cmd in [
+            "claim --project",
+            "take <",
+            "beat <claim_id>",
+            "note <claim_id>",
+            "ask <claim_id>",
+            "wait <claim_id>",
+            "done <claim_id>",
+            "close <claim_id>",
+            "release <claim_id>",
+        ] {
+            assert!(wf.contains(cmd), "缺命令: {cmd}");
+        }
+        // 五个阶段名一个都不能漏（曾经漏了「未完成」）
+        for st in ALL_STAGES {
+            assert!(wf.contains(st), "缺阶段名: {st}");
+        }
+        // 退出码语义
+        for code in ["exit 0", "exit 2", "exit 3"] {
+            assert!(wf.contains(code), "缺 {code} 语义");
+        }
+        assert!(wf.contains("hello --name"), "缺多会话命名提示");
 
-            // 行为规则：两种语言用各自的说法表达同一批规则。
-            let rules: [&[&str]; 7] = if lang == Lang::Zh {
-                [
-                    &["不许自己改任务状态或看板列"],
-                    &["不许自编任务"],
-                    &["不许自己跑 `tba done`", "只有用户能收尾"],
-                    &["纯文本编号", "禁用选择框"],
-                    &["长操作前后各跑一次"],
-                    &["永不超时"],
-                    &["自动退回", "用户已收尾"],
-                ]
-            } else {
-                [
-                    &["never edit task state or board columns yourself"],
-                    &["never invent tasks"],
-                    &["Do NOT run `tba done`", "only the user closes"],
-                    &["numbered", "NEVER use DSH ask_user_question"],
-                    &["before/after long ops"],
-                    &["never times out"],
-                    &["auto-return", "user already closed it"],
-                ]
-            };
-            for group in rules {
-                for piece in group {
-                    assert!(wf.contains(piece), "{tag}版缺规则片段: {piece}");
-                }
+        // 行为规则：
+        let rules: [&[&str]; 7] = [
+            &["不许自己改任务状态或看板列"],
+            &["不许自编任务"],
+            &["不许自己跑 `tba done`", "只有用户能收尾"],
+            &["纯文本编号", "禁用选择框"],
+            &["长操作前后各跑一次"],
+            &["永不超时"],
+            &["自动退回", "用户已收尾"],
+        ];
+        for group in rules {
+            for piece in group {
+                assert!(wf.contains(piece), "缺规则片段: {piece}");
             }
         }
-        // 中文版是准本，不该混进英文速查表；英文版也不该整段中文（阶段名除外）。
-        assert!(
-            !workflow_text("tba", "p-1", &cfg, None, None, Lang::En, false).contains("不许"),
-            "英文版不该出现中文规则句"
-        );
     }
 
     // 带草稿时走 start 登记，且不许去队列领——两种语言都要守住。
@@ -6335,15 +6136,13 @@ mod tests {
         let store = tmp_store("wfdraft");
         let cfg = store.load_config();
         let d = draft_for_mode(&store, "# 草稿标题\n正文", CopyMode::ThisTask);
-        for lang in [Lang::Zh, Lang::En] {
-            let wf = workflow_text("tba", "p-1", &cfg, d.as_ref(), None, lang, false);
-            assert!(wf.contains("start --project"), "{}版该走 start", lang.label());
-            assert!(
-                !wf.contains("claim --project"),
-                "{}版带了草稿就不该让 agent 去队列领",
-                lang.label()
-            );
-        }
+        // 带草稿时走 start 登记，且不许去队列领。
+        let wf = workflow_text("tba", "p-1", &cfg, d.as_ref(), None, false);
+        assert!(wf.contains("start --project"), "该走 start");
+        assert!(
+            !wf.contains("claim --project"),
+            "带了草稿就不该让 agent 去队列领"
+        );
     }
 
     // skill 只列名字，不内联全文——文案 token 的最大头必须按需读取。
@@ -6358,7 +6157,7 @@ mod tests {
             content: big.clone(),
             on: true,
         }];
-        let p = agent_prompt_from(&store, pid, "项目一", &skills, None, Lang::Zh);
+        let p = agent_prompt_from(&store, pid, "项目一", &skills, None);
         assert!(p.contains("部署流程"), "skill 名字必须出现在文案里");
         assert!(
             p.contains("skill <name> --project"),
@@ -6383,32 +6182,19 @@ mod tests {
             });
         }
         // 20 个 5000 字 skill 全内联会是 10 万+ 字符；只列名字应在 2 千字符上下。
-        // 两种语言都量一遍：中文准本也不能超，英文必须更省 token。
-        let zh = agent_prompt_from(&store, pid, "项目一", &skills, None, Lang::Zh);
-        let en = agent_prompt_from(&store, pid, "项目一", &skills, None, Lang::En);
+        let p = agent_prompt_from(&store, pid, "项目一", &skills, None);
 
-        // 实测（20 个 5000 字 skill）：中文 1756 字符 ≈710 token，英文 2385 字符 ≈615 token。
-        // 字符数英文反而更多，但 token 更少——中文字在 BPE 里几乎 1 字 1 token。
+        // 实测（20 个 5000 字 skill）：中文 1756 字符 ≈710 token。
         // 预算按实测留一点余量：涨过就说明文案又变长了，要主动确认（用户明确要求「短」）。
         // v0.2.4 加了一行通用能力名单（约 116 字符，含 exe 路径），预算跟着抬一点；
-        // v0.2.6 能力从「只列名字」改成「一行一条：名字 + 何时用」（中文约 +156、
-        // 英文约 +310，英文说明比中文长），——
+        // v0.2.6 能力从「只列名字」改成「一行一条：名字 + 何时用」（中文约 +156），
         // 只列名字 agent 猜不出用途，等于没写；正文仍然按需读，没有内联。
         // 再涨就说明文案又变长了，要主动确认。
-        // v0.2.20 新增内置能力 git-create（索引多一行，英文约 +55 字符）：这是预期增长，
-        // 英文预算 3400 -> 3500。中文 2600 仍有大量余量，不动。
-        for (tag, p, budget) in [("中文", &zh, 2600usize), ("英文", &en, 3500usize)] {
-            assert!(
-                p.chars().count() < budget,
-                "{tag}版文案体积失控: {} 字符（预算 {budget}）",
-                p.chars().count()
-            );
-        }
+        // v0.2.20 新增内置能力 git-create（索引多一行）：这是预期增长。
         assert!(
-            est_tokens(&en) < est_tokens(&zh),
-            "英文版应比中文版省 token: en≈{} zh≈{}",
-            est_tokens(&en),
-            est_tokens(&zh)
+            p.chars().count() < 2600,
+            "文案体积失控: {} 字符（预算 2600）",
+            p.chars().count()
         );
     }
 
@@ -6418,7 +6204,7 @@ mod tests {
     #[test]
     fn caps_index_carries_why_and_always_mark() {
         let store = tmp_store("capsindex");
-        let p = agent_prompt_from(&store, "p1", "项目一", &[], None, Lang::Zh);
+        let p = agent_prompt_from(&store, "p1", "项目一", &[], None);
         assert!(p.contains("- shot"), "能力要一行一条: {p}");
         assert!(
             p.contains("看界面/验收 UI"),
@@ -6465,17 +6251,18 @@ mod tests {
         assert!(s.contains("这五条"), "「四条」旧口径没改: {s}");
     }
 
-    // v0.2.56：内部任务例外必须写进入口块，否则 lead 自建任务又走 ask 空等。
+    // lead 单任务入口块：开工建 lead: 任务、report 汇报+提问、回 1 联动收尾。
     #[test]
-    fn entry_file_has_internal_task_close_exception() {
-        let store = tmp_store("entry-internal-exception");
+    fn entry_file_has_lead_single_task_rule() {
+        let store = tmp_store("entry-lead-single-task");
         let dir = store.root.clone();
         let p = ensure_entry_at(&dir, "tba").expect("生成初始 AGENTS.md");
         let s = std::fs::read_to_string(&p).unwrap();
-        assert!(s.contains("内部任务例外"), "缺内部任务例外标记: {s}");
+        assert!(s.contains("lead 单任务"), "缺 lead 单任务标记: {s}");
+        assert!(!s.contains("内部任务例外"), "旧内部任务例外没删掉: {s}");
         assert!(
-            s.contains("项目全部完成") && s.contains("close <claim_id>") && s.contains("不 `ask`"),
-            "缺 lead 自建任务收尾直接 close 的指引: {s}"
+            s.contains("lead start") && s.contains("lead report") && s.contains("回 1 收尾 lead 任务"),
+            "缺 lead 单任务流程指引: {s}"
         );
     }
 
@@ -6622,123 +6409,101 @@ mod tests {
     // 之前简报只列能力索引，子代理照样自己拼 git push、找 token，所以补这条回归。
     #[test]
     fn subagent_brief_forbids_hand_rolled_git_push() {
-        for lang in [Lang::Zh, Lang::En] {
-            let t = subagent_workflow_text("tba", "clm-1", lang);
-            assert!(t.contains("tba git main"), "缺提交推送命令: {t}");
-            assert!(t.contains("tba git create"), "缺建仓库命令: {t}");
-            assert!(t.contains("tba publish"), "缺发版命令: {t}");
-            assert!(t.contains("tba cap git-main"), "缺按需读正文指引: {t}");
-            // 红线中必须明确点名这几件常被 agent 乱干的事。
-            assert!(t.contains("http.extraHeader"), "缺禁临时拼 token header: {t}");
-            assert!(t.contains("GH_TOKEN"), "缺禁找 token: {t}");
-            assert!(t.contains("gh"), "缺禁装 gh: {t}");
-        }
+        let t = subagent_workflow_text("tba", "clm-1");
+        assert!(t.contains("tba git main"), "缺提交推送命令: {t}");
+        assert!(t.contains("tba git create"), "缺建仓库命令: {t}");
+        assert!(t.contains("tba publish"), "缺发版命令: {t}");
+        assert!(t.contains("tba cap git-main"), "缺按需读正文指引: {t}");
+        // 红线中必须明确点名这几件常被 agent 乱干的事。
+        assert!(t.contains("http.extraHeader"), "缺禁临时拼 token header: {t}");
+        assert!(t.contains("GH_TOKEN"), "缺禁找 token: {t}");
+        assert!(t.contains("gh"), "缺禁装 gh: {t}");
     }
 
     // 2026-11-17：子代理整读大文件爆上下文 + 项目记忆写错地方，两处预防针都要在简报里。
     #[test]
     fn subagent_brief_warns_big_files_and_memory_command() {
-        for lang in [Lang::Zh, Lang::En] {
-            let t = subagent_workflow_text("tba", "clm-1", lang);
-            assert!(
-                t.contains("grep") && (t.contains("行段") || t.contains("line ranges")),
-                "缺大文件按块读预防针: {t}"
-            );
-            assert!(
-                t.contains("memory --project") && t.contains("--append"),
-                "缺正确的项目记忆写入命令: {t}"
-            );
-            assert!(
-                t.contains("note.md") && t.contains("tba mem"),
-                "缺点名别写 note.md / 别用 tba mem: {t}"
-            );
-            assert!(
-                t.contains("publish --tag vX.Y.Z") && !t.contains("publish --tag vX.Y.Z --watch"),
-                "发版简报还教 --watch: {t}"
-            );
-        }
+        let t = subagent_workflow_text("tba", "clm-1");
+        assert!(
+            t.contains("grep") && t.contains("行段"),
+            "缺大文件按块读预防针: {t}"
+        );
+        assert!(
+            t.contains("memory --project") && t.contains("--append"),
+            "缺正确的项目记忆写入命令: {t}"
+        );
+        assert!(
+            t.contains("note.md") && t.contains("tba mem"),
+            "缺点名别写 note.md / 别用 tba mem: {t}"
+        );
+        assert!(
+            t.contains("publish --tag vX.Y.Z") && !t.contains("publish --tag vX.Y.Z --watch"),
+            "发版简报还教 --watch: {t}"
+        );
     }
 
     // 开工文案里：读记忆给命令，写记忆也必须给命令，否则 agent 会瞎写本地 note.md。
     #[test]
     fn workflow_text_teaches_how_to_write_project_memory() {
         let cfg = tmp_store("wfmemwrite").load_config();
-        for lang in [Lang::Zh, Lang::En] {
-            let wf = workflow_text("tba", "p-1", &cfg, None, None, lang, true);
-            assert!(wf.contains("--append"), "缺项目记忆写入命令: {wf}");
-            assert!(wf.contains("note.md"), "缺点名别写 note.md: {wf}");
-            assert!(wf.contains("tba mem"), "缺点名 tba mem 只是状态: {wf}");
-        }
+        let wf = workflow_text("tba", "p-1", &cfg, None, None, true);
+        assert!(wf.contains("--append"), "缺项目记忆写入命令: {wf}");
+        assert!(wf.contains("note.md"), "缺点名别写 note.md: {wf}");
+        assert!(wf.contains("tba mem"), "缺点名 tba mem 只是状态: {wf}");
     }
 
     // 用户选 3 = 最小方案：子代理自己用 CLI 走待回复交互，主代理只做最终确认。
     #[test]
     fn subagent_brief_uses_cli_ask_and_forbids_dsh_picker() {
-        for lang in [Lang::Zh, Lang::En] {
-            let t = subagent_workflow_text("tba", "clm-1", lang);
-            assert!(t.contains("tba ask clm-1"), "缺子代理自 ask 命令: {t}");
-            assert!(t.contains("tba reply clm-1"), "缺 reply 命令: {t}");
-            assert!(t.contains("tba events --claim clm-1"), "缺 events 命令: {t}");
-            assert!(t.contains("禁用 DSH") || t.contains("NEVER use DSH's") || t.contains("NEVER use DSH"), "缺禁用 DSH 选择框: {t}");
-            assert!(t.contains("ask_user_question"), "缺点名 DSH ask_user_question: {t}");
-            assert!(t.contains("ask_user"), "缺禁用 MCP ask_user: {t}");
-            assert!(!t.contains("不要自己 ask"), "旧「不要自己 ask」还在: {t}");
-            assert!(!t.contains("不自己 ask"), "旧「不自己 ask」还在: {t}");
-            assert!(!t.contains("do NOT ask"), "旧「do NOT ask」还在: {t}");
-            assert!(t.contains("done / close"), "缺 done/close 边界: {t}");
-        }
+        let t = subagent_workflow_text("tba", "clm-1");
+        assert!(t.contains("tba ask clm-1"), "缺子代理自 ask 命令: {t}");
+        assert!(t.contains("tba reply clm-1"), "缺 reply 命令: {t}");
+        assert!(t.contains("tba events --claim clm-1"), "缺 events 命令: {t}");
+        assert!(t.contains("禁用 DSH"), "缺禁用 DSH 选择框: {t}");
+        assert!(t.contains("ask_user_question"), "缺点名 DSH ask_user_question: {t}");
+        assert!(t.contains("ask_user"), "缺禁用 MCP ask_user: {t}");
+        assert!(!t.contains("不要自己 ask"), "旧「不要自己 ask」还在: {t}");
+        assert!(!t.contains("不自己 ask"), "旧「不自己 ask」还在: {t}");
+        assert!(!t.contains("do NOT ask"), "旧「do NOT ask」还在: {t}");
+        assert!(t.contains("done / close"), "缺 done/close 边界: {t}");
     }
 
     // 主代理要用户拍板也必须走 tba ask -q，不能直接在聊天框给选项 / 弹 DSH 选择框。
     #[test]
     fn main_agent_tail_routes_decisions_through_tba_ask() {
-        for lang in [Lang::Zh, Lang::En] {
-            let t = main_agent_tail_text("tba", "clm-main", lang);
-            assert!(t.contains("tba ask -q"), "缺主代理无 claim 直建 task 的 ask -q: {t}");
-            assert!(t.contains("tba ask clm-main -q"), "缺主代理带 claim 的 ask -q: {t}");
-            assert!(
-                t.contains("自动新建") || t.contains("creates a new task"),
-                "缺自动新建 task 说明: {t}"
-            );
-            assert!(t.contains("tba reply <claim_id>"), "缺主代理 reply: {t}");
-            assert!(t.contains("tba events --claim"), "缺主代理 events: {t}");
-            assert!(t.contains("ask_user_question"), "缺点名禁用 DSH 选择框: {t}");
-            assert!(t.contains("ask_user"), "缺点名禁用 MCP ask_user: {t}");
-            assert!(
-                t.contains("不要直接在聊天框") || t.contains("NEVER give options directly in chat"),
-                "缺不直接聊天问: {t}"
-            );
-        }
+        let t = main_agent_tail_text("tba", "clm-main");
+        assert!(t.contains("tba ask -q"), "缺主代理无 claim 直建 task 的 ask -q: {t}");
+        assert!(t.contains("tba ask clm-main -q"), "缺主代理带 claim 的 ask -q: {t}");
+        assert!(t.contains("自动新建"), "缺自动新建 task 说明: {t}");
+        assert!(t.contains("tba reply <claim_id>"), "缺主代理 reply: {t}");
+        assert!(t.contains("tba events --claim"), "缺主代理 events: {t}");
+        assert!(t.contains("ask_user_question"), "缺点名禁用 DSH 选择框: {t}");
+        assert!(t.contains("ask_user"), "缺点名禁用 MCP ask_user: {t}");
+        assert!(t.contains("不要直接在聊天框"), "缺不直接聊天问: {t}");
     }
 
     // 派子代理前主代理必须先 tba sub <claim_id> --agent-tag agent-N 打 tag，再用 subagent 工具派活。
     // v0.2.51：N 是 DSH 当前子代理总数 +1（全局递增），不是本轮第一个；老「如 agent-1 / agent-2」文案必须换掉。
     #[test]
     fn main_agent_tail_tags_subagent_before_dispatch() {
-        for lang in [Lang::Zh, Lang::En] {
-            let t = main_agent_tail_text("tba", "clm-main", lang);
-            assert!(t.contains("tba sub clm-main --agent-tag agent-N"), "缺打 tag 命令: {t}");
-            assert!(t.contains("subagent"), "缺 subagent 工具派活指引: {t}");
-            assert!(
-                (t.contains("先") && t.contains("再"))
-                    || (t.contains("first run") && t.contains("only then")),
-                "缺先打 tag 再派活的时序: {t}"
-            );
-            // v0.2.51：序号规则必须写清 list_agents / 最大序号 +1 / 不从 agent-1 重来。
-            assert!(t.contains("list_agents"), "缺 list_agents 查当前子代理列表: {t}");
-            assert!(
-                t.contains("最大序号 +1") || t.contains("max number + 1"),
-                "缺最大序号 +1 规则: {t}"
-            );
-            assert!(
-                t.contains("不要从 agent-1 重新开始") || t.contains("Do not restart from agent-1"),
-                "缺不从 agent-1 重来: {t}"
-            );
-            assert!(
-                !t.contains("如 agent-1 / agent-2") && !t.contains("agent-1, agent-2, ..."),
-                "仍有误导性递增示例: {t}"
-            );
-        }
+        let t = main_agent_tail_text("tba", "clm-main");
+        assert!(t.contains("tba sub clm-main --agent-tag agent-N"), "缺打 tag 命令: {t}");
+        assert!(t.contains("subagent"), "缺 subagent 工具派活指引: {t}");
+        assert!(
+            t.contains("先") && t.contains("再"),
+            "缺先打 tag 再派活的时序: {t}"
+        );
+        // v0.2.51：序号规则必须写清 list_agents / 最大序号 +1 / 不从 agent-1 重来。
+        assert!(t.contains("list_agents"), "缺 list_agents 查当前子代理列表: {t}");
+        assert!(t.contains("最大序号 +1"), "缺最大序号 +1 规则: {t}");
+        assert!(
+            t.contains("不要从 agent-1 重新开始"),
+            "缺不从 agent-1 重来: {t}"
+        );
+        assert!(
+            !t.contains("如 agent-1 / agent-2") && !t.contains("agent-1, agent-2, ..."),
+            "仍有误导性递增示例: {t}"
+        );
     }
 
     // v0.2.51：简报末尾 footer 也要直接写清序号规则，不能只说 agent-N 让主代理猜。
@@ -6764,19 +6529,17 @@ mod tests {
             ask_at: String::new(),
             question: String::new(),
         };
-        for lang in [Lang::Zh, Lang::En] {
-            let t = subagent_brief(&store, &claim, "", &[], lang);
-            assert!(t.contains("list_agents"), "简报 footer 缺 list_agents: {t}");
-            assert!(
-                t.contains("不要从 agent-1 重新开始") || t.contains("do not restart from agent-1"),
-                "简报 footer 缺不从 agent-1 重来: {t}"
-            );
-            assert!(
-                t.contains("最大序号 +1") || t.contains("max number + 1"),
-                "简报 footer 缺最大序号 +1: {t}"
-            );
-            assert!(!t.contains("如 agent-1 / agent-2"), "简报 footer 仍有误导性示例: {t}");
-        }
+        let t = subagent_brief(&store, &claim, "", &[]);
+        assert!(t.contains("list_agents"), "简报 footer 缺 list_agents: {t}");
+        assert!(
+            t.contains("不要从 agent-1 重新开始"),
+            "简报 footer 缺不从 agent-1 重来: {t}"
+        );
+        assert!(
+            t.contains("最大序号 +1"),
+            "简报 footer 缺最大序号 +1: {t}"
+        );
+        assert!(!t.contains("如 agent-1 / agent-2"), "简报 footer 仍有误导性示例: {t}");
     }
 
     // v0.2.51：主代理收到用户回复后要自己判断「继续当前子代理」还是「新任务派新子代理」。
@@ -6802,13 +6565,11 @@ mod tests {
             ask_at: String::new(),
             question: String::new(),
         };
-        for lang in [Lang::Zh, Lang::En] {
-            let t = subagent_brief(&store, &claim, "", &[], lang);
-            assert!(
-                t.contains("自己判断") || t.contains("decide yourself"),
-                "简报缺收到回复自己判断分派: {t}"
-            );
-        }
+        let t = subagent_brief(&store, &claim, "", &[]);
+        assert!(
+            t.contains("自己判断"),
+            "简报缺收到回复自己判断分派: {t}"
+        );
         let dir = store.root.clone();
         let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
         let s = std::fs::read_to_string(&p).unwrap();
@@ -6847,6 +6608,37 @@ mod tests {
         assert!(s.contains("list_agents"), "重写后缺 list_agents 序号规则: {s}");
         assert!(s.contains("最大序号 +1"), "重写后缺最大序号 +1: {s}");
         assert!(s.contains("不要从 agent-1 重新开始"), "重写后缺不从 agent-1 重来: {s}");
+        assert_eq!(s.matches(ENTRY_MARK).count(), 1, "重写不能重复追加入口块");
+        assert!(s.contains("# 用户说明"), "用户自己的内容不能丢");
+        assert!(ensure_entry_at(&dir, "tba").is_none(), "已是新版就不该反复重写");
+    }
+
+    // v0.2.57：入口块必须带「主代理不自己写、优先派子代理」；老 AGENTS.md 缺这句要整段重写一次。
+    #[test]
+    fn entry_file_refreshes_when_lead_delegation_rule_missing() {
+        let store = tmp_store("entry-delegation");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("主代理不自己写、优先派子代理"), "入口缺主代理派活规则: {s}");
+        assert!(s.contains("省 token、省时间"), "入口缺省 token 前提: {s}");
+
+        // 造一份「其它版本条件都在、只缺主代理派活规则」的老入口。
+        let old = format!(
+            "# 用户说明\n\n{ENTRY_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
+             ## 任务队列入口\n\n\
+             **工具**：`tba`（项目根的 tba.cmd 等价）。\n\n\
+             **交回**：做完两步。`ask` 后 **流转** 到待回复。**通用能力**：`git create`。\n\n\
+             1/2 是系统保留号。\n会话窗直接回\ntba serve 的 WatchAggregator 统一托管\n\
+             禁用 DSH 的 ask_user_question 选择框/弹窗\n主代理要用户拍板也走\n自动新建一条 task\n\
+             派子代理先打 tag：tba sub <claim_id> --agent-tag agent-N（最大序号 +1，不要从 agent-1 重新开始）\n\
+             收到用户回复自己判断分派\n去邮箱回 1\nlead 单任务\n\
+             {RULES_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 编码纪律\n\n四条。\n"
+        );
+        std::fs::write(&p, old).unwrap();
+        assert!(ensure_entry_at(&dir, "tba").is_some(), "缺主代理派活规则的老入口必须重写");
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("主代理不自己写、优先派子代理"), "重写后仍缺主代理派活规则: {s}");
         assert_eq!(s.matches(ENTRY_MARK).count(), 1, "重写不能重复追加入口块");
         assert!(s.contains("# 用户说明"), "用户自己的内容不能丢");
         assert!(ensure_entry_at(&dir, "tba").is_none(), "已是新版就不该反复重写");
@@ -6973,6 +6765,24 @@ mod tests {
         let body = mail_body(&c, "已完成，请确认", "");
         assert!(body.contains("已完成，请确认"), "本次内容为空时该退回问题");
         assert!(!body.contains("本次处理内容"), "本次内容为空时不该有空分区");
+    }
+
+    // 邮件主题/正文要带来源 tag：子代理 claim.task_name 不带 agent-N，tag 只在 note 里。
+    // [TB <claim_id>] marker 必须原样保留，收信侧靠它路由。
+    #[test]
+    fn mail_subject_and_body_carry_agent_tag() {
+        let mut c = fake_waiting("clm-tag", "2026-10-31T15:00:00+08:00");
+        c.note = "agent-21".into();
+        let subject = mail_subject(&c);
+        assert!(subject.contains("agent-21:"), "主题缺 agent tag: {subject}");
+        assert!(subject.contains("[TB clm-tag]"), "主题 marker 被改了: {subject}");
+        let body = mail_body(&c, "已完成，请确认", "改了 A");
+        assert!(body.contains("agent-21"), "正文缺来源 tag");
+        assert!(body.contains("来源"), "正文缺来源分区");
+
+        // 普通任务不带 tag，主题保持原样。
+        c.note.clear();
+        assert_eq!(mail_subject(&c), "[TB clm-tag] 需要你回复：测试任务");
     }
 
     // 「待回复」字段是手机端唯一的可见副本，值格式错了就是一片空白。

@@ -142,8 +142,7 @@ fn tool_defs() -> Value {
                 "project_id": {"type": "string"},
                 "project_name": {"type": "string", "description": "可选。项目显示名。"},
                 "task": {"type": "string", "description": "可选。本次任务正文(markdown)。给了就走 start 新建任务。"},
-                "task_title": {"type": "string", "description": "可选。本次任务标题。留空从 task 首行推断。"},
-                "lang": {"type": "string", "enum": ["zh", "en"], "description": "可选。文案语言：zh=中文(准本，默认)，en=英文压缩版(省 token)。"}
+                "task_title": {"type": "string", "description": "可选。本次任务标题。留空从 task 首行推断。"}
             }, "required": ["project_id"]}
         }
     ])
@@ -442,13 +441,7 @@ fn dispatch(store: &Store, name: &str, args: &Value) -> Value {
                     body_path: String::new(),
                 })
             };
-            // 文案语言：默认中文准本；MCP 调用方可传 "en" 换压缩英文版省 token。
-            let lang = args
-                .get("lang")
-                .and_then(|v| v.as_str())
-                .and_then(Lang::parse)
-                .unwrap_or_default();
-            agent_prompt(store, &pid, &name, draft.as_ref(), lang)
+            agent_prompt(store, &pid, &name, draft.as_ref())
         }
         _ => Err(format!("未知工具: {name}")),
     })();

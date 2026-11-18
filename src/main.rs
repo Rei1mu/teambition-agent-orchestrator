@@ -115,9 +115,6 @@ pub enum Cmd {
         /// 建完顺手：写 MCP 配置 + 当场领一条任务（陌生 agent 自举用）
         #[arg(long)]
         go: bool,
-        /// 开工文案语言：zh / en
-        #[arg(long, default_value = "zh")]
-        lang: String,
     },
     /// 列出项目的所有 skill 及本地开关
     Skills {
@@ -187,9 +184,6 @@ pub enum Cmd {
         /// 项目 id。省略则按 .tba/project 绑定解析
         #[arg(long)]
         project: Option<String>,
-        /// 文案语言：zh=中文(准本) / en=英文(省 token)
-        #[arg(long, default_value = "zh")]
-        lang: String,
         /// 不自动往当前目录补 AGENTS.md 入口
         #[arg(long)]
         no_entry: bool,
@@ -217,9 +211,6 @@ pub enum Cmd {
         /// 派子代理的项目 id，或建任务时指定项目 id（默认按 .tba/project 绑定解析）。
         #[arg(long)]
         project: Option<String>,
-        /// 文案语言：zh=中文(默认) / en=英文
-        #[arg(long, default_value = "zh")]
-        lang: String,
         /// 子代理标记（序号由主代理给，如 agent-21）。派活时写进 claim.note，
         /// 并把 Teambition 任务标题改成 `agent-21:原标题`（永久保留），简报标题同步带前缀。
         #[arg(long)]
@@ -282,6 +273,17 @@ pub enum Cmd {
         /// 由 agent 在当前对话框里问用户
         #[arg(long)]
         off: bool,
+    },
+    /// lead 单任务：开工建任务 / 汇报+提问（say 与 ask 同义）
+    Lead {
+        /// 动作：start 建任务 / report 汇报并提问（别名 say/ask）
+        action: String,
+        /// start 的主题（当前任务名，≤20字）或 report 的内容
+        #[arg(long)]
+        text: Option<String>,
+        /// 报表内容也从 stdin 读
+        #[arg(long)]
+        file: Option<String>,
     },
     /// 继续（只看一眼）：读回你在 Teambition 任务里的评论，状态改回「进行中」
     Reply { claim_id: String },
@@ -390,9 +392,6 @@ pub enum Cmd {
         /// 本次任务正文文件(markdown)。和 --task 同时给时，正文以文件为准
         #[arg(long)]
         task_file: Option<String>,
-        /// 文案语言：zh=中文(准本，默认) / en=英文(压缩版，省 token)
-        #[arg(long, default_value = "zh")]
-        lang: String,
         /// 只打印「项目接入文案」：让 agent 先扫仓库列出候选项目名、由用户拍板，再建项目。
         /// 不解析也不新建项目。--name 给了就固定用那个名字
         #[arg(long)]
@@ -553,9 +552,6 @@ pub enum Cmd {
         /// 一句话说明（写「什么时候用」；开工文案里一行一条给 agent 看）
         #[arg(long)]
         summary: Option<String>,
-        /// 英文说明（英文开工文案用；空着回落到 --summary）
-        #[arg(long = "summary-en")]
-        summary_en: Option<String>,
         /// 正文：文件路径，或 `-` 读 stdin。add 不给留空，edit 不给保留原文
         #[arg(long)]
         body: Option<String>,
