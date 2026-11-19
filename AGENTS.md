@@ -61,7 +61,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 > **主代理每次要用户确认/收尾，必须当场 `tba ask <claim> --done`（或 `-q`）发邮件，并明确告诉用户「去邮箱回 1」——用户不常看 DSH，不能只在聊天框说「回 1 收尾」而不发 ask。发完确认邮件确实发出（`已发邮件通知`），别让任务停在「进行中」空等。
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
-6. **主代理派子代理前先打 tag**：收到 `tba sub` 简报后，先跑 DSH 的 `list_agents` 看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。然后跑 `tba sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
+6. **主代理派子代理前先打 tag**：收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`，**只看本会话**已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；本会话第一个子代理 = agent-1。别跨会话、别参考别的项目/历史会话的序号（前缀混了会打错 tag）。然后跑 `tba sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。`lead:` 前缀是主代理自己的汇报/收尾任务（`tba lead start` 自动加，一条），不打 agent tag；别给子代理用 lead:、别给 lead 任务打 agent tag。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
 
 > **子代理槽位**：tba sub 派的子代理由 DSH 管理（跑完自动结算释放并发槽，可用 `send_message` 冷恢复继续；不同子代理模式见 DSH 文档）。并发上限（默认 8）在 DSH 侧配置，不属 tba；若真的撞满，重启 DSH 或换新会话即可释放，不需要改 tba 代码、也不要在 tba 里写 dispose 逻辑。
 
@@ -69,7 +69,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 看 `docs/流程图.md`。需要时再读，不要一开始就整份加载。
 
-<!-- tba:rules v0.2.58 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:rules v0.2.59 由 tba 自动生成，删掉不影响功能 -->
 ## 编码纪律
 
 五条，动手前过一遍。
@@ -83,74 +83,15 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 例外：错别字、一行小改这类琐碎活，别上完整流程。这五条是为了减少非琐碎工作的代价，不是拖慢简单任务。
 
 
-<!-- tba:ultracave v0.2.58 由 tba 自动生成，删掉不影响功能 -->
-## 默认回复风格：ultracave
+<!-- tba:ultracave v0.2.59 由 tba 自动生成，删掉不影响功能 -->
+## 默认回复风格：简洁
 
-本项目会话默认用 ultracave 风格回复。不依赖 caveman / ultracave 技能。下方为 ultracave 技能原文，尽量保留。
-
-中文回复。本项目默认即生效，无需命令开启；用户说 `stop caveman` 或 `normal mode` 即退回正常语气。
-
-# ultracave
-
-Respond terse like smart caveman. All technical substance stay. Only fluff die. Then cut again.
-
-Ultracave is caveman with the grammar stripped. Payload only.
-
-### Persistence
-
-Every response, whole session, until "stop caveman" or "normal mode". Unsure? Still on. `/caveman status` reports the mode and changes nothing: relay the hook's `Caveman mode: <mode>` value; with no hook, the mode you were in (or `off`) plus `(not tracked by this host)`.
-
-### Floor
-
-Never cut: code, commands, paths, API names, error strings (verbatim). not/never/no/only/except. Numbers and units. The user's language. One term per thing. No invented abbreviations, no arrows. Existing comments in files you edit: never delete or shorten unless asked.
-
-### Rules
-
-#### 1. Fragments
-
-Drop articles, copulas, connectives when order stays clear.
-
-Bad: "The component re-renders because an inline object prop creates a new reference each render."
-Good: "Inline object prop, new ref, re-render. `useMemo`."
-
-#### 2. One word when one word is enough
-
-Bad: "Yes, that should work, though you'll want a null check first."
-Good: "Yes. Null check first."
-
-#### 3. Each fact once
-
-No restating, no summary after a list. Code change: changed lines plus context, not the whole file.
-
-Good: "Pool reuses open DB connections. No per-request handshake."
-
-#### 4. Cut conjunctions only when order survives
-
-Bad: "Migrate table drop column backup first."
-Good: "Back up first. Then migrate: drops column."
-
-#### 5. Tool runs
-
-One line in, one line out. Nothing between calls unless direction changes, confirmation needed, or a security or irreversible step is ahead.
-
-#### 6. Never perform
-
-No prefix, no announcement, no mangled verbs for flavor. Fragment not shorter than the sentence? Use the sentence.
-
-### When to break the rules
-
-Plain prose, then resume: security warning. Irreversible action, confirm first. Any fragment with two readings. User confused. Question to the user, with its options. Anything persisted outside chat (code, comments, commits, docs, issues, PRs, tickets, memory, third-party messages; `/caveman-compress` exempt). Harness asks for a status line.
-
-### Pre-send check
-
-Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? Cut.
-
-### 跨设备 / 其他 agent
-
-本文件随 git 仓库同步，用本仓库的 WorkBuddy 自动生效。非本仓库的 agent：复制本 `## 默认回复风格：ultracave` 整节到其项目指令即可，无需安装技能。
+中文回复。短句优先，能一行说清不写一段。同一事实不重复；列表后不加总结。
+代码、命令、路径、API 名、报错原文、数字单位原样保留，不缩写成自造词。
+安全警告、不可逆操作、有两种读法的句子、给用户的选择题 → 用完整句。用户说 stop caveman / normal mode 即退回正常语气。
 
 
-<!-- tba:entry v0.2.58 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:entry v0.2.59 由 tba 自动生成，删掉不影响功能 -->
 ## 任务队列入口
 
 **工具**：`tba`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。直接执行，别搜 exe、别验证路径、别读 `.tba/`。
@@ -159,7 +100,7 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 
 **流转**：进行中 → `ask` 后 待回复 → 用户收尾 已解决。
 
-**lead 单任务**：每次开工先跑 `tba lead start "<当前任务名，≤20字>"` 建一条 lead: 任务（绑本次会话）；
+**lead 单任务**：每次开工先跑 `tba lead start "<当前任务名，≤20字>"` 建一条 lead: 任务（绑本次会话，一条，主代理自己的汇报/收尾）；
 所有汇报和提问合一条——用 `tba lead report "<汇报内容>"`（say / ask 是同义别名）写到这条 lead 任务，
 会发邮件等你回 1。工作全部做完后，在最后一次 report 里列清所有子任务状态；你回 1 收尾 lead 任务时，
 系统自动把同会话还在「待回复」的子代理任务收为「已解决」，把已断线的僵尸任务收为「已完成」。
@@ -171,7 +112,7 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 
 **主代理收尾/要拍板必须当场 `tba ask` 发邮件，明确告诉用户去邮箱回 1；不能只在聊天框说回 1 而不发 ask。发完确认邮件已发，别让任务停在进行中空等。**
 
-**派子代理先打 tag**：主代理收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。然后跑 `tba sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
+**派子代理先打 tag**：主代理收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`**只看本会话**已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如本会话已有 agent-1..24，则本次用 agent-25。本会话第一个子代理 = agent-1。别跨会话、别参考别的项目/历史会话的序号。原因（用户原话）：前缀混了会导致本会话序号从别的会话接着数、打错 tag。`agent-N:` 由 `tba sub <claim_id> --agent-tag agent-N` 写进 Teambition 标题与 claim.note，subagent 工具的实例名（name 参数）跟 tag 是两回事，不用管；前缀由 `agent_tagged_title` 加，支持覆盖 swap（打错可重打纠正）。`lead:` 是主代理自己的汇报/收尾任务，`lead start` 自动加，一条，不打 agent tag、不派子代理。别给 lead 任务打 agent tag，别给子代理任务用 lead: 前缀。然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
 
 **主代理不自己写、优先派子代理**：主代理（lead）以**省 token、省时间**为前提，动手活（改代码、改文件、查文件、调研、跑验证）**尽量不自己干**，合理拆给子代理：能由子代理独立完成的一律派子代理，只有需要本会话上下文的整合、收尾、拍板、`ask` 才自己来。派活仍按上面「派子代理先打 tag」规范执行。
 
@@ -184,6 +125,6 @@ Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? C
 
 **收到用户回复自己判断分派**：发出 `tba sub` 进监听后，用户可能在本会话或其他渠道回复；先 `tba reply <claim_id>` + `tba events --claim <claim_id>` 读回原话，再自己判断是「继续当前子代理任务」（`send_message` 转给现有子代理）还是「新任务派新子代理」（按上面打 tag 规范新起 agent-N）。别都当新任务，也别把新任务塞回旧子代理。
 
-**回复监听**：`ask` 写问题进备注 + 转「待回复」+ 发邮件后立即返回；监听由 **tba serve 的 WatchAggregator 统一托管**。邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。**自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。选项写纯文本，**主代理要用户拍板也走 `tba ask`：没有现成 claim 时直接 `tba ask -q "问题（纯文本选项，从 3 起编号）"`，tba 自动新建一条 task 并转「待回复」；有 claim 就 `tba ask <claim_id> -q "..."`。不直接在聊天框给选项、禁用 DSH 的 ask_user_question 选择框/弹窗、不用 MCP `tba ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧会话）。**查看回复**：执行中收到的回复用 `tba events --claim <claim_id>` 查看；不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 `ask`（会重复发信）。**会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。只有用户能 `done`/`close`，放弃用 `tba release`。
+**回复监听**：`ask` 写问题进备注 + 转「待回复」+ 发邮件后立即返回；监听由 **tba serve 的 WatchAggregator 统一托管**。邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。**自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。选项写纯文本，**主代理要用户拍板也走 `tba ask`：没有现成 claim 时直接 `tba ask -q "问题（纯文本选项，从 3 起编号）"`，tba 自动新建一条 task 并转「待回复」；有 claim 就 `tba ask <claim_id> -q "..."`。不直接在聊天框给选项、禁用 DSH 的 ask_user_question 选择框/弹窗、不用 MCP `tba ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧会话）。**查看回复**：执行中收到的回复用 `tba events --claim <claim_id>` 看分流卡（分类/字数/摘要），默认不读原文；要看原文才 `--full`。原因（用户原话）「主代理上下文不能太长，我怕他主代理先抽风或者出问题」。三层分流：① 纯数字收尾（closed/summarize）主代理自己做；② 实质需求（free/custom:N）转手子代理，原文由子代理读；③ 要拍板走 `tba ask -q`。正文永不主动进主代理上下文。不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 `ask`（会重复发信）。**会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。只有用户能 `done`/`close`，放弃用 `tba release`。
 
 **通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / `publish` 发版 / `shot` 截图。先 `tba --help`。

@@ -336,6 +336,9 @@ pub enum Cmd {
         /// 显示最近几条（默认 20）
         #[arg(long)]
         limit: Option<usize>,
+        /// 看原文（默认只出分流卡：分类/字数/摘要）
+        #[arg(long)]
+        full: bool,
     },
     /// 续命：刷新心跳。长构建/长测试前后调用，避免被判定会话断开
     Beat { claim_id: String },

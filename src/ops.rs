@@ -27,7 +27,7 @@ tba caps / tba shot / tba ui。\n\
 // 主进程环境、拿不到 DSH_SESSION_ID，必须靠这个文件，否则唤醒静默失效。
 // 文件不存在时回退读 env（直接由 agent shell 拉起的监听走这条）。
 // 两者都没有 = 非 DSH 唤起，桥无意义，静默跳过。
-pub fn write_wake_request(root: &std::path::Path, claim_id: &str, text: &str) {
+pub fn write_wake_request(root: &std::path::Path, claim_id: &str, raw: &str, action: &str) {
     let session_file = root.join("waits").join(format!("{claim_id}.session"));
     let from_file = std::fs::read_to_string(&session_file)
         .ok()
@@ -47,10 +47,18 @@ pub fn write_wake_request(root: &std::path::Path, claim_id: &str, text: &str) {
         eprintln!("wake: 创建 wakes 目录失败（{e}），跳过唤醒握手");
         return;
     }
+    // 插件读 payload.text 注入会话（index.js:118）。text 放摘要，原文挪 raw：
+    // 原因（用户原话）：主代理上下文不能太长，我怕他主代理先抽风或者出问题。
+    // 先把「（邮件回复）」标记剥掉再 strip，否则同行标记会把整行正文一起丢。
+    let cleaned = strip_reply_noise(&raw.replace("（邮件回复）", ""));
+    let summary = crate::events::summary(&cleaned, 120);
     let payload = serde_json::json!({
         "sessionId": session_id,
-        "text": text,
+        "text": summary,
+        "raw": raw,
         "ts": chrono::Local::now().to_rfc3339(),
+        "action": action,
+        "claimId": claim_id,
     });
     let tmp = dir.join(format!("{session_id}.{}.tmp", std::process::id()));
     let final_path = dir.join(format!("{session_id}.json"));
@@ -2874,6 +2882,16 @@ impl ReplyAction {
         }
     }
 
+    // 落盘/唤醒用的紧凑分类：closed / summarize / custom:N / free。
+    pub fn event_tag(&self) -> String {
+        match self {
+            ReplyAction::Closed => "closed".to_string(),
+            ReplyAction::Summarize => "summarize".to_string(),
+            ReplyAction::Custom(n) => format!("custom:{n}"),
+            ReplyAction::Free => "free".to_string(),
+        }
+    }
+
     // 对应的数字。Free 没有数字（用户没回数字 / 回了废弃的 0）。
     pub fn num(&self) -> Option<u32> {
         match self {
@@ -3331,12 +3349,14 @@ pub fn wait(
                         .collect();
                     for m in &mails {
                         // 先落盘：会话还没被唤起、监听被重启，原话也还在。
-                        crate::events::append(&store.root, claim_id, "mail", m);
+                        let tag = parse_reply(&format!("（邮件回复）\n\n{m}")).0.event_tag();
+                        crate::events::append(&store.root, claim_id, "mail", m, &tag);
                     }
                     // 收到邮件回信：无论待回复/执行中，都写唤醒握手文件，让 dsh-tba-bridge
                     // 注入会话立刻唤醒。收尾仍由 action==Closed 走 finish 决定，互不干扰。
                     if let Some(last) = mails.last() {
-                        write_wake_request(&store.root, claim_id, &format!("（邮件回复）\\n\\n{last}"));
+                        let tag = parse_reply(&format!("（邮件回复）\n\n{last}")).0.event_tag();
+                        write_wake_request(&store.root, claim_id, &format!("（邮件回复）\\n\\n{last}"), &tag);
                     }
                     if has_ask && !mails.is_empty() {
                         // ① 留痕：用户还是能在 Teambition 动态里看到自己回过什么。
@@ -3398,7 +3418,8 @@ pub fn wait(
                         }
                         // 收到邮件回信：写唤醒握手，让 dsh-tba-bridge 注入会话。
                         if let Some(last) = mails.last() {
-                            write_wake_request(&store.root, claim_id, &format!("（邮件回复）\n\n{last}"));
+                            let tag = parse_reply(&format!("（邮件回复）\n\n{last}")).0.event_tag();
+                            write_wake_request(&store.root, claim_id, &format!("（邮件回复）\n\n{last}"), &tag);
                         }
                     }
                 }
@@ -3440,13 +3461,15 @@ pub fn wait(
                 .last()
                 .map(|c| c.text.clone())
                 .unwrap_or_default();
-            write_wake_request(&store.root, claim_id, &last_text);
+            let tag = parse_reply(&last_text).0.event_tag();
+            write_wake_request(&store.root, claim_id, &last_text, &tag);
         }
         if !fresh.is_empty() && !has_ask {
             // 执行中态：不 resume、不改状态、不碰看板列，只记录 + 退出唤醒会话。
             // 状态流转仍由 agent 看完原话后自己决定，避免跟它手上的活打架。
             for c in &fresh {
-                crate::events::append(&store.root, claim_id, "comment", &c.text);
+                let tag = parse_reply(&c.text).0.event_tag();
+                crate::events::append(&store.root, claim_id, "comment", &c.text, &tag);
                 noted.push(c.text.clone());
             }
         } else if !fresh.is_empty() {
@@ -4656,7 +4679,8 @@ fn workflow_text_zh(
 
     // 第 4 步：做完必须交回用户。ask 立即返回，回复由聚合器握手唤醒会话。
     // 调用姿势单独抽出来，两个分支共用，免得只改一处、文案分叉。
-    let ask_posture = "**ask 调用姿势（tba serve 聚合器统一托管）**：`tba ask <claim_id> --done` 写备注+待回复+发信后立即返回；回复监听由 tba serve 聚合器统一托管，邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 注入会话、立刻唤醒。不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 ask（重复发信）。查看执行中收到的回复用 `tba events --claim <claim_id>`；会话窗直接回话要先把任务推回「进行中」再干活：`tba reply <claim_id>`。只有回复 1 才收尾（聚合器 finish）；不许 agent 自己 done/close。**主代理要用户确认/收尾必须当场 `{exe} ask` 发邮件并明确告诉用户去邮箱回 1——用户不常看 DSH，不能只在聊天框说「回 1」而不发 ask；发完确认「已发邮件通知」，别让任务停在进行中空等。**";
+    let ask_posture = "**ask 调用姿势（tba serve 聚合器统一托管）**：`tba ask <claim_id> --done` 写备注+待回复+发信后立即返回；回复监听由 tba serve 聚合器统一托管，邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 注入会话、立刻唤醒。不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 ask（重复发信）。查看执行中收到的回复用 `tba events --claim <claim_id>`；会话窗直接回话要先把任务推回「进行中」再干活：`tba reply <claim_id>`。只有回复 1 才收尾（聚合器 finish）；不许 agent 自己 done/close。**主代理要用户确认/收尾必须当场 `{exe} ask` 发邮件并明确告诉用户去邮箱回 1——用户不常看 DSH，不能只在聊天框说「回 1」而不发 ask；发完确认「已发邮件通知」，别让任务停在进行中空等。**
+**回复处理（主代理上下文减负）**：原因——用户原话「主代理上下文不能太长，我怕他主代理先抽风或者出问题」。主代理处理回复 = 读 `tba events` 分流卡 → 判层 → 落动作，**默认不读原文**；要看原文才 `tba events --full`。三层分流：① 纯数字收尾（closed/summarize）主代理自己做；② 实质需求（free/custom:N）转手子代理，原文由子代理读；③ 要拍板走 `{exe} ask -q`。正文永不主动进主代理上下文。";
     if memory_on {
         s.push_str(&format!(
             "4. 做完必须交回用户，两步不许省：①`{exe} note <claim_id> --text \"改了什么/怎么验\"`；②`{exe} ask <claim_id> --done`（1=已解决/2=先写记忆/3+=有问题，自定义选项从 3 起编号；转「{0}」+列「{1}」+发邮件，**后台常驻等回复，agent 本轮回复可正常结束**）。ask exit 0=收到回复 / exit 3=用户已收尾；常驻模式不会超时，只有 `--once` 才可能 exit 2（用 `{exe} wait <claim_id>` 续等，别重跑 ask 会重发信）（「{2}」「{3}」或列「{4}」「{5}」），停。**不许停在进行中**。有坑就 `{exe} memory --project {project_id} --append \"...\"`。不许自己跑 `{exe} done`/`{exe} close` —— 只有用户能收尾（明确要求才 `{exe} done <claim_id>` / `{exe} close <claim_id>`）。放弃用 `{exe} release <claim_id>`。无心跳 {t} 分钟 → 自动退回「{6}」+列「{7}」；「{0}」永不超时。多会话先 `{exe} hello --name <名字>`。{ask_posture}\n",
@@ -5199,16 +5223,23 @@ fn strip_marker_block_to_next_tba(s: &str, mark: &str) -> String {
 // 找不到 mark 删不掉。必须在删完带标记真块之后调用，那时剩下的全是残留。
 // 只认行首标题，避免命中正文里反引号中的同名引用。
 fn strip_unmarked_ultracave(s: &str) -> String {
-    const HEAD: &str = "## 默认回复风格：ultracave";
+    // 旧标题 + 新标题都要认，历史残留是旧块的正文。
+    const HEADS: [&str; 2] = ["## 默认回复风格：ultracave", "## 默认回复风格：简洁"];
     // 行首标题位置（含开头），从后往前删，避免删除影响前面的下标。
-    let heads: Vec<usize> = s
-        .match_indices(HEAD)
-        .filter(|(p, _)| *p == 0 || s[..*p].ends_with('\n'))
-        .map(|(p, _)| p)
-        .collect();
+    let mut heads: Vec<(usize, usize)> = Vec::new();
+    for head in HEADS {
+        heads.extend(
+            s.match_indices(head)
+                .filter(|(p, _)| *p == 0 || s[..*p].ends_with('\n'))
+                .map(|(p, _)| (p, head.len())),
+        );
+    }
+    heads.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
+    // 同一位置只会被一个标题命中，但保险起见去重。
+    heads.dedup_by_key(|(p, _)| *p);
     let mut out = s.to_string();
-    for &pos in heads.iter().rev() {
-        let after = pos + HEAD.len();
+    for &(pos, len) in &heads {
+        let after = pos + len;
         let rest = &out[after..];
         let end_rel = rest
             .find("\n## ")
@@ -5221,40 +5252,12 @@ fn strip_unmarked_ultracave(s: &str) -> String {
 }
 
 const ULTRACAVE_MARK: &str = "<!-- tba:ultracave";
-const ULTRACAVE_BODY: &str = "## 默认回复风格：ultracave\n\n\
-本项目会话默认用 ultracave 风格回复。不依赖 caveman / ultracave 技能。下方为 ultracave 技能原文，尽量保留。\n\n\
-中文回复。本项目默认即生效，无需命令开启；用户说 `stop caveman` 或 `normal mode` 即退回正常语气。\n\n\
-# ultracave\n\n\
-Respond terse like smart caveman. All technical substance stay. Only fluff die. Then cut again.\n\n\
-Ultracave is caveman with the grammar stripped. Payload only.\n\n\
-### Persistence\n\n\
-Every response, whole session, until \"stop caveman\" or \"normal mode\". Unsure? Still on. `/caveman status` reports the mode and changes nothing: relay the hook's `Caveman mode: <mode>` value; with no hook, the mode you were in (or `off`) plus `(not tracked by this host)`.\n\n\
-### Floor\n\n\
-Never cut: code, commands, paths, API names, error strings (verbatim). not/never/no/only/except. Numbers and units. The user's language. One term per thing. No invented abbreviations, no arrows. Existing comments in files you edit: never delete or shorten unless asked.\n\n\
-### Rules\n\n\
-#### 1. Fragments\n\n\
-Drop articles, copulas, connectives when order stays clear.\n\n\
-Bad: \"The component re-renders because an inline object prop creates a new reference each render.\"\n\
-Good: \"Inline object prop, new ref, re-render. `useMemo`.\"\n\n\
-#### 2. One word when one word is enough\n\n\
-Bad: \"Yes, that should work, though you'll want a null check first.\"\n\
-Good: \"Yes. Null check first.\"\n\n\
-#### 3. Each fact once\n\n\
-No restating, no summary after a list. Code change: changed lines plus context, not the whole file.\n\n\
-Good: \"Pool reuses open DB connections. No per-request handshake.\"\n\n\
-#### 4. Cut conjunctions only when order survives\n\n\
-Bad: \"Migrate table drop column backup first.\"\n\
-Good: \"Back up first. Then migrate: drops column.\"\n\n\
-#### 5. Tool runs\n\n\
-One line in, one line out. Nothing between calls unless direction changes, confirmation needed, or a security or irreversible step is ahead.\n\n\
-#### 6. Never perform\n\n\
-No prefix, no announcement, no mangled verbs for flavor. Fragment not shorter than the sentence? Use the sentence.\n\n\
-### When to break the rules\n\n\
-Plain prose, then resume: security warning. Irreversible action, confirm first. Any fragment with two readings. User confused. Question to the user, with its options. Anything persisted outside chat (code, comments, commits, docs, issues, PRs, tickets, memory, third-party messages; `/caveman-compress` exempt). Harness asks for a status line.\n\n\
-### Pre-send check\n\n\
-Two readings? Full sentence. Negations present? Payload verbatim? Flavor word? Cut.\n\n\
-### 跨设备 / 其他 agent\n\n\
-本文件随 git 仓库同步，用本仓库的 WorkBuddy 自动生效。非本仓库的 agent：复制本 `## 默认回复风格：ultracave` 整节到其项目指令即可，无需安装技能。\n";
+// 极简版。原因（用户原话）：主代理上下文不能太长，我怕他主代理先抽风或者出问题。
+// 2588 字符的旧块占常驻上下文 27%；模型本就不稳定遵守，砍到 ~150 字。
+const ULTRACAVE_BODY: &str = "## 默认回复风格：简洁\n\n\
+中文回复。短句优先，能一行说清不写一段。同一事实不重复；列表后不加总结。\n\
+代码、命令、路径、API 名、报错原文、数字单位原样保留，不缩写成自造词。\n\
+安全警告、不可逆操作、有两种读法的句子、给用户的选择题 → 用完整句。用户说 stop caveman / normal mode 即退回正常语气。\n";
 
 // 带标记 + 版本行的 ultracave 块。版本塞进标记行（见 ENTRY_VERSION 注释）。
 fn ultracave_block() -> String {
@@ -5283,7 +5286,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          项目链接原样转给用户。已给 `--name` / `--project` 时 tba 自动建好并开工，不用再问。\
          退出码：0+claim_id=干活；0+EMPTY=队列空。别自建任务。\n\n\
          **流转**：进行中 → `ask` 后 待回复 → 用户收尾 已解决。\n\n\
-         **lead 单任务**：每次开工先跑 `{exe} lead start \"<当前任务名，≤20字>\"` 建一条 lead: 任务（绑本次会话）；\n\
+         **lead 单任务**：每次开工先跑 `{exe} lead start \"<当前任务名，≤20字>\"` 建一条 lead: 任务（绑本次会话，一条，主代理自己的汇报/收尾）；\n\
          所有汇报和提问合一条——用 `{exe} lead report \"<汇报内容>\"`（say / ask 是同义别名）写到这条 lead 任务，\n\
          会发邮件等你回 1。工作全部做完后，在最后一次 report 里列清所有子任务状态；你回 1 收尾 lead 任务时，\n\
          系统自动把同会话还在「待回复」的子代理任务收为「已解决」，把已断线的僵尸任务收为「已完成」。\n\
@@ -5293,9 +5296,13 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          ② `{exe} ask <claim_id> --done`\n\n\
          **主代理收尾/要拍板必须当场 `tba ask` 发邮件，明确告诉用户去邮箱回 1；不能只在聊天框说回 1 而不发 ask。发完确认邮件已发，别让任务停在进行中空等。**\n\n\
          **派子代理先打 tag**：主代理收到 `{exe} sub` 简报后，先跑 DSH 的 `list_agents`\
-          看当前已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；\
-          例如列表已有 agent-1..24，则本次用 agent-25。不要从 agent-1 重新开始。\
-          然后跑 `{exe} sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；\
+          **只看本会话**已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；\
+          例如本会话已有 agent-1..24，则本次用 agent-25。本会话第一个子代理 = agent-1。\
+          别跨会话、别参考别的项目/历史会话的序号。原因（用户原话）：前缀混了会导致本会话序号从别的会话接着数、打错 tag。\
+          `agent-N:` 由 `{exe} sub <claim_id> --agent-tag agent-N` 写进 Teambition 标题与 claim.note，\
+          subagent 工具的实例名（name 参数）跟 tag 是两回事，不用管；前缀由 `agent_tagged_title` 加，支持覆盖 swap（打错可重打纠正）。\
+          `lead:` 是主代理自己的汇报/收尾任务，`lead start` 自动加，一条，不打 agent tag、不派子代理。\
+          别给 lead 任务打 agent tag，别给子代理任务用 lead: 前缀。\
           然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `{exe} sub` 继续监听。\n\n\
           **主代理不自己写、优先派子代理**：主代理（lead）以**省 token、省时间**为前提，\
           动手活（改代码、改文件、查文件、调研、跑验证）**尽量不自己干**，合理拆给子代理：\
@@ -5313,7 +5320,10 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
           **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，\
           拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。选项写纯文本，\
           **主代理要用户拍板也走 `{exe} ask`：没有现成 claim 时直接 `{exe} ask -q \"问题（纯文本选项，从 3 起编号）\"`，tba 自动新建一条 task 并转「待回复」；有 claim 就 `{exe} ask <claim_id> -q \"...\"`。不直接在聊天框给选项、禁用 DSH 的 ask_user_question 选择框/弹窗、不用 MCP `{exe} ask_user`**（serve 拿不到 DSH_SESSION_ID，可能唤醒旧会话）。\
-          **查看回复**：执行中收到的回复用 `{exe} events --claim <claim_id>` 查看；不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 `ask`（会重复发信）。\
+          **查看回复**：执行中收到的回复用 `{exe} events --claim <claim_id>` 看分流卡（分类/字数/摘要），默认不读原文；要看原文才 `--full`。\
+          原因（用户原话）「主代理上下文不能太长，我怕他主代理先抽风或者出问题」。\
+          三层分流：① 纯数字收尾（closed/summarize）主代理自己做；② 实质需求（free/custom:N）转手子代理，原文由子代理读；③ 要拍板走 `{exe} ask -q`。正文永不主动进主代理上下文。\
+          不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 `ask`（会重复发信）。\
           **会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、\
           看不到它，所以先跑 `{exe} reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。\
           只有用户能 `done`/`close`，放弃用 `{exe} release`。\n\n\
@@ -6274,10 +6284,9 @@ mod tests {
 
         assert!(refresh_agents_at(&dir, "tba", false).is_some(), "脏文件该重写");
         let out = std::fs::read_to_string(&clean).unwrap();
-        // 正文里还有一句「复制本 `## 默认回复风格：ultracave` 整节」也是同名串，
-        // 只数行首标题才是真正的块数。
+        // 只数行首标题才是真正的块数（极简块内已无同名引用，但保留按行首计）。
         let head_count = out
-            .match_indices("## 默认回复风格：ultracave")
+            .match_indices("## 默认回复风格：简洁")
             .filter(|(p, _)| *p == 0 || out[..*p].ends_with('\n'))
             .count();
         assert_eq!(head_count, 1, "refresh 后 ultracave 块该只剩一份: {out}");
@@ -6496,8 +6505,12 @@ mod tests {
         assert!(t.contains("list_agents"), "缺 list_agents 查当前子代理列表: {t}");
         assert!(t.contains("最大序号 +1"), "缺最大序号 +1 规则: {t}");
         assert!(
-            t.contains("不要从 agent-1 重新开始"),
-            "缺不从 agent-1 重来: {t}"
+            t.contains("只看本会话"),
+            "缺只看本会话边界: {t}"
+        );
+        assert!(
+            t.contains("本会话第一个子代理 = agent-1"),
+            "缺本会话首个 agent-1 规则: {t}"
         );
         assert!(
             !t.contains("如 agent-1 / agent-2") && !t.contains("agent-1, agent-2, ..."),
@@ -6544,7 +6557,8 @@ mod tests {
         let e = std::fs::read_to_string(&p).unwrap();
         assert!(e.contains("list_agents"), "入口缺 list_agents: {e}");
         assert!(e.contains("最大序号 +1"), "入口缺最大序号 +1: {e}");
-        assert!(e.contains("不要从 agent-1 重新开始"), "入口缺不从 agent-1 重来: {e}");
+        assert!(e.contains("只看本会话"), "入口缺只看本会话边界: {e}");
+        assert!(e.contains("本会话第一个子代理 = agent-1"), "入口缺本会话首个 agent-1 规则: {e}");
         assert!(!e.contains("如 agent-1 / agent-2"), "入口仍有误导性示例: {e}");
     }
 
@@ -6594,7 +6608,8 @@ mod tests {
         assert!(s.contains("tba sub <claim_id> --agent-tag agent-N"), "入口缺打 tag 规范: {s}");
         assert!(s.contains("list_agents"), "入口缺 list_agents 序号规则: {s}");
         assert!(s.contains("最大序号 +1"), "入口缺最大序号 +1: {s}");
-        assert!(s.contains("不要从 agent-1 重新开始"), "入口缺不从 agent-1 重来: {s}");
+        assert!(s.contains("只看本会话"), "入口缺只看本会话边界: {s}");
+        assert!(s.contains("本会话第一个子代理 = agent-1"), "入口缺本会话首个 agent-1 规则: {s}");
         assert!(!s.contains("如 agent-1 / agent-2"), "入口仍有误导性递增示例: {s}");
 
         // 造一份「其它版本条件都在、只有 --agent-tag 但缺新序号规则」的老入口。
@@ -6614,7 +6629,8 @@ mod tests {
         assert!(s.contains("tba sub <claim_id> --agent-tag agent-N"), "重写后仍缺打 tag 规范: {s}");
         assert!(s.contains("list_agents"), "重写后缺 list_agents 序号规则: {s}");
         assert!(s.contains("最大序号 +1"), "重写后缺最大序号 +1: {s}");
-        assert!(s.contains("不要从 agent-1 重新开始"), "重写后缺不从 agent-1 重来: {s}");
+        assert!(s.contains("只看本会话"), "重写后缺只看本会话边界: {s}");
+        assert!(s.contains("本会话第一个子代理 = agent-1"), "重写后缺本会话首个 agent-1 规则: {s}");
         assert_eq!(s.matches(ENTRY_MARK).count(), 1, "重写不能重复追加入口块");
         assert!(s.contains("# 用户说明"), "用户自己的内容不能丢");
         assert!(ensure_entry_at(&dir, "tba").is_none(), "已是新版就不该反复重写");
@@ -6882,7 +6898,7 @@ mod tests {
         let prev_sid = std::env::var("DSH_SESSION_ID").ok();
         std::env::remove_var("DSH_SESSION_ID");
 
-        write_wake_request(&root, "clm-x", "hi");
+        write_wake_request(&root, "clm-x", "hi", "free");
         let wake = root.join("wakes").join("session-from-file.json");
         let got = std::fs::read_to_string(&wake).unwrap();
         assert!(
@@ -6893,7 +6909,7 @@ mod tests {
         // 文件也没、env 也没：不该写任何 wake 文件
         let root2 = tmp.join("data2");
         let _ = std::fs::create_dir_all(&root2);
-        write_wake_request(&root2, "clm-y", "hi");
+        write_wake_request(&root2, "clm-y", "hi", "free");
         assert!(
             !root2.join("wakes").exists(),
             "既无 env 又无 .session 文件时不应写 wake"
@@ -6904,5 +6920,31 @@ mod tests {
         if let Some(v) = prev_sid {
             std::env::set_var("DSH_SESSION_ID", v);
         }
+    }
+
+    // wake payload：text=摘要（插件注入这个），raw=原文，另带 action/claimId。
+    #[test]
+    fn wake_payload_has_summary_raw_action_and_claim() {
+        let tmp = std::env::temp_dir().join(format!("tba-wake-payload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("data");
+        let waits = root.join("waits");
+        std::fs::create_dir_all(&waits).unwrap();
+        std::fs::write(waits.join("clm-p.session"), "sess-p").unwrap();
+
+        let raw = "（邮件回复）\n\n离线模式是什么情况？不需要离线模式啊，我这边自动同步全靠它。\n第二行不该进摘要";
+        write_wake_request(&root, "clm-p", raw, "free");
+        let got = std::fs::read_to_string(root.join("wakes").join("sess-p.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+
+        assert_eq!(v["sessionId"], "sess-p");
+        assert_eq!(v["claimId"], "clm-p");
+        assert_eq!(v["action"], "free");
+        assert_eq!(v["raw"], raw);
+        let summary = v["text"].as_str().unwrap();
+        assert!(summary.contains("离线模式是什么情况"), "text 应是摘要: {summary}");
+        assert!(!summary.contains("第二行"), "摘要只取首行: {summary}");
+        assert!(summary.len() <= 130, "摘要封顶 ~120 字 + 省略号: {summary}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

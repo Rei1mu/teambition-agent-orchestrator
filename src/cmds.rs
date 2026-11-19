@@ -2023,7 +2023,7 @@ pub fn run() -> Result<(), String> {
                 // 监听由 tba serve 的 WatchAggregator 统一托管，wait 不再 spawn 独立进程。
             }
         }
-        Cmd::Events { claim, limit } => {
+        Cmd::Events { claim, limit, full } => {
             let rows = crate::events::recent(
                 &store.root,
                 limit.unwrap_or(20),
@@ -2031,11 +2031,28 @@ pub fn run() -> Result<(), String> {
             );
             if rows.is_empty() {
                 println!("还没有记录到执行中收到的回复。");
-            } else {
+            } else if full {
                 for e in &rows {
                     println!("[{}] {} 来源={}\n  {}", &e.ts, &e.claim_id, &e.source, &e.text);
                 }
                 println!("\n共 {} 条。`tba events` 只列出，不改任务状态。", rows.len());
+            } else {
+                for e in &rows {
+                    let hhmm = e.ts.get(11..16).unwrap_or(&e.ts);
+                    let tag = if e.action.is_empty() { "free" } else { &e.action };
+                    let mark = if e.handled { " [handled]" } else { "" };
+                    println!(
+                        "[{}] {} {} [{}] {}字{} \"{}\"",
+                        hhmm,
+                        e.claim_id,
+                        e.source,
+                        tag,
+                        if e.len == 0 { e.text.chars().count() } else { e.len },
+                        mark,
+                        crate::events::summary(&e.text, 40)
+                    );
+                }
+                println!("\n共 {} 条。默认只出分流卡；`tba events --full 看原文`。不改任务状态。", rows.len());
             }
         }
         Cmd::Beat { claim_id } => {

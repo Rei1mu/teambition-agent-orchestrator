@@ -230,8 +230,8 @@ fn project_name(projects: &[(String, String)], id: &str) -> String {
 }
 
 fn notify(store: &Store, claim_id: &str, text: &str) {
-    events::append(&store.root, claim_id, "addtask", text);
-    write_wake_request(&store.root, claim_id, text);
+    events::append(&store.root, claim_id, "addtask", text, "free");
+    write_wake_request(&store.root, claim_id, text, "free");
 }
 
 // 邮件回信经 clean_reply 后正文不带 marker；唤醒文案仍保留「邮件回复」标记，
@@ -446,11 +446,13 @@ fn handle_message(store: &Store, claim: &Claim, text: &str, source: &str) {
         return;
     }
     let wake = wake_text(source, text);
-    events::append(&store.root, &claim.claim_id, source, text);
-    write_wake_request(&store.root, &claim.claim_id, &wake);
     // parse_reply 要的是干净原文。wake 前缀「（邮件回复）」与正文同一行，
     // strip_reply_noise 会把整行当标记丢弃，导致「1」解析成空、不收尾。
-    // 唤醒用 wake（给人看），动作判定用干净 text。
+    // 唤醒/落盘用 wake（给人看），动作判定和分类用干净 text。
+    let (action, _body) = parse_reply(text);
+    let tag = action.event_tag();
+    events::append(&store.root, &claim.claim_id, source, text, &tag);
+    write_wake_request(&store.root, &claim.claim_id, &wake, &tag);
     dispatch_reply(store, &claim.claim_id, text, source);
 }
 
