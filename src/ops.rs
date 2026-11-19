@@ -2461,8 +2461,9 @@ pub fn lead_report(store: &Store, content: &str) -> Result<Claim, String> {
 }
 
 // 回 1 收尾 lead task 时联动：把同会话（claim.agent 相同）的其他活动 claim 一起收尾。
-//   waiting            -> finish 到 STAGE_DONE（等用户回 1 的子代理任务）
-//   running / claimed  -> 心跳老化（僵尸）-> finish 到 STAGE_CLOSED
+//   waiting            -> finish 到 STAGE_DONE（已解决）
+//   running / claimed  -> 心跳新鲜 -> finish 到 STAGE_DONE（已解决，正常执行中的子任务）
+//                         心跳老化（僵尸）-> finish 到 STAGE_CLOSED（已完成）
 // 僵尸只看 claim 自己的 heartbeat：子代理 claim.agent 是主会话名，没有独立
 // session 心跳文件，用 session_age 豁免会把 lead 活着时的僵尸全都漏掉。
 // 动作是 finish 而不是 sweep 的 revert。lead claim 自己不入列，由 aggregator 正常 finish。单个 finish 失败只记错误继续。
@@ -2482,12 +2483,14 @@ pub fn lead_finalize_peers(store: &Store, lead_claim_id: &str) -> Result<Vec<Str
             (STAGE_DONE, "已解决")
         } else if c.is_running() {
             // 子代理的 claim.agent 就是主会话名，没有自己的 session 心跳文件；
-            // session_age 只代表 lead 会话，lead 活着时永远新鲜。所以僵尸只看
-            // claim 自己的心跳：由子代理调 tba beat 刷新，子代理会话一断就老化。
+            // 只看 claim 自己的心跳：由子代理调 tba beat 刷新，子代理会话一断就老化。
+            // 心跳新鲜 = 正常执行中，lead 回 1 了就一起收为「已解决」；
+            // 心跳老化 = 断线的僵尸，收为「已完成」。
             if crate::store::age_secs(c.heartbeat()) <= timeout {
-                continue;
+                (STAGE_DONE, "已解决")
+            } else {
+                (STAGE_CLOSED, "已完成")
             }
-            (STAGE_CLOSED, "已完成")
         } else {
             continue;
         };
@@ -5289,16 +5292,17 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **lead 单任务**：每次开工先跑 `{exe} lead start \"<当前任务名，≤20字>\"` 建一条 lead: 任务（绑本次会话，一条，主代理自己的汇报/收尾）；\n\
          所有汇报和提问合一条——用 `{exe} lead report \"<汇报内容>\"`（say / ask 是同义别名）写到这条 lead 任务，\n\
          会发邮件等你回 1。工作全部做完后，在最后一次 report 里列清所有子任务状态；你回 1 收尾 lead 任务时，\n\
-         系统自动把同会话还在「待回复」的子代理任务收为「已解决」，把已断线的僵尸任务收为「已完成」。\n\
+         系统自动把同会话还在「执行中」「待回复」的子代理任务收为「已解决」，把已断线的僵尸任务收为「已完成」。\n\
          不再用 start/start_task 自建多个内部任务，也不自己 done/close。\n\n\
          **交回**：做完两步，不许省：\n\
          ① `{exe} note <claim_id> --text \"改了什么/怎么验\"`\n\
          ② `{exe} ask <claim_id> --done`\n\n\
          **主代理收尾/要拍板必须当场 `tba ask` 发邮件，明确告诉用户去邮箱回 1；不能只在聊天框说回 1 而不发 ask。发完确认邮件已发，别让任务停在进行中空等。**\n\n\
          **派子代理先打 tag**：主代理收到 `{exe} sub` 简报后，先跑 DSH 的 `list_agents`\
-          **只看本会话**已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；\
-          例如本会话已有 agent-1..24，则本次用 agent-25。本会话第一个子代理 = agent-1。\
-          别跨会话、别参考别的项目/历史会话的序号。原因（用户原话）：前缀混了会导致本会话序号从别的会话接着数、打错 tag。\
+          **只看本会话**已有 agent-N（含 inactive 历史）。agent-N **按任务号分配，不按子代理实例数**：\
+          N = 本会话已分过号的任务数 + 1；同一个任务重开（失败/断线/换实例接手）复用原 agent-N，不占新号；\
+          send_message 冷恢复原实例号不变；只有全新任务才递增。本会话第一个任务 = agent-1。\
+          别跨会话、别参考别的项目/历史会话的任务。原因（用户原话）：前缀混了会导致本会话序号从别的会话接着数、打错 tag。\
           `agent-N:` 由 `{exe} sub <claim_id> --agent-tag agent-N` 写进 Teambition 标题与 claim.note，\
           subagent 工具的实例名（name 参数）跟 tag 是两回事，不用管；前缀由 `agent_tagged_title` 加，支持覆盖 swap（打错可重打纠正）。\
           `lead:` 是主代理自己的汇报/收尾任务，`lead start` 自动加，一条，不打 agent tag、不派子代理。\
@@ -5868,6 +5872,147 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         Store { root }
+    }
+
+    // lead_finalize_peers 会走 finish -> Ctx::new（要 token + MCP）。用一个本地
+    // 极简 JSON-RPC stub 顶住：initialize / tools/list 给几个必要工具，tools/call
+    // 一律回成功。这样测的是真函数，不是重写的判定逻辑。
+    fn test_mcp_stub(store: &Store) -> std::net::TcpListener {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let mut cfg = store.load_config();
+        cfg.mcp_url = url;
+        cfg.access_token = Some("test".into());
+        cfg.offline = false;
+        store.save_config(&cfg).unwrap();
+        // 工具名用真实 MCP 的规范名，直接写进 tool_overrides 固定住角色，
+        // 不依赖自动识别规则（规则会随版本变，测试不该跟着晃）。
+        let mut cfg2 = store.load_config();
+        for (role, tool) in [
+            ("get_project", "project_get"),
+            ("list_taskflows", "taskflow_list"),
+            ("list_stages", "taskflowstatus_list"),
+            ("create_stage", "taskflowstatus_create"),
+            ("move_task", "task_update_stage"),
+            ("list_tasks", "task_query"),
+            ("get_task", "task_get"),
+        ] {
+            cfg2.tool_overrides
+                .insert(role.into(), tool.into());
+        }
+        store.save_config(&cfg2).unwrap();
+        let tools = serde_json::json!([
+            {"name":"project_get","description":"get project","inputSchema":{"type":"object","properties":{}}},
+            {"name":"taskflow_list","description":"list taskflows","inputSchema":{"type":"object","properties":{}}},
+            {"name":"taskflowstatus_list","description":"list task stages","inputSchema":{"type":"object","properties":{}}},
+            {"name":"taskflowstatus_create","description":"create task stage","inputSchema":{"type":"object","properties":{}}},
+            {"name":"task_query","description":"query task","inputSchema":{"type":"object","properties":{}}},
+            {"name":"task_get","description":"get task","inputSchema":{"type":"object","properties":{}}},
+            {"name":"task_update_stage","description":"move task stage","inputSchema":{"type":"object","properties":{}}}
+        ]);
+        let listener2 = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener2.incoming() {
+                let Ok(mut s) = stream else { break };
+                // 按 Content-Length 读完整请求体（一次 read 可能只读到半截）。
+                let mut raw: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 4096];
+                let (head_end, body_len) = loop {
+                    let n = match s.read(&mut buf) { Ok(0) | Err(_) => break (0, 0), Ok(n) => n };
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..pos]);
+                        let len = head.lines()
+                            .find_map(|l| l.strip_prefix("Content-Length:").or_else(|| l.strip_prefix("content-length:")))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if raw.len() >= pos + 4 + len { break (pos + 4, len); }
+                    }
+                };
+                if head_end == 0 { continue; }
+                let req: serde_json::Value =
+                    serde_json::from_slice(&raw[head_end..head_end + body_len]).unwrap_or(serde_json::Value::Null);
+                let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let result = match method {
+                    "initialize" => serde_json::json!({"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}),
+                    "tools/list" => serde_json::json!({"tools": tools}),
+                    "tools/call" => {
+                        let name = req.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("");
+                        let payload = match name {
+                            "project_get" => serde_json::json!({"id":"p-test","taskflowId":"tf-test"}),
+                            "taskflowstatus_list" => serde_json::json!([
+                                {"id":"s-todo","name":"未完成","kind":"start"},
+                                {"id":"s-doing","name":"进行中","kind":"unset"},
+                                {"id":"s-wait","name":"待回复","kind":"unset"},
+                                {"id":"s-done","name":"已解决","kind":"end"},
+                                {"id":"s-closed","name":"已完成","kind":"end"}
+                            ]),
+                            _ => serde_json::json!({}),
+                        };
+                        serde_json::json!({"content":[{"type":"text","text":payload.to_string()}]})
+                    }
+                    _ => serde_json::json!({}),
+                };
+                let res = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}).to_string();
+                let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", res.len(), res).as_bytes());
+            }
+        });
+        listener
+    }
+
+    // 造一条 lead / 子代理 claim。state 用 running（含心跳时间）、waiting；
+    // agent 相同视为同会话，不同视为别的会话。
+    fn peer_claim(id: &str, name: &str, state: &str, agent: &str, hb: &str) -> Claim {
+        Claim {
+            claim_id: id.into(),
+            task_id: format!("task-{id}"),
+            task_name: name.into(),
+            project_id: "p-test".into(),
+            stage_from: STAGE_DOING.into(),
+            stage_to: STAGE_DOING.into(),
+            agent: agent.into(),
+            cwd: ".".into(),
+            state: state.into(),
+            created_at: hb.into(),
+            updated_at: hb.into(),
+            note: String::new(),
+            last_note: String::new(),
+            heartbeat_at: hb.into(),
+            tasklist_from: "2".into(),
+            ask_at: String::new(),
+            question: String::new(),
+        }
+    }
+
+    #[test]
+    fn lead_finalize_peers_closes_all_kinds_and_spares_others() {
+        let store = tmp_store("lead-finalize-peers");
+        let _stub = test_mcp_stub(&store);
+        let now = chrono::Local::now().to_rfc3339();
+        let old = (chrono::Local::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let a = "s-lead";
+        store.append_claim(&peer_claim("clm-lead", "lead:收尾", "waiting", a, &now)).unwrap();
+        store.append_claim(&peer_claim("clm-run", "执行中子任务", "running", a, &now)).unwrap();
+        store.append_claim(&peer_claim("clm-wait", "待回复子任务", "waiting", a, &now)).unwrap();
+        store.append_claim(&peer_claim("clm-zombie", "僵尸子任务", "running", a, &old)).unwrap();
+        store.append_claim(&peer_claim("clm-other", "别会话任务", "running", "s-other", &old)).unwrap();
+
+        let got = lead_finalize_peers(&store, "clm-lead").unwrap();
+        assert!(got.iter().any(|s| s == "已解决: 执行中子任务"), "新鲜 running 应已解决: {got:?}");
+        assert!(got.iter().any(|s| s == "已解决: 待回复子任务"), "waiting 应已解决: {got:?}");
+        assert!(got.iter().any(|s| s == "已完成: 僵尸子任务"), "超时 running 应已完成: {got:?}");
+        assert!(!got.iter().any(|s| s.contains("别会话任务")), "别会话不该被收: {got:?}");
+        assert!(!got.iter().any(|s| s.contains("lead:收尾")), "lead 自己不该被收: {got:?}");
+
+        let state = |id: &str| store.get_claim(id).unwrap().state;
+        assert_eq!(state("clm-run"), "done", "新鲜 running 落 done");
+        assert_eq!(state("clm-wait"), "done", "waiting 落 done");
+        assert_eq!(state("clm-zombie"), "closed", "僵尸 running 落 closed");
+        assert_eq!(state("clm-other"), "running", "别会话保持原样");
+        assert_eq!(state("clm-lead"), "waiting", "lead 自己保持原样");
     }
 
     // 直连模式文案（`tba go -off <任务>`）：带上这次要做的事，但**一条 Teambition
@@ -6488,7 +6633,7 @@ mod tests {
     }
 
     // 派子代理前主代理必须先 tba sub <claim_id> --agent-tag agent-N 打 tag，再用 subagent 工具派活。
-    // v0.2.51：N 是 DSH 当前子代理总数 +1（全局递增），不是本轮第一个；老「如 agent-1 / agent-2」文案必须换掉。
+    // N 按任务号分配（本会话已分过号的任务数 +1），同一任务重开复用原号；老「如 agent-1 / agent-2」文案必须换掉。
     #[test]
     fn entry_tags_subagent_before_dispatch() {
         let store = tmp_store("entry-tag-dispatch");
@@ -6501,15 +6646,16 @@ mod tests {
             t.contains("先") && t.contains("再"),
             "缺先打 tag 再派活的时序: {t}"
         );
-        // v0.2.51：序号规则必须写清 list_agents / 最大序号 +1 / 不从 agent-1 重来。
+        // 序号规则：list_agents / 按任务号分配 / 重开复用 / 不从 agent-1 重来。
         assert!(t.contains("list_agents"), "缺 list_agents 查当前子代理列表: {t}");
-        assert!(t.contains("最大序号 +1"), "缺最大序号 +1 规则: {t}");
+        assert!(t.contains("按任务号分配"), "缺按任务号分配规则: {t}");
+        assert!(t.contains("重开"), "缺同一任务重开复用规则: {t}");
         assert!(
             t.contains("只看本会话"),
             "缺只看本会话边界: {t}"
         );
         assert!(
-            t.contains("本会话第一个子代理 = agent-1"),
+            t.contains("本会话第一个任务 = agent-1"),
             "缺本会话首个 agent-1 规则: {t}"
         );
         assert!(
@@ -6556,9 +6702,10 @@ mod tests {
         let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
         let e = std::fs::read_to_string(&p).unwrap();
         assert!(e.contains("list_agents"), "入口缺 list_agents: {e}");
-        assert!(e.contains("最大序号 +1"), "入口缺最大序号 +1: {e}");
+        assert!(e.contains("按任务号分配"), "入口缺按任务号分配: {e}");
+        assert!(e.contains("重开"), "入口缺同一任务重开复用: {e}");
         assert!(e.contains("只看本会话"), "入口缺只看本会话边界: {e}");
-        assert!(e.contains("本会话第一个子代理 = agent-1"), "入口缺本会话首个 agent-1 规则: {e}");
+        assert!(e.contains("本会话第一个任务 = agent-1"), "入口缺本会话首个 agent-1 规则: {e}");
         assert!(!e.contains("如 agent-1 / agent-2"), "入口仍有误导性示例: {e}");
     }
 
@@ -6597,7 +6744,7 @@ mod tests {
         assert!(s.contains("收到用户回复自己判断分派"), "入口缺回复分派规则: {s}");
     }
 
-    // v0.2.51：入口块必须带派活打 tag 规范；序号规则改为 list_agents 最大序号 +1，
+    // 入口块必须带派活打 tag 规范；序号规则为 list_agents 按任务号分配 + 重开复用，
     // 老 AGENTS.md 缺这句要被整段重写一次。
     #[test]
     fn entry_file_refreshes_when_agent_tag_rule_missing() {
@@ -6607,9 +6754,10 @@ mod tests {
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(s.contains("tba sub <claim_id> --agent-tag agent-N"), "入口缺打 tag 规范: {s}");
         assert!(s.contains("list_agents"), "入口缺 list_agents 序号规则: {s}");
-        assert!(s.contains("最大序号 +1"), "入口缺最大序号 +1: {s}");
+        assert!(s.contains("按任务号分配"), "入口缺按任务号分配: {s}");
+        assert!(s.contains("重开"), "入口缺同一任务重开复用: {s}");
         assert!(s.contains("只看本会话"), "入口缺只看本会话边界: {s}");
-        assert!(s.contains("本会话第一个子代理 = agent-1"), "入口缺本会话首个 agent-1 规则: {s}");
+        assert!(s.contains("本会话第一个任务 = agent-1"), "入口缺本会话首个 agent-1 规则: {s}");
         assert!(!s.contains("如 agent-1 / agent-2"), "入口仍有误导性递增示例: {s}");
 
         // 造一份「其它版本条件都在、只有 --agent-tag 但缺新序号规则」的老入口。
@@ -6628,9 +6776,10 @@ mod tests {
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(s.contains("tba sub <claim_id> --agent-tag agent-N"), "重写后仍缺打 tag 规范: {s}");
         assert!(s.contains("list_agents"), "重写后缺 list_agents 序号规则: {s}");
-        assert!(s.contains("最大序号 +1"), "重写后缺最大序号 +1: {s}");
+        assert!(s.contains("按任务号分配"), "重写后缺按任务号分配: {s}");
+        assert!(s.contains("重开"), "重写后缺同一任务重开复用: {s}");
         assert!(s.contains("只看本会话"), "重写后缺只看本会话边界: {s}");
-        assert!(s.contains("本会话第一个子代理 = agent-1"), "重写后缺本会话首个 agent-1 规则: {s}");
+        assert!(s.contains("本会话第一个任务 = agent-1"), "重写后缺本会话首个 agent-1 规则: {s}");
         assert_eq!(s.matches(ENTRY_MARK).count(), 1, "重写不能重复追加入口块");
         assert!(s.contains("# 用户说明"), "用户自己的内容不能丢");
         assert!(ensure_entry_at(&dir, "tba").is_none(), "已是新版就不该反复重写");

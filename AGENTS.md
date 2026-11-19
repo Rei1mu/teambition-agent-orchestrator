@@ -61,7 +61,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 > **主代理每次要用户确认/收尾，必须当场 `tba ask <claim> --done`（或 `-q`）发邮件，并明确告诉用户「去邮箱回 1」——用户不常看 DSH，不能只在聊天框说「回 1 收尾」而不发 ask。发完确认邮件确实发出（`已发邮件通知`），别让任务停在「进行中」空等。
 4. 不许自建任务、不许自己改状态或看板列，一律经 `tba` 命令。
 5. 长操作前后各跑一次 `tba beat <claim>`。
-6. **主代理派子代理前先打 tag**：收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`，**只看本会话**已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；本会话第一个子代理 = agent-1。别跨会话、别参考别的项目/历史会话的序号（前缀混了会打错 tag）。然后跑 `tba sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。`lead:` 前缀是主代理自己的汇报/收尾任务（`tba lead start` 自动加，一条），不打 agent tag；别给子代理用 lead:、别给 lead 任务打 agent tag。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
+6. **主代理派子代理前先打 tag**：收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`，**只看本会话**。agent-N 按任务号分配，不按子代理实例数：N = 这个任务在本会话排第几（第一个任务 = agent-1，第二个 = agent-2）；同一个任务重开（失败/断线/换子代理接手）复用原号，不换新号；只有全新任务才往后排。别跨会话、别参考别的项目/历史会话（前缀混了会打错 tag）。然后跑 `tba sub <claim_id> --agent-tag agent-N`，把 `agent-N:` 前缀写进 Teambition 标题与 claim.note；然后再用 subagent 工具把简报作为 prompt 派活。`lead:` 前缀是主代理自己的汇报/收尾任务（`tba lead start` 自动加，一条），不打 agent tag；别给子代理用 lead:、别给 lead 任务打 agent tag。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
 
 > **子代理槽位**：tba sub 派的子代理由 DSH 管理（跑完自动结算释放并发槽，可用 `send_message` 冷恢复继续；不同子代理模式见 DSH 文档）。并发上限（默认 8）在 DSH 侧配置，不属 tba；若真的撞满，重启 DSH 或换新会话即可释放，不需要改 tba 代码、也不要在 tba 里写 dispose 逻辑。
 
@@ -69,7 +69,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 看 `docs/流程图.md`。需要时再读，不要一开始就整份加载。
 
-<!-- tba:rules v0.2.59 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:rules v0.2.60 由 tba 自动生成，删掉不影响功能 -->
 ## 编码纪律
 
 五条，动手前过一遍。
@@ -83,7 +83,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 例外：错别字、一行小改这类琐碎活，别上完整流程。这五条是为了减少非琐碎工作的代价，不是拖慢简单任务。
 
 
-<!-- tba:ultracave v0.2.59 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:ultracave v0.2.60 由 tba 自动生成，删掉不影响功能 -->
 ## 默认回复风格：简洁
 
 中文回复。短句优先，能一行说清不写一段。同一事实不重复；列表后不加总结。
@@ -91,7 +91,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 安全警告、不可逆操作、有两种读法的句子、给用户的选择题 → 用完整句。用户说 stop caveman / normal mode 即退回正常语气。
 
 
-<!-- tba:entry v0.2.59 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:entry v0.2.60 由 tba 自动生成，删掉不影响功能 -->
 ## 任务队列入口
 
 **工具**：`tba`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。直接执行，别搜 exe、别验证路径、别读 `.tba/`。
@@ -103,7 +103,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 **lead 单任务**：每次开工先跑 `tba lead start "<当前任务名，≤20字>"` 建一条 lead: 任务（绑本次会话，一条，主代理自己的汇报/收尾）；
 所有汇报和提问合一条——用 `tba lead report "<汇报内容>"`（say / ask 是同义别名）写到这条 lead 任务，
 会发邮件等你回 1。工作全部做完后，在最后一次 report 里列清所有子任务状态；你回 1 收尾 lead 任务时，
-系统自动把同会话还在「待回复」的子代理任务收为「已解决」，把已断线的僵尸任务收为「已完成」。
+系统自动把同会话还在「执行中」「待回复」的子代理任务收为「已解决」，把已断线的僵尸任务收为「已完成」。
 不再用 start/start_task 自建多个内部任务，也不自己 done/close。
 
 **交回**：做完两步，不许省：
@@ -112,7 +112,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 **主代理收尾/要拍板必须当场 `tba ask` 发邮件，明确告诉用户去邮箱回 1；不能只在聊天框说回 1 而不发 ask。发完确认邮件已发，别让任务停在进行中空等。**
 
-**派子代理先打 tag**：主代理收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`**只看本会话**已有 agent-N（含 inactive 历史），取最大序号 +1 作为本次 tag；例如本会话已有 agent-1..24，则本次用 agent-25。本会话第一个子代理 = agent-1。别跨会话、别参考别的项目/历史会话的序号。原因（用户原话）：前缀混了会导致本会话序号从别的会话接着数、打错 tag。`agent-N:` 由 `tba sub <claim_id> --agent-tag agent-N` 写进 Teambition 标题与 claim.note，subagent 工具的实例名（name 参数）跟 tag 是两回事，不用管；前缀由 `agent_tagged_title` 加，支持覆盖 swap（打错可重打纠正）。`lead:` 是主代理自己的汇报/收尾任务，`lead start` 自动加，一条，不打 agent tag、不派子代理。别给 lead 任务打 agent tag，别给子代理任务用 lead: 前缀。然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
+**派子代理先打 tag**：主代理收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`**只看本会话**已有 agent-N（含 inactive 历史）。agent-N **按任务号分配，不按子代理实例数**：N = 本会话已分过号的任务数 + 1；同一个任务重开（失败/断线/换实例接手）复用原 agent-N，不占新号；send_message 冷恢复原实例号不变；只有全新任务才递增。本会话第一个任务 = agent-1。别跨会话、别参考别的项目/历史会话的任务。原因（用户原话）：前缀混了会导致本会话序号从别的会话接着数、打错 tag。`agent-N:` 由 `tba sub <claim_id> --agent-tag agent-N` 写进 Teambition 标题与 claim.note，subagent 工具的实例名（name 参数）跟 tag 是两回事，不用管；前缀由 `agent_tagged_title` 加，支持覆盖 swap（打错可重打纠正）。`lead:` 是主代理自己的汇报/收尾任务，`lead start` 自动加，一条，不打 agent tag、不派子代理。别给 lead 任务打 agent tag，别给子代理任务用 lead: 前缀。然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
 
 **主代理不自己写、优先派子代理**：主代理（lead）以**省 token、省时间**为前提，动手活（改代码、改文件、查文件、调研、跑验证）**尽量不自己干**，合理拆给子代理：能由子代理独立完成的一律派子代理，只有需要本会话上下文的整合、收尾、拍板、`ask` 才自己来。派活仍按上面「派子代理先打 tag」规范执行。
 
