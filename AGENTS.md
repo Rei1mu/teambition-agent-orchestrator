@@ -1,4 +1,4 @@
-<!-- tba:bootstrap 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:bootstrap v0.2.63 由 tba 自动生成，删掉不影响功能 -->
 tba 是本机已安装的命令行工具，在 PATH 里。当前项目用它管任务队列。
 **直接执行 `tba`。不要为了找它去搜 exe、不要验证路径、不要 `where tba`。**
 跑不通就把错误原样报给用户。只有用户明确要求排查时才 `tba doctor`。
@@ -69,7 +69,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 看 `docs/流程图.md`。需要时再读，不要一开始就整份加载。
 
-<!-- tba:rules v0.2.61 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:rules 由 tba 自动生成，删掉不影响功能 -->
 ## 编码纪律
 
 五条，动手前过一遍。
@@ -83,7 +83,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 例外：错别字、一行小改这类琐碎活，别上完整流程。这五条是为了减少非琐碎工作的代价，不是拖慢简单任务。
 
 
-<!-- tba:ultracave v0.2.61 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:ultracave 由 tba 自动生成，删掉不影响功能 -->
 ## 默认回复风格：简洁
 
 中文回复。短句优先，能一行说清不写一段。同一事实不重复；列表后不加总结。
@@ -91,7 +91,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 安全警告、不可逆操作、有两种读法的句子、给用户的选择题 → 用完整句。用户说 stop caveman / normal mode 即退回正常语气。
 
 
-<!-- tba:entry v0.2.61 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:entry 由 tba 自动生成，删掉不影响功能 -->
 ## 任务队列入口
 
 **工具**：`tba`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。直接执行，别搜 exe、别验证路径、别读 `.tba/`。
@@ -113,6 +113,8 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 **主代理收尾/要拍板必须当场 `tba ask` 发邮件，明确告诉用户去邮箱回 1；不能只在聊天框说回 1 而不发 ask。发完确认邮件已发，别让任务停在进行中空等。**
 
 **派子代理先打 tag**：主代理收到 `tba sub` 简报后，先跑 DSH 的 `list_agents`**只看本会话**已有 agent-N（含 inactive 历史）。agent-N **按任务号分配，不按子代理实例数**：N = 本会话已分过号的任务数 + 1；同一个任务重开（失败/断线/换实例接手）复用原 agent-N，不占新号；send_message 冷恢复原实例号不变；只有全新任务才递增。本会话第一个任务 = agent-1。别跨会话、别参考别的项目/历史会话的任务。原因（用户原话）：前缀混了会导致本会话序号从别的会话接着数、打错 tag。`agent-N:` 由 `tba sub <claim_id> --agent-tag agent-N` 写进 Teambition 标题与 claim.note，subagent 工具的实例名（name 参数）跟 tag 是两回事，不用管；前缀由 `agent_tagged_title` 加，支持覆盖 swap（打错可重打纠正）。`lead:` 是主代理自己的汇报/收尾任务，`lead start` 自动加，一条，不打 agent tag、不派子代理。别给 lead 任务打 agent tag，别给子代理任务用 lead: 前缀。然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `tba sub` 继续监听。
+
+**`tba sub` 常驻监听必须后台执行**：它是常驻监听（空队列不退出），前台跑会挂住会话。挂监听时一律用后台 job（`run_in_background: true`），**不许前台等待**；前台跑只留给单次领任务的动作。
 
 **主代理不自己写、优先派子代理**：主代理（lead）以**省 token、省时间**为前提，动手活（改代码、改文件、查文件、调研、跑验证）**尽量不自己干**，合理拆给子代理：能由子代理独立完成的一律派子代理，只有需要本会话上下文的整合、收尾、拍板、`ask` 才自己来。派活仍按上面「派子代理先打 tag」规范执行。
 

@@ -5084,11 +5084,9 @@ const ENTRY_MARK: &str = "<!-- tba:entry";
 const RULES_MARK: &str = "<!-- tba:rules";
 
 // 固定生成文案的版本指纹。绑定 crate 版本，发版才变。
-// 版本写在每块第一行的标记里（如 `<!-- tba:entry v0.2.57 ... -->`）；
-// 版本一致就跳过不重写（省 token），不一致或缺失就整块清掉重写——把「逐句
-// contains 检查」换成「只比指纹」，以后改文案不用每句加检查。
-// 版本号必须和标记同一行：单独一行 `<!-- tba:entry-ver -->` 会被标记前缀
-// `<!-- tba:entry` 匹配到，`matches(ENTRY_MARK).count()` 数成 2，把「块重复」判定搞错。
+// 版本只写在 bootstrap 块第一行的标记里（如 `<!-- tba:bootstrap v0.2.62 ... -->`）；
+// 其余三块标记不带版本。版本一致就整体跳过不重写（省 token），不一致或缺失就
+// 清掉旧块重写——把「逐句 contains 检查」换成「只比指纹」，以后改文案不用每句加检查。
 const ENTRY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // 当前目录是不是 git 仓库（向上找 .git；worktree 里 .git 是文件，用 exists 一并覆盖）。
@@ -5144,11 +5142,13 @@ pub fn refresh_agents_at(dir: &std::path::Path, cmd: &str, force: bool) -> Optio
     let path = dir.join("AGENTS.md");
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     let mut stale = old.clone();
-    // 把三个块标记行里的版本号摘掉：gate 只认「标记 + 当前版本」，摘掉就不通过，
-    // ensure_entry_at 会清掉全部旧块重生成。只动版本标记，块外用户内容一个字不碰。
-    for mark in [ENTRY_MARK, RULES_MARK, ULTRACAVE_MARK] {
-        stale = stale.replace(&format!("{mark} v{ENTRY_VERSION}"), mark);
-    }
+    // 把 bootstrap 标记行里的版本号摘掉：gate 只认「bootstrap 标记 + 当前版本」，
+    // 摘掉就不通过，ensure_entry_at 会清掉三块旧块重生成；bootstrap 自身由
+    // ensure_bootstrap_block 按当前版本改写标记行。只动版本标记，块外用户内容一个字不碰。
+    stale = stale.replace(
+        &format!("{BOOTSTRAP_MARK} v{ENTRY_VERSION}"),
+        BOOTSTRAP_MARK,
+    );
     if force {
         // --f：连用户手写内容一起丢，只留 tba 块。
         stale = String::new();
@@ -5190,19 +5190,38 @@ fn strip_tba_block(s: &str, mark: &str) -> String {
 // 零上下文短块，只写 AGENTS.md 一份。CLAUDE.md 用 @AGENTS.md 导入，不重复写。
 // 「别搜 exe」只限定在定位 tba 这件事上：写成「禁止读源码」会挡住正常开发。
 const BOOTSTRAP_MARK: &str = "<!-- tba:bootstrap";
-const BOOTSTRAP_BLOCK: &str = "<!-- tba:bootstrap 由 tba 自动生成，删掉不影响功能 -->\n\
-    tba 是本机已安装的命令行工具，在 PATH 里。当前项目用它管任务队列。\n\
-    **直接执行 `tba`。不要为了找它去搜 exe、不要验证路径、不要 `where tba`。**\n\
-    跑不通就把错误原样报给用户。只有用户明确要求排查时才 `tba doctor`。\n\
-    `tba --help` 看全部命令。\n";
+// 版本只写在这一块的标记行里（全文件唯一一处版本号）。其余三块标记不带版本。
+fn bootstrap_block() -> String {
+    format!(
+        "{BOOTSTRAP_MARK} v{ENTRY_VERSION} 由 tba 自动生成，删掉不影响功能 -->\n\
+     tba 是本机已安装的命令行工具，在 PATH 里。当前项目用它管任务队列。\n\
+     **直接执行 `tba`。不要为了找它去搜 exe、不要验证路径、不要 `where tba`。**\n\
+     跑不通就把错误原样报给用户。只有用户明确要求排查时才 `tba doctor`。\n\
+     `tba --help` 看全部命令。\n"
+    )
+}
 
 fn ensure_bootstrap_block(path: &std::path::Path) {
     let old = std::fs::read_to_string(path).unwrap_or_default();
-    if old.contains(BOOTSTRAP_MARK) {
+    let current = bootstrap_block();
+    let current_mark_line = current.lines().next().unwrap_or(BOOTSTRAP_MARK);
+    if let Some(start) = old.find(BOOTSTRAP_MARK) {
+        // 已有标记块：只把标记行换成带当前版本的那行，块正文和用户内容都不动。
+        // 行内已有别的旧版本、或压根没版本，都归一到当前版本。
+        if let Some(line_end) = old[start..].find('\n') {
+            let line_end = start + line_end;
+            if &old[start..line_end] != current_mark_line {
+                let mut s = String::with_capacity(old.len() + 32);
+                s.push_str(&old[..start]);
+                s.push_str(current_mark_line);
+                s.push_str(&old[line_end..]);
+                let _ = std::fs::write(path, s);
+            }
+        }
         return;
     }
-    // 放最前面：约定文件里越靠前越不容易被后面的长文档挤到看不见。
-    let _ = std::fs::write(path, format!("{BOOTSTRAP_BLOCK}\n{old}"));
+    // 没有标记块：放最前面。约定文件里越靠前越不容易被后面的长文档挤到看不见。
+    let _ = std::fs::write(path, format!("{current}\n{old}"));
 }
 
 // 迁移用：从 mark 删到下一个 `<!-- tba:` 标记之前（不含）。
@@ -5262,23 +5281,23 @@ const ULTRACAVE_BODY: &str = "## 默认回复风格：简洁\n\n\
 代码、命令、路径、API 名、报错原文、数字单位原样保留，不缩写成自造词。\n\
 安全警告、不可逆操作、有两种读法的句子、给用户的选择题 → 用完整句。用户说 stop caveman / normal mode 即退回正常语气。\n";
 
-// 带标记 + 版本行的 ultracave 块。版本塞进标记行（见 ENTRY_VERSION 注释）。
+// 带标记的 ultracave 块。版本统一由 bootstrap 标记行承载（见 ENTRY_VERSION 注释）。
 fn ultracave_block() -> String {
     format!(
-        "{ULTRACAVE_MARK} v{ENTRY_VERSION} 由 tba 自动生成，删掉不影响功能 -->\n\
+        "{ULTRACAVE_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
          {ULTRACAVE_BODY}"
     )
 }
 
 fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBuf> {
     let path = dir.join("AGENTS.md");
-    ensure_bootstrap_block(&path);
-
+    // bootstrap 的标记行检查放到版本门之后：refresh 就是靠摘掉 bootstrap 的版本
+    // 让门失效来触发全量重写；若在这里先补回版本，门会误判为最新而不重写。
     // 裸命令，不写本机绝对路径。那个路径换台设备就失效，会逼 agent 全盘搜 exe。
     let exe = cmd.to_string();
 
     let entry = format!(
-        "{ENTRY_MARK} v{ENTRY_VERSION} 由 tba 自动生成，删掉不影响功能 -->\n\
+        "{ENTRY_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
          ## 任务队列入口\n\n\
          **工具**：`{exe}`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。\
          直接执行，别搜 exe、别验证路径、别读 `.tba/`。\n\n\
@@ -5308,6 +5327,8 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
           `lead:` 是主代理自己的汇报/收尾任务，`lead start` 自动加，一条，不打 agent tag、不派子代理。\
           别给 lead 任务打 agent tag，别给子代理任务用 lead: 前缀。\
           然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `{exe} sub` 继续监听。\n\n\
+          **`{exe} sub` 常驻监听必须后台执行**：它是常驻监听（空队列不退出），前台跑会挂住会话。\
+          挂监听时一律用后台 job（`run_in_background: true`），**不许前台等待**；前台跑只留给单次领任务的动作。\n\n\
           **主代理不自己写、优先派子代理**：主代理（lead）以**省 token、省时间**为前提，\
           动手活（改代码、改文件、查文件、调研、跑验证）**尽量不自己干**，合理拆给子代理：\
           能由子代理独立完成的一律派子代理，只有需要本会话上下文的整合、收尾、拍板、`ask` 才自己来。\
@@ -5343,7 +5364,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     // 任务流程无关，而且每条都要解释才管用。塞进 prompt 每次会话固定多 1500 字，
     // 而 AGENTS.md 是 agent 进项目就会读的约定文件，成本几乎为零。
     let rules = format!(
-        "{RULES_MARK} v{ENTRY_VERSION} 由 tba 自动生成，删掉不影响功能 -->\n\
+        "{RULES_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
          ## 编码纪律\n\n\
          五条，动手前过一遍。\n\n\
          1. **先想再写。** 不假设、不藏困惑。不确定就问，别猜着往下做；有歧义就摆出几种解释；\
@@ -5367,18 +5388,15 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     // 不能用 strip_tba_block，按下一个 tba 标记收边界）。新块由下面的 ultracave 逻辑补。
     old = strip_marker_block_to_next_tba(&old, "<!-- user:ultracave");
 
-    // 版本门：同一行同时含标记 + 版本号才算数。
-    // 版本不一致或缺失就整块清掉重写；老文件（无版本）自然重写一次，平滑迁移。
-    let ver = format!("v{ENTRY_VERSION}");
-    let entry_ok = old
-        .lines()
-        .any(|l| l.contains(ENTRY_MARK) && l.contains(&ver));
-    let rules_ok = old
-        .lines()
-        .any(|l| l.contains(RULES_MARK) && l.contains(&ver));
-    let ultracave_ok = old
-        .lines()
-        .any(|l| l.contains(ULTRACAVE_MARK) && l.contains(&ver));
+    // 版本门：版本只在 bootstrap 标记行上。bootstrap 带当前版本 + 另外三块标记都在
+    // 才算最新；bootstrap 版本不一致或缺失，就整块清掉三块重写（老文件自然重写一次，
+    // 平滑迁移）。bootstrap 自身的标记行由 ensure_bootstrap_block 归一到当前版本。
+    let current_mark_line = bootstrap_block();
+    let current_mark_line = current_mark_line.lines().next().unwrap_or(BOOTSTRAP_MARK);
+    let bootstrap_ok = old.lines().any(|l| l == current_mark_line);
+    let entry_ok = old.lines().any(|l| l.contains(ENTRY_MARK));
+    let rules_ok = old.lines().any(|l| l.contains(RULES_MARK));
+    let ultracave_ok = old.lines().any(|l| l.contains(ULTRACAVE_MARK));
 
     // 转发脚本只写 `tba.exe`，不带本机绝对路径，换设备一样能用。
     // 带 .exe 后缀是必须的：只写 `tba` 的话 cmd 会先匹配到当前目录的 tba.cmd，
@@ -5389,7 +5407,9 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         let _ = std::fs::write(&shim, shim_text);
     }
 
-    if entry_ok && rules_ok && ultracave_ok {
+    if bootstrap_ok && entry_ok && rules_ok && ultracave_ok {
+        // 四块齐全且 bootstrap 版本是当前的：只补/修 bootstrap 标记行（幂等）。
+        ensure_bootstrap_block(&path);
         return None;
     }
 
@@ -5421,6 +5441,8 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         s.push_str(block);
     }
     std::fs::write(&path, s).ok()?;
+    // 重写完三块后，再补/修 bootstrap 块（不参与上面的剥离，用户正文保留）。
+    ensure_bootstrap_block(&path);
     Some(path)
 }
 
@@ -6452,6 +6474,82 @@ mod tests {
         assert!(out.contains(ULTRACAVE_MARK));
     }
 
+    // 版本号全文件只写一次：只在 bootstrap 标记行；其余三块不带版本。
+    #[test]
+    fn version_appears_only_in_bootstrap_marker() {
+        let store = tmp_store("single-version");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("生成初始 AGENTS.md");
+        let s = std::fs::read_to_string(&p).unwrap();
+        let ver = format!("v{ENTRY_VERSION}");
+        assert_eq!(s.matches(&ver).count(), 1, "版本号应只出现一次: {s}");
+        assert!(s.contains(&format!("{BOOTSTRAP_MARK} {ver}")), "bootstrap 标记该带版本");
+        for mark in [ENTRY_MARK, RULES_MARK, ULTRACAVE_MARK] {
+            let line = s.lines().find(|l| l.contains(mark)).expect("缺标记");
+            assert!(!line.contains("v0."), "{mark} 标记行不该带版本: {line}");
+        }
+        // 再跑一次：幂等，不追加不重复。
+        assert!(ensure_entry_at(&dir, "tba").is_none(), "已是最新不该再写");
+    }
+
+    // 老版本生成的 AGENTS.md：bootstrap 标记带旧版本、三块标记无版本。
+    // 必须把 bootstrap 标记行换成当前版本，并重写三块；用户正文保留。
+    #[test]
+    fn old_bootstrap_version_rewrites_all_blocks() {
+        let store = tmp_store("old-bootstrap-version");
+        let dir = store.root.clone();
+        let p = dir.join("AGENTS.md");
+        std::fs::write(
+            &p,
+            format!(
+                "# 用户说明\n\n{BOOTSTRAP_MARK} v0.0.1 由 tba 自动生成，删掉不影响功能 -->\n\
+                 旧 bootstrap 正文\n\n\
+                 {ENTRY_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 任务队列入口\n\n旧入口。\n\n\
+                 {RULES_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 编码纪律\n\n旧纪律。\n\n\
+                 {ULTRACAVE_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 默认回复风格：简洁\n\n旧风格。\n"
+            ),
+        )
+        .unwrap();
+        assert!(
+            ensure_entry_at(&dir, "tba").is_some(),
+            "旧版本该触发全量重写"
+        );
+        let s = std::fs::read_to_string(&p).unwrap();
+        let ver = format!("v{ENTRY_VERSION}");
+        assert_eq!(s.matches(&ver).count(), 1, "重写后版本号只该出现一次");
+        assert!(s.contains(&format!("{BOOTSTRAP_MARK} {ver}")), "bootstrap 该是最新版本");
+        assert!(s.contains("git create"), "三块该刷成最新文案");
+        assert!(s.contains("主代理不自己写"), "入口块该刷成最新文案");
+        assert!(s.contains("# 用户说明"), "用户正文不该丢");
+        assert!(!s.contains("旧入口"), "旧块正文不该残留");
+        assert!(ensure_entry_at(&dir, "tba").is_none(), "已是最新不该反复重写");
+    }
+
+    // refresh 靠摘 bootstrap 版本触发全量重写：老版本的三块也要一起刷新。
+    #[test]
+    fn refresh_with_old_bootstrap_version_rewrites_all_blocks() {
+        let store = tmp_store("refresh-old-version");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("生成初始 AGENTS.md");
+        let mut s = std::fs::read_to_string(&p).unwrap();
+        let ver = format!("v{ENTRY_VERSION}");
+        // 模拟磁盘上是旧版本生成的 bootstrap 标记。
+        s = s.replace(&format!("{BOOTSTRAP_MARK} {ver}"), &format!("{BOOTSTRAP_MARK} v0.0.1"));
+        s = s.replace("先想再写", "旧的先想再写（过期）");
+        s.push_str("\n\n## 我的笔记\n\n用户手写，不许动。\n");
+        std::fs::write(&p, &s).unwrap();
+
+        assert!(refresh_agents_at(&dir, "tba", false).is_some(), "旧版本该触发刷新");
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(out.matches(&ver).count(), 1, "刷新后版本号只该出现一次");
+        assert!(out.contains(&format!("{BOOTSTRAP_MARK} {ver}")), "bootstrap 该是最新版本");
+        assert!(out.contains("先想再写") && !out.contains("旧的先想再写"), "三块该刷成最新");
+        assert!(out.contains("用户手写，不许动"), "用户正文不该丢");
+        for mark in [ENTRY_MARK, RULES_MARK, ULTRACAVE_MARK] {
+            assert_eq!(out.matches(mark).count(), 1, "{mark} 不该重复");
+        }
+    }
+
     // AGENTS.md 入口：两个块各自补，用户自己的内容一个字不动。
     // 重点是「老项目也能补上后加的编码纪律」——不能被「已有入口」挡住。
     #[test]
@@ -6630,6 +6728,18 @@ mod tests {
         assert!(t.contains("ask_user_question"), "缺点名禁用 DSH 选择框: {t}");
         assert!(t.contains("ask_user"), "缺点名禁用 MCP ask_user: {t}");
         assert!(t.contains("不直接在聊天框给选项"), "缺不直接聊天问: {t}");
+    }
+
+    // 裸 `tba sub` 是常驻监听（空队列不退出），前台跑会挂住会话；入口块必须写明后台执行。
+    #[test]
+    fn entry_requires_background_execution_for_sub_watch() {
+        let store = tmp_store("entry-sub-background");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
+        let t = std::fs::read_to_string(&p).unwrap();
+        assert!(t.contains("run_in_background"), "缺后台执行指引: {t}");
+        assert!(t.contains("不许前台等待"), "缺不许前台等待规则: {t}");
+        assert!(t.contains("常驻监听必须后台执行"), "缺常驻监听后台规则标题: {t}");
     }
 
     // 派子代理前主代理必须先 tba sub <claim_id> --agent-tag agent-N 打 tag，再用 subagent 工具派活。
