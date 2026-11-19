@@ -120,9 +120,9 @@ const CONTEXT_DIFF_DESC: &str = "上下文差异能力插件";
 
 // 两类来源，文案分开写：GitHub 用 dsh plugin --profile ... add "github:..."，
 // dsh 类从插件市场装，用 dsh plugin add <包名>。
-const INSTALL_MODSEARCH: &str = "GitHub 安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin --profile web add \"github:liustack/modsearch\"\n仓库：https://github.com/liustack/modsearch\n装完重启 harness / 在 Web UI 确认加载。";
-const INSTALL_BRIDGE: &str = "GitHub 安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin --profile desktop add \"github:Rei1mu/dsh-tba-bridge\"\n仓库：https://github.com/Rei1mu/dsh-tba-bridge\n装完重启 harness / 在 Web UI 确认加载。";
-const INSTALL_CONTEXT_DIFF: &str = "从 DSH 插件市场安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin add dsh-context-diff\n装完重启 harness / 在 Web UI 确认加载。";
+const INSTALL_MODSEARCH: &str = "GitHub 安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin --profile web add \"github:liustack/modsearch\"\n仓库：https://github.com/liustack/modsearch\n装完重启 harness / 在 Web UI 确认加载。\n已装可照此命令重装/更新到新版；插件非必须。";
+const INSTALL_BRIDGE: &str = "GitHub 安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin --profile desktop add \"github:Rei1mu/dsh-tba-bridge\"\n仓库：https://github.com/Rei1mu/dsh-tba-bridge\n装完重启 harness / 在 Web UI 确认加载。\n已装可照此命令重装/更新到新版；插件非必须。";
+const INSTALL_CONTEXT_DIFF: &str = "从 DSH 插件市场安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin add dsh-context-diff\n装完重启 harness / 在 Web UI 确认加载。\n已装可照此命令重装/更新到新版；插件非必须。";
 
 struct PluginSpec {
     name: &'static str,
@@ -1190,12 +1190,12 @@ impl App {
         }
     }
 
-    /// DSH 插件卡：4 个插件的已装/未装状态 + 未装的可复制安装文案。
+    /// DSH 插件卡：4 个插件的已装/未装状态 + 都可复制安装/更新文案。
     /// 只提示、不自动装；检测走后台线程，不挡窗口。
     fn draw_plugins_card(&mut self, ui: &mut egui::Ui) {
         ui.add_space(10.0);
         ui.label(egui::RichText::new("DSH 插件").strong());
-        ui.label("只检测、不自动安装。未装的把文案复制去你自己的 shell 跑（本机 dsh 不在 PATH）。");
+        ui.label("只检测、不自动安装。已装/未装都可复制文案（更新或安装），去你自己的 shell 跑（本机 dsh 不在 PATH）。");
         let Some(rows) = self.plugins.as_ref() else {
             ui.label("检测中...");
             return;
@@ -1212,10 +1212,10 @@ impl App {
                         egui::Color32::from_rgb(0xc6, 0x28, 0x28),
                         format!("✗ {}", p.name),
                     );
-                    if ui.small_button("复制安装文案").clicked() {
-                        ui.ctx().copy_text(p.install_text.to_string());
-                        self.status = format!("已复制 {} 安装文案", p.name);
-                    }
+                }
+                if ui.small_button("复制安装/更新文案").clicked() {
+                    ui.ctx().copy_text(p.install_text.to_string());
+                    self.status = format!("已复制 {} 安装/更新文案", p.name);
                 }
                 ui.label(egui::RichText::new(p.desc).small().weak());
             });
@@ -3103,6 +3103,11 @@ mod tests {
             for b in dsh {
                 assert_ne!(a, b, "两类文案不能相同");
             }
+        }
+        // 已装/未装都复制同一份文案，所以每份都要带「可重装/更新 + 非必须」的提示。
+        for t in gh.iter().chain(dsh.iter()) {
+            assert!(t.contains("重装/更新"), "文案要提示已装可更新: {t}");
+            assert!(t.contains("非必须"), "文案要说清插件非强制: {t}");
         }
     }
 
