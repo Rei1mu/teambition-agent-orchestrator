@@ -384,6 +384,22 @@ fn subagent_watch(
     // 固定间隔：裸命令最短，不塞轮询开关。
     let iv = store.load_config().wait_interval_secs.max(5);
     let agent = current_agent();
+    // 单例锁：同一 agent（会话）只能挂一个常驻监听。锁按 agent 分路径，
+    // 不同会话各挂各的不冲突。_lock 活到函数结束（含整个 loop），进程退出自动释放。
+    let sub_dir = store.root.join("sub");
+    if let Err(e) = std::fs::create_dir_all(&sub_dir) {
+        return Err(format!("创建 tba sub 锁目录失败: {e}"));
+    }
+    let _lock = match store.try_lock_path(
+        &sub_dir.join(format!("{agent}.lock")),
+        "tba sub 监听",
+    ) {
+        Ok(l) => l,
+        Err(_) => {
+            eprintln!("tba sub：本会话已有一个监听在跑，退出。要重挂先停掉旧的。");
+            return Ok(());
+        }
+    };
     eprintln!(
         "tba sub 常驻监听已挂上：项目 {project_id} · 每 {iv} 秒查一次看板列「{STAGE_TODO}」；同时扫描列「{STAGE_DONE}」/「{STAGE_CLOSED}」同步误拖任务的状态与会话；空队列不退出，领到任务才唤醒。"
     );
@@ -2609,6 +2625,55 @@ pub fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{mcp_command, mcp_snippet};
+    use crate::store::Store;
+
+    /// 同一路径重复加锁必须失败；第一个放掉后第二个能成功。
+    /// 防止同会话挂两个 `tba sub` 后台的单例锁就靠这个语义。
+    #[test]
+    fn lock_path_is_exclusive_and_released_on_drop() {
+        let root = std::env::temp_dir().join(format!("tba-sub-lock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store { root };
+        let sub = store.root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let path = sub.join("agent-x.lock");
+
+        let first = store
+            .lock_path(&path, "测试锁")
+            .expect("首个锁应拿到");
+        assert!(
+            store.lock_path(&path, "测试锁").is_err(),
+            "同一路径第二个锁应失败（锁被第一个持有）"
+        );
+        drop(first);
+        let _second = store
+            .lock_path(&path, "测试锁")
+            .expect("第一个放掉后第二个应能拿到");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// try_lock_path 抢不到锁必须立刻失败（< 1s），不重蹈 lock_path 等 10 秒的覆辙。
+    #[test]
+    fn try_lock_path_fails_fast_when_held() {
+        let root = std::env::temp_dir().join(format!("tba-sub-trylock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store { root };
+        let path = store.root.join("try.lock");
+
+        let first = store
+            .try_lock_path(&path, "测试秒退锁")
+            .expect("首个锁应拿到");
+        let t = std::time::Instant::now();
+        assert!(
+            store.try_lock_path(&path, "测试秒退锁").is_err(),
+            "同一路径第二个锁应立即失败"
+        );
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "秒退不能等 10 秒");
+        drop(first);
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
 
     /// Windows 路径含反斜杠，片段必须是能被客户端直接解析的合法 JSON。
     #[test]

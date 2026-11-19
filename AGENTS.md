@@ -69,7 +69,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 
 看 `docs/流程图.md`。需要时再读，不要一开始就整份加载。
 
-<!-- tba:rules v0.2.60 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:rules v0.2.61 由 tba 自动生成，删掉不影响功能 -->
 ## 编码纪律
 
 五条，动手前过一遍。
@@ -83,7 +83,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 例外：错别字、一行小改这类琐碎活，别上完整流程。这五条是为了减少非琐碎工作的代价，不是拖慢简单任务。
 
 
-<!-- tba:ultracave v0.2.60 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:ultracave v0.2.61 由 tba 自动生成，删掉不影响功能 -->
 ## 默认回复风格：简洁
 
 中文回复。短句优先，能一行说清不写一段。同一事实不重复；列表后不加总结。
@@ -91,7 +91,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 安全警告、不可逆操作、有两种读法的句子、给用户的选择题 → 用完整句。用户说 stop caveman / normal mode 即退回正常语气。
 
 
-<!-- tba:entry v0.2.60 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:entry v0.2.61 由 tba 自动生成，删掉不影响功能 -->
 ## 任务队列入口
 
 **工具**：`tba`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。直接执行，别搜 exe、别验证路径、别读 `.tba/`。

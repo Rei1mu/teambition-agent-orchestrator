@@ -563,7 +563,21 @@ off = [{}]
         self.lock_path(&dir.join(name), "项目写锁")
     }
 
-    fn lock_path(&self, path: &std::path::Path, label: &str) -> Result<MemoryLock, String> {
+    // 跟 lock_path 同一把 OS 文件锁，但抢不到立即返回 Err，不重试不 sleep。
+    // 用途：单例锁（如 tba sub 常驻监听）第二个实例要秒退，不能等 10 秒。
+    pub fn try_lock_path(&self, path: &std::path::Path, label: &str) -> Result<MemoryLock, String> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| format!("打开{label}失败: {e}"))?;
+        file.try_lock()
+            .map_err(|_| format!("另一个 tb 进程正占着{label}"))?;
+        Ok(MemoryLock { file })
+    }
+
+    pub fn lock_path(&self, path: &std::path::Path, label: &str) -> Result<MemoryLock, String> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
