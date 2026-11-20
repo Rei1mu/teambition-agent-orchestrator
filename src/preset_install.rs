@@ -10,6 +10,7 @@ use std::process::Command;
 
 const TBA_PACKAGE: &str = include_str!("../dsh-tba-preset/package.json");
 const TBA_PATCH: &str = include_str!("../dsh-tba-preset/cordis.patch.yml");
+const TBA_SHADOW: &str = include_str!("../dsh-tba-preset/identity-shadow.js");
 const CHAT_PACKAGE: &str = include_str!("../dsh-chat-preset/package.json");
 const CHAT_PATCH: &str = include_str!("../dsh-chat-preset/cordis.patch.yml");
 const PWSH_LITE_PACKAGE: &str = include_str!("../dsh-pwsh-lite/package.json");
@@ -131,19 +132,25 @@ fn presets_root() -> PathBuf {
         .join("presets")
 }
 
-/// 写一份 bundle 的 2 个文件；内容没变就不动盘（保证幂等、避免无谓写）。
-fn write_bundle(dir: &Path, package: &str, patch: &str) -> Result<(), String> {
+/// 写一份 bundle：2 个基础文件 + 可选的额外文件（如 tba 预设的 identity-shadow.js）。
+/// 内容没变就不动盘（保证幂等、避免无谓写）。
+fn write_bundle_files(dir: &Path, files: &[(&str, &str)]) -> Result<(), String> {
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("无法创建 {}: {e}", dir.display()))?;
-    for (name, content) in [("package.json", package), ("cordis.patch.yml", patch)] {
+    for (name, content) in files {
         let path = dir.join(name);
-        if matches!(std::fs::read_to_string(&path).as_deref(), Ok(s) if s == content) {
+        if matches!(std::fs::read_to_string(&path).as_deref(), Ok(s) if s == *content) {
             continue;
         }
         std::fs::write(&path, content)
             .map_err(|e| format!("无法写入 {}: {e}", path.display()))?;
     }
     Ok(())
+}
+
+/// 写一份预设 bundle 的 2 个基础文件。
+fn write_bundle(dir: &Path, package: &str, patch: &str) -> Result<(), String> {
+    write_bundle_files(dir, &[("package.json", package), ("cordis.patch.yml", patch)])
 }
 
 /// 从 profile node_modules 读已装插件的 version（读不到返回 None）。
@@ -516,12 +523,21 @@ pub fn install_presets() -> Result<String, String> {
         ));
     }
 
-    // 版本变化 / 缺登记：覆盖写 bundle 文件（内容没变 write_bundle 不动盘）。
-    for (_, dir, package, patch, action) in &decisions {
+    // tba 预设额外带 identity-shadow.js（三模式共享的 identity 屏蔽插件）；
+    // chat 的 patch 也引用它，所以必须跟预设一起落盘，否则新装 profile 会 "never started"。
+    for (dep, dir, package, patch, action) in &decisions {
         if matches!(action, Action::SkipLatest(_)) {
             continue;
         }
-        write_bundle(dir, package, patch)?;
+        if *dep == TBA_DEP {
+            write_bundle_files(dir, &[
+                ("package.json", package),
+                ("cordis.patch.yml", patch),
+                ("identity-shadow.js", TBA_SHADOW),
+            ])?;
+        } else {
+            write_bundle(dir, package, patch)?;
+        }
     }
 
     // 需要装 dep 的：pnpm add。登记齐但版本变化的不用再 pnpm（软链已指向同一目录）。
@@ -726,6 +742,8 @@ mod tests {
             ))
             .unwrap()
         ));
+        // 三模式共享的 identity-shadow.js 必须内嵌，否则新装 profile 的 chat/tba preset 会 never started。
+        assert!(TBA_SHADOW.contains("harness:identity"));
     }
 
     #[test]

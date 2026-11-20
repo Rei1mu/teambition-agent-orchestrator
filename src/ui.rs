@@ -160,7 +160,7 @@ const PLUGIN_SPECS: &[PluginSpec] = &[
         name: "@local/dsh-pwsh-lite",
         desc: PWSH_LITE_DESC,
         paths: PWSH_LITE_PATHS,
-        install_text: "一键安装：点本卡片上方「安装 tba 预设+插件」按钮，tba 会检查两个预设和 pwsh-lite / dsh-tba-bridge 的版本并安装/更新。装完请完全退出并重启 DSH。",
+        install_text: "一键安装：点本卡片上方「安装 tba 预设+插件」按钮，tba 会按版本检查并安装/更新三模式预设（tba/tbaptc/chat，含共享 identity-shadow）和 pwsh-lite / dsh-tba-bridge 插件。装完请完全退出并重启 DSH。",
     },
 ];
 
@@ -1211,7 +1211,7 @@ impl App {
     fn draw_plugins_card(&mut self, ui: &mut egui::Ui) {
         ui.add_space(10.0);
         ui.label(egui::RichText::new("DSH 插件").strong());
-        ui.label("已装的插件显示 ✓；未装的显示 ✗。其它插件只提示不自动装，可复制文案去你自己的 shell 跑（本机 dsh 不在 PATH）。点「安装 tba 预设+插件」会同时按版本检查并安装两个预设和 pwsh-lite / dsh-tba-bridge。");
+        ui.label("已装的插件显示 ✓；未装的显示 ✗。其它插件只提示不自动装，可复制文案去你自己的 shell 跑（本机 dsh 不在 PATH）。点「安装 tba 预设+插件」会按版本检查并安装三模式预设（tba/tbaptc/chat，含共享 identity-shadow）和 pwsh-lite / dsh-tba-bridge 插件。");
         ui.horizontal_wrapped(|ui| {
             if self.preset_busy {
                 ui.label("安装预设中...");
