@@ -3182,7 +3182,8 @@ fn subagent_workflow_text(exe: &str, claim_id: &str) -> String {
         r##"## 你的职责
 1. 只改完成这个任务必须改的，遵循项目编码纪律（见上方上下文）。
 2. 干完把「改了什么/怎么验」写进任务备注（不是评论）：`{exe} note {id} --text "改了什么/怎么验"`。项目记忆（踩坑/决策）写云端用 `{exe} memory --project <id> --append "..." --section 踩坑`；别写本地 note.md，`tba mem` 只是任务状态。
-3. 问用户：`{exe} ask {id} -q "问题（纯文本选项，从 3 起编号）"`（发邮件+转待回复），收尾 `{exe} ask {id} --done`；回复先 `{exe} reply {id}` 再 `{exe} events --claim {id}` 读原话。两条禁用：**① DSH `ask_user_question` 是聊天弹窗——回答只留在 DSH 会话，到不了邮件/Teambition；② MCP `{exe} ask_user` 不是弹窗——拿不到 DSH_SESSION_ID，可能唤醒旧会话。**
+3. 问用户：`{exe} ask {id} -q "问题（纯文本选项，从 3 起编号）"`（发邮件+转待回复），收尾 `{exe} ask {id} --done`；回复先 `{exe} reply {id}` 再 `{exe} events --claim {id}` 读原话。
+   提问只用 `{exe} ask`（发邮件）；别用 DSH `ask_user_question` 弹窗 / MCP `{exe} ask_user`（唤醒旧会话）。
 4. **不要自己 done / close**：用户回 1 后由 tba serve 聚合器自动 finish。这是本简报里唯一一条 done/close 规则。
 5. 拿不准的先用上面的 `ask -q` 问用户，别假设后硬干；同时把疑问写进备注并回报主代理。
 6. 探查大文件先量行数、grep 定位、按行段读，别整份读几千行的大文件。
@@ -4676,7 +4677,7 @@ fn workflow_text_zh(
     // 第 3 步：数字协议由 tb 执行（agent 不解释、不跑 done），只有 1 收尾。
     // ask 默认挂后台常驻监听，所以这里不再有单独的 wait 一步。
     s.push_str(&format!(
-        "3. 要用户输入（主代理/子代理都一样）：`{exe} ask <claim_id> -q \"问题（纯文本选项，从 3 起编号）\"` 转「{0}」+列「{1}」+发邮件，立即返回；回复由 tba serve 托管。**主代理手上没有现成 claim 时直接 `{exe} ask -q \"...\"`，tba 自动新建一条 task 并转待回复。ask 写备注+发邮件+转待回复/列3。两条禁用：① DSH `ask_user_question` 是聊天弹窗——回答只留 DSH 会话，到不了邮件/Teambition；② MCP `{exe} ask_user` 不是弹窗——拿不到 DSH_SESSION_ID，可能唤醒旧会话**。回复数字 tb 处理：1=已解决→列{3}收尾；2=先写项目记忆→列{2}，写完再ask；3+=有问题→列{2}；非数字=按原文→列{2}；0 已废弃，按原文不收尾。只有1收尾，其余回列{2}。只等别重复问。自定义选项必须从 3 起编号（3/4/5…），1/2 系统保留（1=收尾 2=写记忆，tb 直接执行），拿 1/2 当自己的选项会让用户回 1 被误收尾，tba 会拒绝发这种问题。选项用纯文本编号，**主代理不在聊天问**。\n",
+        "3. 要用户输入（主代理/子代理都一样）：`{exe} ask <claim_id> -q \"问题（纯文本选项，从 3 起编号）\"` 转「{0}」+列「{1}」+发邮件，立即返回；回复由 tba serve 托管。**主代理手上没有现成 claim 时直接 `{exe} ask -q \"...\"`，tba 自动新建一条 task 并转待回复。ask 写备注+发邮件+转待回复/列3。提问/汇报只用 CLI `{exe} ask`（发邮件+Teambition）；别用 DSH `ask_user_question` 弹窗，也别用 MCP `{exe} ask_user`（唤醒旧会话）**。回复数字 tb 处理：1=已解决→列{3}收尾；2=先写项目记忆→列{2}，写完再ask；3+=有问题→列{2}；非数字=按原文→列{2}；0 已废弃，按原文不收尾。只有1收尾，其余回列{2}。只等别重复问。自定义选项必须从 3 起编号（3/4/5…），1/2 系统保留（1=收尾 2=写记忆，tb 直接执行），拿 1/2 当自己的选项会让用户回 1 被误收尾，tba 会拒绝发这种问题。选项用纯文本编号，**主代理不在聊天问**。\n",
         STAGE_WAIT, cfg.tasklist_wait, cfg.tasklist_claim, cfg.tasklist_done
     ));
 
@@ -5346,7 +5347,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
           **自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，\
           拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。选项写纯文本，\
           **主代理要用户拍板也走 CLI `{exe} ask`：没有现成 claim 时直接 `{exe} ask -q \"问题（纯文本选项，从 3 起编号）\"`，tba 自动新建一条 task 并转「待回复」；有 claim 就 `{exe} ask <claim_id> -q \"...\"`。ask 写问题进任务备注 + 发邮件 + 转「待回复」/列3，回复由 tba serve 的 WatchAggregator 托管；不直接在聊天框给选项。**\n\
-           两条禁用，原因不同，别混：**① DSH 的 `ask_user_question` 是聊天弹窗——禁用。弹窗回答只留在 DSH 会话，tba 的回复通道是邮件/Teambition 评论，弹窗答案到不了 worker。② MCP `tba ask_user`（`tba serve` 暴露）不是弹窗——禁用。MCP 路径拿不到 DSH_SESSION_ID，回复可能唤醒旧会话。**\n\
+           提问/汇报只用 CLI `{exe} ask`（发邮件+Teambition）；别用 DSH `ask_user_question` 弹窗，也别用 MCP `{exe} ask_user`（唤醒旧会话）。\n\
           **查看回复**：执行中收到的回复用 `{exe} events --claim <claim_id>` 看分流卡（分类/字数/摘要），默认不读原文；要看原文才 `--full`。\
           原因（用户原话）「主代理上下文不能太长，我怕他主代理先抽风或者出问题」。\
           三层分流：① 纯数字收尾（closed/summarize）主代理自己做；② 实质需求（free/custom:N）转手子代理，原文由子代理读；③ 要拍板走 `{exe} ask -q`。正文永不主动进主代理上下文。\
@@ -6288,7 +6289,7 @@ mod tests {
             &["不许自己改任务状态或看板列"],
             &["不许自编任务"],
             &["不许自己跑 `tba done`", "只有用户能收尾"],
-            &["纯文本编号", "是聊天弹窗", "不是弹窗"],
+            &["纯文本编号", "ask_user_question", "弹窗", "ask_user", "旧会话", "发邮件"],
             &["长操作前后各跑一次"],
             &["永不超时"],
             &["自动退回", "用户已收尾"],
@@ -6708,11 +6709,13 @@ mod tests {
         assert!(t.contains("tba reply clm-1"), "缺 reply 命令: {t}");
         assert!(t.contains("tba events --claim clm-1"), "缺 events 命令: {t}");
         assert!(t.contains("ask_user_question"), "缺点名 DSH ask_user_question: {t}");
-        assert!(t.contains("是聊天弹窗"), "缺 DSH 弹窗定性: {t}");
-        assert!(t.contains("只留在 DSH 会话"), "缺弹窗答案到不了 tba 的理由: {t}");
+        assert!(t.contains("弹窗"), "缺 DSH 弹窗ban 理由: {t}");
         assert!(t.contains("ask_user"), "缺点名 MCP ask_user: {t}");
-        assert!(t.contains("不是弹窗"), "缺 MCP 非弹窗澄清: {t}");
-        assert!(t.contains("拿不到 DSH_SESSION_ID"), "缺 MCP 唤醒旧会话理由: {t}");
+        assert!(t.contains("旧会话"), "缺 MCP 唤醒旧会话理由: {t}");
+        assert!(t.contains("发邮件"), "缺走 CLI ask 发邮件理由: {t}");
+        // 精简文案：禁用那一行必须短（不再复述两段长理由）。
+        let ban_line = t.lines().find(|l| l.contains("ask_user_question")).unwrap();
+        assert!(ban_line.chars().count() < 120, "禁用行过长({} 字): {ban_line}", ban_line.chars().count());
         assert!(!t.contains("不要自己 ask"), "旧「不要自己 ask」还在: {t}");
         assert!(!t.contains("不自己 ask"), "旧「不自己 ask」还在: {t}");
         assert!(!t.contains("do NOT ask"), "旧「do NOT ask」还在: {t}");
@@ -6734,12 +6737,14 @@ mod tests {
         assert!(t.contains("tba reply <claim_id>"), "缺主代理 reply: {t}");
         assert!(t.contains("tba events --claim"), "缺主代理 events: {t}");
         assert!(t.contains("ask_user_question"), "缺点名禁用 DSH 选择框: {t}");
-        assert!(t.contains("是聊天弹窗"), "缺 DSH 弹窗定性: {t}");
-        assert!(t.contains("只留在 DSH 会话"), "缺弹窗理由: {t}");
+        assert!(t.contains("弹窗"), "缺 DSH 弹窗 ban 理由: {t}");
         assert!(t.contains("ask_user"), "缺点名禁用 MCP ask_user: {t}");
-        assert!(t.contains("不是弹窗"), "缺 MCP 非弹窗澄清: {t}");
-        assert!(t.contains("拿不到 DSH_SESSION_ID"), "缺 MCP 唤醒旧会话理由: {t}");
+        assert!(t.contains("旧会话"), "缺 MCP 唤醒旧会话理由: {t}");
+        assert!(t.contains("发邮件"), "缺走 CLI ask 发邮件理由: {t}");
         assert!(t.contains("不直接在聊天框给选项"), "缺不直接聊天问: {t}");
+        // 精简文案：入口块里的禁用行必须短。
+        let ban_line = t.lines().find(|l| l.contains("ask_user_question")).unwrap();
+        assert!(ban_line.chars().count() < 120, "入口禁用行过长({} 字): {ban_line}", ban_line.chars().count());
     }
 
     // 裸 `tba sub` 是常驻监听（空队列不退出），前台跑会挂住会话；入口块必须写明后台执行。
@@ -6953,8 +6958,9 @@ mod tests {
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(s.contains("tba serve 的 WatchAggregator 统一托管"), "缺聚合器托管说明: {s}");
         assert!(s.contains("tba ask <claim_id> -q") || s.contains("纯文本"), "缺纯文本 ask 说明: {s}");
-        assert!(s.contains("ask_user_question") && s.contains("是聊天弹窗"), "缺 DSH 弹窗定性: {s}");
-        assert!(s.contains("不是弹窗") && s.contains("拿不到 DSH_SESSION_ID"), "缺 MCP 非弹窗澄清: {s}");
+        assert!(s.contains("ask_user_question") && s.contains("弹窗"), "缺 DSH 弹窗 ban 理由: {s}");
+        assert!(s.contains("ask_user") && s.contains("旧会话"), "缺 MCP 唤醒旧会话理由: {s}");
+        assert!(s.contains("发邮件"), "缺走 CLI ask 发邮件理由: {s}");
         assert!(s.contains("主代理要用户拍板也走"), "缺主代理也走 tba ask 规则: {s}");
         assert!(s.contains("自动新建一条 task"), "缺无 claim 自动建 task 规则: {s}");
         for stale in ["spawn detached", "DSH 后台唤醒配方"] {

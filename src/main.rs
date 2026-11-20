@@ -13,6 +13,7 @@ mod mcp_server;
 mod naming;
 mod oauth;
 mod ops;
+mod preset_install;
 mod proc;
 mod shot;
 mod store;

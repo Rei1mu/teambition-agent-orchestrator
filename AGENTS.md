@@ -1,4 +1,4 @@
-<!-- tba:bootstrap v0.2.64 由 tba 自动生成，删掉不影响功能 -->
+<!-- tba:bootstrap v0.2.65 由 tba 自动生成，删掉不影响功能 -->
 tba 是本机已安装的命令行工具，在 PATH 里。当前项目用它管任务队列。
 **直接执行 `tba`。不要为了找它去搜 exe、不要验证路径、不要 `where tba`。**
 跑不通就把错误原样报给用户。只有用户明确要求排查时才 `tba doctor`。
@@ -129,7 +129,7 @@ Copy-Item D:\dev\mcp\target\release\tbagui.exe C:\Users\user\tba\tbagui.exe -For
 **收到用户回复自己判断分派**：发出 `tba sub` 进监听后，用户可能在本会话或其他渠道回复；先 `tba reply <claim_id>` + `tba events --claim <claim_id>` 读回原话，再自己判断是「继续当前子代理任务」（`send_message` 转给现有子代理）还是「新任务派新子代理」（按上面打 tag 规范新起 agent-N）。别都当新任务，也别把新任务塞回旧子代理。
 
 **回复监听**：`ask` 写问题进备注 + 转「待回复」+ 发邮件后立即返回；监听由 **tba serve 的 WatchAggregator 统一托管**。邮件/Teambition 新回复写 `data/wakes/<sessionId>.json`，dsh-tba-bridge 插件注入会话、立刻唤醒；1=收尾 2=写记忆 3+=有问题（0 已废弃按原文不收尾），只有用户回 1 才由聚合器 finish。**自定义问题（`-q`）的选项必须从 3 起编号（3/4/5…），1/2 是系统保留号**，拿 1/2 当自己的选项会让用户回 1 被直接收尾，tba 会拒绝发这种问题。选项写纯文本，**主代理要用户拍板也走 CLI `tba ask`：没有现成 claim 时直接 `tba ask -q "问题（纯文本选项，从 3 起编号）"`，tba 自动新建一条 task 并转「待回复」；有 claim 就 `tba ask <claim_id> -q "..."`。ask 写问题进任务备注 + 发邮件 + 转「待回复」/列3，回复由 tba serve 的 WatchAggregator 托管；不直接在聊天框给选项。**
-两条禁用，原因不同，别混：**① DSH 的 `ask_user_question` 是聊天弹窗——禁用。弹窗回答只留在 DSH 会话，tba 的回复通道是邮件/Teambition 评论，弹窗答案到不了 worker。② MCP `tba ask_user`（`tba serve` 暴露）不是弹窗——禁用。MCP 路径拿不到 DSH_SESSION_ID，回复可能唤醒旧会话。**
+提问/汇报只用 CLI `tba ask`（发邮件+Teambition）；别用 DSH `ask_user_question` 弹窗，也别用 MCP `tba ask_user`（唤醒旧会话）。
 **查看回复**：执行中收到的回复用 `tba events --claim <claim_id>` 看分流卡（分类/字数/摘要），默认不读原文；要看原文才 `--full`。原因（用户原话）「主代理上下文不能太长，我怕他主代理先抽风或者出问题」。三层分流：① 纯数字收尾（closed/summarize）主代理自己做；② 实质需求（free/custom:N）转手子代理，原文由子代理读；③ 要拍板走 `tba ask -q`。正文永不主动进主代理上下文。不要后台挂起、不要等待者、不要 `--no-wait`、不要重跑 `ask`（会重复发信）。**会话窗直接回**：用户直接在聊天框打字也会唤醒会话，但后台监听只看邮件和评论、看不到它，所以先跑 `tba reply <claim_id>` 把任务推回「进行中」再干活，干完再 `ask`。只有用户能 `done`/`close`，放弃用 `tba release`。
 
 **通用能力**（别自己拼脚本）：`doctor` 环境自检 / `git create` 建或连接 GitHub 仓库（**别装 gh**）/ `git main -m` 提交推送 / `publish` 发版 / `shot` 截图。先 `tba --help`。

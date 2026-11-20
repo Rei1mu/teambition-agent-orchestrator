@@ -1,0 +1,103 @@
+# tba 模式：基于 standard 裁剪，去掉跟 tba 工作流冲突的插件：
+#   - persona：保留 "You are a coding agent." 帮助编码，去掉 powered by {{model}} 那段
+#   - tool-ask-user：注册 ask_user_question 聊天弹窗；tba 提问/汇报走 CLI tba ask（发邮件+Teambition）
+#   - planning / plan-mode：内含 ask_user_question 指引，且 plan mode 与 tba 直接干活的节奏冲突
+#   - command-goal / tool-goal：DSH goal 与 tba 的 Teambition 任务队列是两套系统，避免混淆
+#   - tool-schedule：tba 有自己的提醒/回复监听，不在模型侧建 DSH 定时任务
+#   - workflow-ptc / tool-workflow：DSH 多代理编排不走 tba 打 tag / 汇报流程（subagent 工具保留，tba sub 派活要用）
+#   - tool-web：需要 DS 搜索 API，tba 调研走 modsearch 插件的 web_search/fetch
+- insert:
+    - id: preset-tba
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: tba
+        name: tba模式
+        description: 用 tba 任务队列流程的编码模式；无 ask_user_question 弹窗/plan-mode/goal/定时任务/workflow/web 工具，保留 subagent 供 tba sub 派活，提问走 tba ask 发邮件。
+        order: 5
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a coding agent.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              customSkillDirs:
+                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          # tool-ask-user 故意不挂：ask_user_question 是聊天弹窗，tba 流程走 tba ask 发邮件。
+          # tba sub 派活依赖下面三个工具：subagent 派子代理、fork 用 subagent_fork、control 提供 list_agents/send_message。
+          # workflow-ptc / tool-workflow 故意不挂：DSH 多代理编排不走 tba 打 tag / 汇报流程。
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: false
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+                config:
+                  interrupt: false
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelection: true
+                  modelDiscovery: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-office
+            name: '@deepseek-ai/dsh-tool-office'
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: !!js "!ctx.get('profileContext')"

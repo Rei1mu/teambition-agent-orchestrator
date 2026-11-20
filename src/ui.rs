@@ -47,6 +47,8 @@ enum Ev {
     ToolchainChecked(crate::toolchain::Resolved),
     /// DSH 插件检测结果（后台，不挡窗口）
     PluginsChecked(Vec<PluginStatus>),
+    /// 一键安装 DSH 预设的结果
+    PresetsInstalled(Result<String, String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -269,6 +271,8 @@ pub struct App {
     tc_resolved: Option<crate::toolchain::Resolved>,
     // DSH 插件状态（None = 后台还没测完）
     plugins: Option<Vec<PluginStatus>>,
+    // 一键装预设在跑（按钮置灰 + 显示「安装中...」）
+    preset_busy: bool,
 }
 
 // skill 编辑窗的编辑态。正文是整段 markdown，直接存 String。
@@ -612,6 +616,7 @@ impl App {
             tc_check: Some(true),
             tc_resolved: None,
             plugins: None,
+            preset_busy: false,
         };
         if !needs_token {
             app.reload_projects();
@@ -1196,6 +1201,18 @@ impl App {
         ui.add_space(10.0);
         ui.label(egui::RichText::new("DSH 插件").strong());
         ui.label("只检测、不自动安装。已装/未装都可复制文案（更新或安装），去你自己的 shell 跑（本机 dsh 不在 PATH）。");
+        ui.horizontal_wrapped(|ui| {
+            if self.preset_busy {
+                ui.label("安装中...");
+            } else if ui.button("安装 tba模式/聊天模式预设").clicked() {
+                self.preset_busy = true;
+                self.status = "正在安装 DSH 预设...".to_string();
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let _ = tx.send(Ev::PresetsInstalled(crate::preset_install::install_presets()));
+                });
+            }
+        });
         let Some(rows) = self.plugins.as_ref() else {
             ui.label("检测中...");
             return;
@@ -1391,6 +1408,13 @@ impl eframe::App for App {
                 }
                 Ev::PluginsChecked(rows) => {
                     self.plugins = Some(rows);
+                }
+                Ev::PresetsInstalled(r) => {
+                    self.preset_busy = false;
+                    self.status = match r {
+                        Ok(msg) => msg,
+                        Err(e) => format!("安装 DSH 预设失败: {e}"),
+                    };
                 }
                 Ev::GbInstalled(r) => {
                     self.gb_busy = false;
