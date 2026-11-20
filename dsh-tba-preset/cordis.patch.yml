@@ -1,6 +1,6 @@
 # tba 模式：基于 standard 裁剪，去掉跟 tba 工作流冲突的插件：
 #   - persona：prefix 保留 "You are a coding agent." 帮助编码，去掉 powered by；suffix 提醒 tba sub 后台跑
-#   （v1.0.1：加 suffix「tba sub 用 run_in_background=true 挂后台，别前台等 120s」）
+#   （v1.0.2：suffix 改成英文，只留操作指令）
 #   - tool-ask-user：注册 ask_user_question 聊天弹窗；tba 提问/汇报走 CLI tba ask（发邮件+Teambition）
 #   - planning / plan-mode：内含 ask_user_question 指引，且 plan mode 与 tba 直接干活的节奏冲突
 #   - command-goal / tool-goal：DSH goal 与 tba 的 Teambition 任务队列是两套系统，避免混淆
@@ -20,7 +20,7 @@
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: You are a coding agent.
-              suffix: '跑 tba sub 时用 pwsh(command="tba sub", run_in_background=true) 后台挂监听；别前台跑，会卡满 120 秒超时。'
+              suffix: 'When running tba sub, use pwsh(command="tba sub", run_in_background=true) to attach the listener in the background.'
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
