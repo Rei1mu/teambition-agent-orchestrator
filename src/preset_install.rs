@@ -12,9 +12,17 @@ const TBA_PACKAGE: &str = include_str!("../dsh-tba-preset/package.json");
 const TBA_PATCH: &str = include_str!("../dsh-tba-preset/cordis.patch.yml");
 const CHAT_PACKAGE: &str = include_str!("../dsh-chat-preset/package.json");
 const CHAT_PATCH: &str = include_str!("../dsh-chat-preset/cordis.patch.yml");
+const PWSH_LITE_PACKAGE: &str = include_str!("../dsh-pwsh-lite/package.json");
+const PWSH_LITE_PATCH: &str = include_str!("../dsh-pwsh-lite/cordis.patch.yml");
+const PWSH_LITE_JS: &str = include_str!("../dsh-pwsh-lite/index.js");
+const BRIDGE_PACKAGE: &str = include_str!("../dsh-tba-bridge/package.json");
+const BRIDGE_PATCH: &str = include_str!("../dsh-tba-bridge/cordis.patch.yml");
+const BRIDGE_JS: &str = include_str!("../dsh-tba-bridge/index.js");
 
 const TBA_DEP: &str = "@local/dsh-tba-preset";
 const CHAT_DEP: &str = "@local/dsh-chat-preset";
+pub const PWSH_LITE_DEP: &str = "@local/dsh-pwsh-lite";
+const BRIDGE_DEP: &str = "dsh-tba-bridge";
 
 /// 从 DSH 主进程命令行里解析出来的路径。
 #[derive(Clone, Debug, PartialEq)]
@@ -138,6 +146,27 @@ fn write_bundle(dir: &Path, package: &str, patch: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 从 profile node_modules 读已装插件的 version（读不到返回 None）。
+fn installed_plugin_version(paths: &DshPaths, dep: &str) -> Option<String> {
+    std::fs::read_to_string(
+        paths.profile_dir.join("node_modules").join(dep).join("package.json"),
+    )
+    .ok()
+    .as_deref()
+    .and_then(read_version)
+}
+
+/// 写插件源码的 3 个运行时文件（package.json / patch / index.js）；内容没变不动盘。
+fn write_plugin_source(dir: &Path, package: &str, patch: &str, js: &str) -> Result<(), String> {
+    write_bundle(dir, package, patch)?;
+    let js_path = dir.join("index.js");
+    if !matches!(std::fs::read_to_string(&js_path).as_deref(), Ok(s) if s == js) {
+        std::fs::write(&js_path, js)
+            .map_err(|e| format!("无法写入 {}: {e}", js_path.display()))?;
+    }
+    Ok(())
+}
+
 /// 从 bundle package.json 里读 version（纯函数，取不到返回 None）。
 fn read_version(package_json: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(package_json)
@@ -173,12 +202,7 @@ fn compare_version(a: &str, b: &str) -> CmpOrdering {
 /// 判断 profile package.json 里预设是否完整装好。
 /// DSH 加载 bundle 需要两件事同时成立：dependencies 里有 dep（pnpm 软链），
 /// 且 dsh.profile.bundles 数组里有同名项（DSH 注册）。只查一边会误判。
-#[cfg(test)]
-pub fn deps_installed(package_json: &str) -> bool {
-    dep_installed(package_json, TBA_DEP) && dep_installed(package_json, CHAT_DEP)
-}
-
-fn dep_installed(package_json: &str, name: &str) -> bool {
+fn dep_registered(package_json: &str, name: &str) -> bool {
     has_dep(package_json, name) && has_bundle(package_json, name)
 }
 
@@ -193,6 +217,17 @@ fn has_dep(package_json: &str, name: &str) -> bool {
                 .as_str()
                 .map(|s| !s.is_empty())
         })
+        .unwrap_or(false)
+}
+
+/// 判断 dependencies[dep] 是否是 link:<dir>（归一化斜杠/大小写后比较）。
+/// bridge 必须始终指向 tba 内嵌落盘目录；指向别处（如旧的 ~/.dsh source）时要重新 pnpm add。
+fn dep_points_to(package_json: &str, dep: &str, dir: &Path) -> bool {
+    let wanted = format!("link:{}", dir.to_string_lossy().replace('\\', "/")).to_lowercase();
+    serde_json::from_str::<serde_json::Value>(package_json)
+        .ok()
+        .and_then(|v| v.get("dependencies")?.get(dep)?.as_str().map(|s| s.to_string()))
+        .map(|s| s.replace('\\', "/").to_lowercase() == wanted)
         .unwrap_or(false)
 }
 
@@ -355,7 +390,50 @@ fn action_text(action: &Action) -> String {
     }
 }
 
+/// 把一个本地目录以 link: 依赖装进运行中 DSH profile，并加入 dsh.profile.bundles。
+/// 给 GUI 的「一键安装」用：与预设安装共用同一套路径解析 + pnpm add 逻辑，
+/// 不手工建 junction，pnpm 自己同步 pnpm-lock.yaml。
+pub fn install_local_plugin(dir: &Path, package: &str) -> Result<String, String> {
+    let cmdline = dsh_command_line()?;
+    let paths = parse_dsh_command_line(&cmdline)
+        .ok_or_else(|| format!("无法从 DSH 进程命令行解析路径: {cmdline}"))?;
+    if !dir.is_dir() {
+        return Err(format!("插件目录不存在: {}", dir.display()));
+    }
+    let manifest = std::fs::read_to_string(dir.join("package.json"))
+        .map_err(|e| format!("读取插件 package.json 失败: {e}"))?;
+    let declared: serde_json::Value = serde_json::from_str(&manifest)
+        .map_err(|e| format!("插件 package.json 不是合法 JSON: {e}"))?;
+    let name = declared.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if name != package {
+        return Err(format!(
+            "插件目录 package.json 的 name 是 {name:?}，期望 {package:?}，拒绝安装"
+        ));
+    }
+
+    let package_json_path = paths.profile_dir.join("package.json");
+    let profile = std::fs::read_to_string(&package_json_path)
+        .map_err(|e| format!("读取 {}: {e}", package_json_path.display()))?;
+    let registered = dep_registered(&profile, package);
+    if !has_dep(&profile, package) {
+        pnpm_add(&paths, package, dir)?;
+    }
+    // pnpm add 会重写 package.json，最后补 bundles 数组。
+    let profile = std::fs::read_to_string(&package_json_path)
+        .map_err(|e| format!("读取 {}: {e}", package_json_path.display()))?;
+    if let Some(updated) = add_bundles(&profile, &[package])? {
+        std::fs::write(&package_json_path, &updated)
+            .map_err(|e| format!("写入 {} 失败: {e}", package_json_path.display()))?;
+    }
+    let what = if registered { "已补齐登记" } else { "已安装" };
+    Ok(format!(
+        "{package} {what}（link:{}）。请完全退出并重启 DSH 使插件生效。",
+        dir.display()
+    ))
+}
+
 /// 一键安装。返回值直接显示到 GUI 状态栏。
+/// 同时处理两个 DSH 预设和 pwsh-lite / dsh-tba-bridge 两个本地插件，四个包都按 version 比对。
 pub fn install_presets() -> Result<String, String> {
     let cmdline = dsh_command_line()?;
     let paths = parse_dsh_command_line(&cmdline)
@@ -365,14 +443,18 @@ pub fn install_presets() -> Result<String, String> {
     let root = presets_root();
     let tba_dir = root.join("dsh-tba-preset");
     let chat_dir = root.join("dsh-chat-preset");
+    // 插件源码目录（与 GUI「安装 pwsh-lite 插件」按钮、现有 junction 指向保持一致）。
+    // index.js 是运行时文件，必须留在源码目录里让 pnpm link 指过去，不能只写 bundle 文件。
+    let pwsh_lite_dir = PathBuf::from(crate::ui::PWSH_LITE_SOURCE);
 
+    // 两个预设用 write_bundle 写 2 个文件；插件额外写 index.js。
     let specs = [
         (TBA_DEP, &tba_dir, TBA_PACKAGE, TBA_PATCH),
         (CHAT_DEP, &chat_dir, CHAT_PACKAGE, CHAT_PATCH),
     ];
     // 先决策：读已装目录版本 + profile 登记状态，不写任何盘。
     let mut decisions = Vec::new();
-    let mut profile = std::fs::read_to_string(&package_json_path)
+    let profile = std::fs::read_to_string(&package_json_path)
         .map_err(|e| format!("读取 {}: {e}", package_json_path.display()))?;
     for (dep, dir, package, patch) in &specs {
         let installed_version = std::fs::read_to_string(dir.join("package.json"))
@@ -381,25 +463,55 @@ pub fn install_presets() -> Result<String, String> {
             .and_then(read_version);
         let embedded_version = read_version(package)
             .ok_or_else(|| format!("内嵌 bundle {dep} 的 package.json 缺少 version"))?;
-        let action = decide_action(installed_version.as_deref(), &embedded_version, dep_installed(&profile, dep));
+        let action = decide_action(installed_version.as_deref(), &embedded_version, dep_registered(&profile, dep));
         decisions.push((*dep, *dir, *package, *patch, action));
     }
 
+    // 插件统一从 profile node_modules 读已装版本；源码落盘在 presets_root() 同级。
+    let plugin_installed_version = installed_plugin_version(&paths, PWSH_LITE_DEP);
+    let plugin_embedded_version = read_version(PWSH_LITE_PACKAGE)
+        .ok_or_else(|| format!("内嵌 bundle {PWSH_LITE_DEP} 的 package.json 缺少 version"))?;
+    let plugin_action = decide_action(
+        plugin_installed_version.as_deref(),
+        &plugin_embedded_version,
+        dep_registered(&profile, PWSH_LITE_DEP),
+    );
+
+    // bridge：源码内嵌随 tba 分发，跟 pwsh-lite 一样的版本检查 + 落盘 + link。
+    let bridge_dir = root.join("dsh-tba-bridge");
+    let bridge_installed_version = installed_plugin_version(&paths, BRIDGE_DEP);
+    let bridge_embedded_version = read_version(BRIDGE_PACKAGE)
+        .ok_or_else(|| format!("内嵌 bundle {BRIDGE_DEP} 的 package.json 缺少 version"))?;
+    let bridge_action = decide_action(
+        bridge_installed_version.as_deref(),
+        &bridge_embedded_version,
+        dep_registered(&profile, BRIDGE_DEP),
+    );
+    // 版本相同也可能 link 还指向旧的 ~/.dsh/dsh-tba-bridge；强制以 tba 内嵌源为准。
+    let bridge_relink = !dep_points_to(&profile, BRIDGE_DEP, &bridge_dir);
+
     let all_skipped = decisions
         .iter()
-        .all(|(_, _, _, _, a)| matches!(a, Action::SkipLatest(_)));
+        .all(|(_, _, _, _, a)| matches!(a, Action::SkipLatest(_)))
+        && matches!(plugin_action, Action::SkipLatest(_))
+        && matches!(bridge_action, Action::SkipLatest(_))
+        && !bridge_relink;
     if all_skipped {
         let versions: Vec<String> = decisions
             .iter()
             .filter_map(|(_, _, _, _, a)| match a {
-                Action::SkipLatest(v) => Some(format!("v{v}")),
+                Action::SkipLatest(v) => Some(format!("{v}")),
                 _ => None,
             })
+            .chain([&plugin_action, &bridge_action].iter().filter_map(|a| match a {
+                Action::SkipLatest(v) => Some(v.clone()),
+                _ => None,
+            }))
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
         return Ok(format!(
-            "两个预设已是最新（{}），无需更新。请手动重启 DSH 使预设生效。",
+            "四个包已是最新（{}），无需更新。请手动重启 DSH 使预设与插件生效。",
             versions.join("、")
         ));
     }
@@ -422,21 +534,45 @@ pub fn install_presets() -> Result<String, String> {
         pnpm_add(&paths, dep, dir)?;
     }
 
-    // pnpm add 会重写 package.json，最后补 bundles 数组。
-    profile = std::fs::read_to_string(&package_json_path)
+    // pnpm add 会重写 package.json，最后补 bundles 数组（含 pwsh-lite）。
+    let profile = std::fs::read_to_string(&package_json_path)
         .map_err(|e| format!("读取 {}: {e}", package_json_path.display()))?;
-    if let Some(updated) = add_bundles(&profile, &[TBA_DEP, CHAT_DEP])? {
+    if let Some(updated) = add_bundles(&profile, &[TBA_DEP, CHAT_DEP, PWSH_LITE_DEP, BRIDGE_DEP])? {
         std::fs::write(&package_json_path, &updated)
             .map_err(|e| format!("写入 {} 失败: {e}", package_json_path.display()))?;
     }
 
+    // 插件：版本变化 / 缺登记 / link 指向旧源时，把内嵌文件写到落盘目录，再走 install_local_plugin。
+    for (dir, package, patch, js, dep, action, force_relink) in [
+        (&pwsh_lite_dir, PWSH_LITE_PACKAGE, PWSH_LITE_PATCH, PWSH_LITE_JS, PWSH_LITE_DEP, &plugin_action, false),
+        (&bridge_dir, BRIDGE_PACKAGE, BRIDGE_PATCH, BRIDGE_JS, BRIDGE_DEP, &bridge_action, bridge_relink),
+    ] {
+        if matches!(action, Action::SkipLatest(_)) && !force_relink {
+            continue;
+        }
+        write_plugin_source(dir, package, patch, js)?;
+        if force_relink {
+            // has_dep 为真但 link 指向旧源：直接 pnpm add 覆盖 link 目标。
+            pnpm_add(&paths, dep, dir)?;
+        }
+        install_local_plugin(dir, dep)?;
+    }
+
+    let bridge_display = if bridge_relink && matches!(bridge_action, Action::SkipLatest(_)) {
+        Action::RegisterOnly(bridge_embedded_version.clone())
+    } else {
+        bridge_action
+    };
     let summary: Vec<String> = decisions
         .iter()
-        .filter(|(_, _, _, _, a)| !matches!(a, Action::SkipLatest(_)))
         .map(|(dep, _, _, _, a)| format!("{dep}: {}", action_text(a)))
+        .chain([
+            format!("{PWSH_LITE_DEP}: {}", action_text(&plugin_action)),
+            format!("{BRIDGE_DEP}: {}", action_text(&bridge_display)),
+        ])
         .collect();
     Ok(format!(
-        "{}。请手动重启 DSH 使预设生效。",
+        "{}。请手动重启 DSH 使预设与插件生效。",
         summary.join("；")
     ))
 }
@@ -473,12 +609,13 @@ mod tests {
         let bundle_only = r#"{"dsh":{"profile":{"bundles":["@local/dsh-tba-preset","@local/dsh-chat-preset"]}}}"#;
         let one = r#"{"dependencies":{"@local/dsh-tba-preset":"link:D:/a"},"dsh":{"profile":{"bundles":["@local/dsh-tba-preset"]}}}"#;
         let none = r#"{"dependencies":{}}"#;
-        assert!(deps_installed(both));
-        assert!(!deps_installed(dep_only), "只加依赖但 bundles 没登记，DSH 不加载");
-        assert!(!deps_installed(bundle_only), "只登记 bundles 但没软链，也不可用");
-        assert!(!deps_installed(one));
-        assert!(!deps_installed(none));
-        assert!(!deps_installed("not json"));
+        assert!(dep_registered(both, TBA_DEP) && dep_registered(both, CHAT_DEP));
+        assert!(!dep_registered(dep_only, TBA_DEP), "只加依赖但 bundles 没登记，DSH 不加载");
+        assert!(!dep_registered(bundle_only, TBA_DEP), "只登记 bundles 但没软链，也不可用");
+        assert!(dep_registered(one, TBA_DEP));
+        assert!(!dep_registered(one, CHAT_DEP));
+        assert!(!dep_registered(none, TBA_DEP));
+        assert!(!dep_registered("not json", TBA_DEP));
     }
 
     #[test]
@@ -490,7 +627,7 @@ mod tests {
         assert_eq!(v["name"], "dsh-profile-desktop");
         assert_eq!(v["dependencies"]["x"], "1");
         assert_eq!(v["dsh"]["profile"]["bundles"].as_array().unwrap().len(), 2);
-        assert!(!deps_installed(&out)); // 只有 bundles，dependencies 还没加
+        assert!(!dep_registered(&out, TBA_DEP)); // 只有 bundles，dependencies 还没加
 
         // 只有一个：补齐另一个，不动已有项顺序。
         let src = r#"{"dependencies":{"@local/dsh-tba-preset":"link:D:/a","@local/dsh-chat-preset":"link:D:/b"},"dsh":{"profile":{"bundles":["other", "@local/dsh-tba-preset"]}}}"#;
@@ -503,7 +640,7 @@ mod tests {
             .map(|b| b.as_str().unwrap())
             .collect();
         assert_eq!(bundles, vec!["other", TBA_DEP, CHAT_DEP]);
-        assert!(deps_installed(&out));
+        assert!(dep_registered(&out, TBA_DEP) && dep_registered(&out, CHAT_DEP));
 
         // 两个都有：不重复添加，返回 None。
         let src = r#"{"dependencies":{"@local/dsh-tba-preset":"link:D:/a","@local/dsh-chat-preset":"link:D:/b"},"dsh":{"profile":{"bundles":["@local/dsh-tba-preset","@local/dsh-chat-preset"]}}}"#;
@@ -578,8 +715,134 @@ mod tests {
 
     #[test]
     fn embedded_versions_are_readable() {
-        // 内嵌的两个 package.json 都能读出自己的 version（当前 1.0.0）。
+        // 内嵌的两个预设 + pwsh-lite 插件的 package.json 都能读出自己的 version。
         assert!(read_version(TBA_PACKAGE).is_some());
         assert!(read_version(CHAT_PACKAGE).is_some());
+        assert_eq!(read_version(PWSH_LITE_PACKAGE).as_deref(), Some("1.0.0"));
+        assert_eq!(read_version(PWSH_LITE_PACKAGE), read_version(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/dsh-pwsh-lite/package.json"
+            ))
+            .unwrap()
+        ));
+    }
+
+    #[test]
+    fn plugin_decide_action_covers_all_cases() {
+        // 插件没装 -> Install
+        assert_eq!(
+            decide_action(None, "1.0.1", false),
+            Action::Install("1.0.1".to_string())
+        );
+        // 旧版本 -> Upgrade
+        assert_eq!(
+            decide_action(Some("1.0.0"), "1.0.1", false),
+            Action::Upgrade("1.0.0".to_string(), "1.0.1".to_string())
+        );
+        // 同版本 + 已登记 -> SkipLatest
+        assert_eq!(
+            decide_action(Some("1.0.1"), "1.0.1", true),
+            Action::SkipLatest("1.0.1".to_string())
+        );
+        // 同版本 + 未登记 -> RegisterOnly
+        assert_eq!(
+            decide_action(Some("1.0.1"), "1.0.1", false),
+            Action::RegisterOnly("1.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn dep_points_to_detects_old_bridge_source() {
+        let dir = Path::new(r"C:\Users\user\tba\presets\dsh-tba-bridge");
+        let new = r#"{"dependencies":{"dsh-tba-bridge":"link:C:/Users/user/tba/presets/dsh-tba-bridge"}}"#;
+        let old = r#"{"dependencies":{"dsh-tba-bridge":"link:C:/Users/user/.dsh/dsh-tba-bridge"}}"#;
+        let backslash = r#"{"dependencies":{"dsh-tba-bridge":"link:C:\\Users\\user\\tba\\presets\\dsh-tba-bridge"}}"#;
+        assert!(dep_points_to(new, BRIDGE_DEP, dir), "指向内嵌目录 -> 不用重链");
+        assert!(!dep_points_to(old, BRIDGE_DEP, dir), "指向旧 ~/.dsh 源 -> 必须重链");
+        assert!(dep_points_to(backslash, BRIDGE_DEP, dir), "反斜杠写法应等价");
+        assert!(!dep_points_to(r#"{"dependencies":{}}"#, BRIDGE_DEP, dir));
+        assert!(!dep_points_to("not json", BRIDGE_DEP, dir));
+    }
+
+    #[test]
+    fn bridge_decide_action_by_registration_and_version() {
+        // bridge 跟其它插件共用 decide_action：没装 -> Install、旧版 -> Upgrade、同版已登记 -> SkipLatest。
+        assert_eq!(
+            decide_action(None, "0.1.0", false),
+            Action::Install("0.1.0".to_string())
+        );
+        assert_eq!(
+            decide_action(Some("0.0.9"), "0.1.0", true),
+            Action::Upgrade("0.0.9".to_string(), "0.1.0".to_string())
+        );
+        assert_eq!(
+            decide_action(Some("0.1.0"), "0.1.0", true),
+            Action::SkipLatest("0.1.0".to_string())
+        );
+        assert_eq!(
+            decide_action(Some("0.1.0"), "0.1.0", false),
+            Action::RegisterOnly("0.1.0".to_string())
+        );
+        // dep_registered 对 bridge 的判断同其它包。
+        let profile = r#"{"dependencies":{"dsh-tba-bridge":"link:C:/x"},"dsh":{"profile":{"bundles":["dsh-tba-bridge"]}}}"#;
+        assert!(dep_registered(profile, BRIDGE_DEP));
+        assert!(!dep_registered(r#"{"dependencies":{}}"#, BRIDGE_DEP));
+    }
+
+    #[test]
+    fn four_package_summary_includes_all_statuses() {
+        // 汇总文案必须包含四个包，即使两个预设 SkipLatest、插件是 Install。
+        let specs = [
+            (TBA_DEP, "1.0.0", Some("1.0.0"), true),
+            (CHAT_DEP, "1.0.0", Some("1.0.0"), true),
+            (PWSH_LITE_DEP, "1.0.0", None, false),
+            (BRIDGE_DEP, "0.1.0", Some("0.1.0"), true),
+        ];
+        let mut lines = Vec::new();
+        for (dep, embedded, installed, registered) in &specs {
+            let action = decide_action(installed.as_deref(), embedded, *registered);
+            lines.push(format!("{dep}: {}", action_text(&action)));
+            assert!(!lines.last().unwrap().is_empty());
+        }
+        let summary = lines.join("；");
+        assert!(summary.contains(TBA_DEP), "{summary}");
+        assert!(summary.contains(CHAT_DEP), "{summary}");
+        assert!(summary.contains(PWSH_LITE_DEP), "{summary}");
+        assert!(summary.contains(BRIDGE_DEP), "{summary}");
+        assert!(summary.contains("已安装 v1.0.0"), "{summary}");
+        assert!(summary.contains("已是最新 v0.1.0"), "{summary}");
+    }
+
+    #[test]
+    fn bridge_embedded_source_is_readable() {
+        // bridge 内嵌源码可解析出版本，且 name 对得上 BRIDGE_DEP。
+        let manifest: serde_json::Value = serde_json::from_str(BRIDGE_PACKAGE).unwrap();
+        assert_eq!(read_version(BRIDGE_PACKAGE).as_deref(), Some("0.1.0"));
+        assert_eq!(manifest["name"].as_str(), Some(BRIDGE_DEP));
+        assert!(!BRIDGE_JS.is_empty());
+        assert!(BRIDGE_PATCH.contains("dsh-tba-bridge"));
+        // 内嵌内容必须和仓库源码目录一致（避免编译期过期）。
+        let disk = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/dsh-tba-bridge/package.json"
+        )).unwrap();
+        assert_eq!(BRIDGE_PACKAGE, disk);
+    }
+
+    #[test]
+    fn pwsh_lite_dep_constant_matches_manifest() {
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/dsh-pwsh-lite/package.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["name"].as_str(), Some(PWSH_LITE_DEP));
+        // 内嵌的 package.json 内容必须和源码目录里的完全一致（避免编译期过期）。
+        let embedded: serde_json::Value = serde_json::from_str(PWSH_LITE_PACKAGE).unwrap();
+        assert_eq!(manifest, embedded);
     }
 }

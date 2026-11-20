@@ -7,20 +7,32 @@
 #   - tool-schedule：tba 有自己的提醒/回复监听，不在模型侧建 DSH 定时任务
 #   - workflow-ptc / tool-workflow：DSH 多代理编排不走 tba 打 tag / 汇报流程（subagent 工具保留，tba sub 派活要用）
 #   - tool-web：需要 DS 搜索 API，tba 调研走 modsearch 插件的 web_search/fetch
+#   - tool-plugin-manager：注册 plugin_manager 工具（每轮 673 token），tba 有 GUI 安装按钮 + CLI，不需要会话内插件管理页
+# tba 三模式说明（产品化）：
+#   tba    — native 默认，通用干活；工具按需逐个调用，适合零/单次调用、要看原始输出、长工具调用。
+#   tbaptc — PTC run_code，把多次 ps/grep/tba 调用批量进一个程序，适合多工具批量调用省往返。
+#   chat   — 聊天模式（独立 bundle @local/dsh-chat-preset），全量工具 + 二次元虚拟人，不跑 tba 任务。
+# 默认模式由 profile 的 agent-preset-registry.selectedDefault 控制（当前 tba，不在此改动）。
 - insert:
     - id: preset-tba
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: tba
         name: tba模式
-        description: 用 tba 任务队列流程的编码模式；无 ask_user_question 弹窗/plan-mode/goal/定时任务/workflow/web 工具，保留 subagent 供 tba sub 派活，提问走 tba ask 发邮件。
+        description: tba 队列通用模式（默认）；native 工具逐个调用，适合零/单次工具、要看原始输出、长工具调用；提问走 tba ask 发邮件。
         order: 5
         plugins:
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: You are a coding agent.
-              suffix: 'When running tba sub, use pwsh(command="tba sub", run_in_background=true) to attach the listener in the background.'
+              suffix: 'tba sub: pwsh-lite(command="tba sub", run_in_background=true). Keep it running: never job_output or job_kill it. Bridge wakes you.'
+          - id: identity-shadow
+            name: '@local/dsh-tba-preset/identity-shadow.js'
+          # 注意：不要用 shadow 插件覆盖 tool:jobs。
+          # 曾尝试失败：绝对路径 loader 当 bare specifier 解析失败（never started）；
+          # 改包名后若在 preset 里同时挂 tool-jobs，会与 shadow 在同一 preset scope 撞同名 section。
+          # tba sub 的例外写进 persona suffix（order 10200，排在 tool-jobs 之后，模型最后看到）。
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
@@ -32,7 +44,9 @@
             disabled: !!js process.platform === 'win32'
           - id: tool-pwsh
             name: '@deepseek-ai/dsh-tool-pwsh'
-            disabled: !!js process.platform !== 'win32'
+            disabled: !!js true
+          - id: pwsh-lite
+            name: '@local/dsh-pwsh-lite'
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
             config:
@@ -100,6 +114,104 @@
             name: '@deepseek-ai/dsh-tool-present'
           - id: tool-office
             name: '@deepseek-ai/dsh-tool-office'
-          - id: tool-plugin-manager
-            name: '@deepseek-ai/dsh-plugin-manager/tools'
-            disabled: !!js "!ctx.get('profileContext')"
+
+# tbaptc 模式：在 tba 模式基础上启用 PTC（run_code）。
+# PTC runtime 由 base bundle 挂载（id: ptc-runtime，per-call + 文件沙箱策略随会话策略）；
+# 这里只启用 tool-executor-ptc，其余插件与 tba 模式一致，默认模式不变。
+- insert:
+    - id: preset-tbaptc
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: tbaptc
+        name: tbaptc模式
+        description: tba 队列 + PTC run_code；ps/grep/tba 等工具作为 SDK binding 在程序内批量调用，多次工具调用时更省 token；单工具/长工具调用改用 tba。
+        order: 6
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a coding agent.
+              suffix: 'tba sub: pwsh-lite(command="tba sub", run_in_background=true). Keep it running: never job_output or job_kill it. Bridge wakes you. Tools run via run_code PTC; batch ps/grep/tba calls inside one program when practical.'
+          - id: identity-shadow
+            name: '@local/dsh-tba-preset/identity-shadow.js'
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js true
+          - id: pwsh-lite
+            name: '@local/dsh-pwsh-lite'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              customSkillDirs:
+                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: false
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+                config:
+                  interrupt: false
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelection: true
+                  modelDiscovery: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-office
+            name: '@deepseek-ai/dsh-tool-office'
+          - id: tool-executor-ptc
+            name: '@deepseek-ai/dsh-tool-executor-ptc'
+

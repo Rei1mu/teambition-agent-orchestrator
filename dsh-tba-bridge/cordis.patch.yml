@@ -1,0 +1,6 @@
+# dsh-tba-bridge bundle patch.
+# 一行 insert 即挂载 host 半身：轮询 tba 的唤醒请求目录，把回复注入对应会话。
+- insert:
+    - id: dsh-tba-bridge
+      name: 'dsh-tba-bridge'
+      config: {}

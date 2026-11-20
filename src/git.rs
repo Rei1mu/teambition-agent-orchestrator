@@ -993,13 +993,28 @@ fn current_branch(root: &Path) -> String {
     default_branch(root)
 }
 
-// 用 token 注入 HTTP header 推送，不在 .git/config 留明文（避免 PAT 泄漏到 remote URL）。
+// 推送策略：先用裸 git push 走用户已配置的 credential helper；失败时再用
+// extraHeader 注入 token 兜底（适配用户 git 没配凭据、但提供了 GH_TOKEN 的场景）。
+// 注入的 header 会压制 credential manager，所以不能作为第一选择。
 fn push_with_token(
     root: &Path,
     remote: &str,
     branch: &str,
     token: &str,
 ) -> Result<String, String> {
+    let bare = git(
+        root,
+        &["push", "-u", remote, &format!("HEAD:{branch}")],
+    )?;
+    if bare.code == 0 {
+        return Ok(format!("已推送 {branch} -> {remote}（新建上游分支）\n"));
+    }
+    let bare_err = tail(&bare);
+
+    if token.is_empty() {
+        return Err(format!("git push 失败: {bare_err}"));
+    }
+
     let header = format!("Authorization: Basic {}", b64_encode(format!(":{token}").as_bytes()));
     // 只在 github.com 上注入：写死域名，token 不会随任何重定向跑到第三方域。
     // 注意 key 里带 URL，git 的 -c 按第一个 = 分割，value 里的 = (base64 padding) 会保留。
@@ -1023,7 +1038,7 @@ fn push_with_token(
     };
     if out.code != 0 {
         return Err(format!(
-            "git push 失败: {}\n（确认 token 有 repo 权限；私有仓库需要 `repo` scope）",
+            "git push 失败: {bare_err}\n注入 token 重试也失败: {}\n（确认 token 有 repo 权限；私有仓库需要 `repo` scope）",
             tail(&out)
         ));
     }
@@ -1261,6 +1276,38 @@ mod tests {
         let z = workflow_yaml("app", None);
         assert!(z.contains("Compress-Archive"));
         assert!(!z.contains("iscc"));
+    }
+
+    #[test]
+    fn push_with_token_uses_bare_push_first_and_token_only_as_fallback() {
+        let root = std::env::temp_dir().join(format!("tba-git-push-{}", std::process::id()));
+        let script = root.join(if cfg!(windows) { "fake-git.cmd" } else { "fake-git.sh" });
+        let log = root.join("argv.log");
+        let _ = std::fs::create_dir_all(&root);
+        let _ = std::fs::remove_file(&log);
+        if cfg!(windows) {
+            std::fs::write(&script, "@echo off\r\n>>\"%~dp0argv.log\" echo %*\r\nexit /b 0\r\n").unwrap();
+        } else {
+            std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/argv.log\"\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut p = std::fs::metadata(&script).unwrap().permissions();
+                p.set_mode(0o755);
+                std::fs::set_permissions(&script, p).unwrap();
+            }
+        }
+        std::env::set_var("TBA_GIT", &script);
+        let result = push_with_token(&root, "origin", "main", "secret-token");
+        std::env::remove_var("TBA_GIT");
+
+        assert!(result.is_ok(), "裸 push 应直接成功: {result:?}");
+        let argv = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(argv.lines().count(), 1, "裸 push 成功不该再调 token push: {argv}");
+        assert!(argv.contains("push -u origin HEAD:main"), "调用应是裸 push: {argv}");
+        assert!(!argv.contains("extraHeader"), "不该注入 Authorization header: {argv}");
+        assert!(!argv.contains("secret-token"), "token 不该出现在 argv: {argv}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

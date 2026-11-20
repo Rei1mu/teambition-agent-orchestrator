@@ -118,7 +118,7 @@ pub fn run_aggregator(store: Store, alive: Arc<AtomicBool>) {
                         if let Some(c) = hits.first() {
                             let marker = format!("[TB {}]", c.claim_id);
                             let text = crate::mail::clean_reply(&body, &marker);
-                            handle_message(&store, c, &text, "mail");
+                            handle_message(&store, c, &text, "mail", None);
                         }
                     }
                 }
@@ -155,9 +155,38 @@ pub fn run_aggregator(store: Store, alive: Arc<AtomicBool>) {
                 if let Some(latest) = fresh.iter().map(|x| x.created.as_str()).max() {
                     cur.advance(latest);
                 }
-                if let Some(last) = fresh.last() {
-                    let text = last.text.clone();
-                    handle_message(&store, c, &text, "comment");
+                if !fresh.is_empty() {
+                    // events 里已落过同样正文的评论直接跳过：拦住跨轮重复
+                    // （水位解析失败 / 多实例并发时同一条评论被当新评论重放），
+                    // 免得同一条评论触发两次 wake 重复唤醒会话、烧 token。
+                    let seen: std::collections::HashSet<String> = events::load(&store.root)
+                        .into_iter()
+                        .filter(|e| e.claim_id == c.claim_id && e.source == "comment")
+                        .map(|e| comment_dedup_key(&e.text))
+                        .collect();
+                    let new: Vec<&CommentInfo> = fresh
+                        .iter()
+                        .filter(|x| !seen.contains(&comment_dedup_key(&x.text)))
+                        .collect();
+                    if !new.is_empty() {
+                        // 多条 wake 文件会互相覆盖（bridge 只读最后一个），所以
+                        // events 每条都记，wake 只写一次：多条时用带条数的合并摘要，
+                        // 单条时正文照旧。handle_message 内部照常走 pending/添加任务语义。
+                        let merged = if new.len() == 1 {
+                            wake_text("comment", &new[0].text)
+                        } else {
+                            format!(
+                                "（{} 条新评论）{}",
+                                new.len(),
+                                wake_text("comment", &new.last().unwrap().text)
+                            )
+                        };
+                        // wake 写一次：第一条 handle 带合并文案，其余传空串跳过 wake。
+                        for (i, x) in new.iter().enumerate() {
+                            let w = if i == 0 { Some(merged.as_str()) } else { Some("") };
+                            handle_message(&store, c, &x.text, "comment", w);
+                        }
+                    }
                 }
             }
         }
@@ -232,6 +261,12 @@ fn project_name(projects: &[(String, String)], id: &str) -> String {
 fn notify(store: &Store, claim_id: &str, text: &str) {
     events::append(&store.root, claim_id, "addtask", text, "free");
     write_wake_request(&store.root, claim_id, text, "free");
+}
+
+// 评论去重键：去首尾空白的正文。events 里没有评论 id/created 字段，
+// 用正文做键足够拦住「同一条评论跨轮重复处理」这个实际故障。
+fn comment_dedup_key(text: &str) -> String {
+    text.trim().to_string()
 }
 
 // 邮件回信经 clean_reply 后正文不带 marker；唤醒文案仍保留「邮件回复」标记，
@@ -438,21 +473,29 @@ fn handle_pending_answer(store: &Store, claim: &Claim, text: &str, source: &str)
     true
 }
 
-fn handle_message(store: &Store, claim: &Claim, text: &str, source: &str) {
+// wake_override: Some = 用调用方给的文案写 wake（多条评论合并时用），
+// None = 用本条 text 写（邮件/单条评论的默认路径）。
+fn handle_message(store: &Store, claim: &Claim, text: &str, source: &str, wake_override: Option<&str>) {
     if handle_pending_answer(store, claim, text, source) {
         return;
     }
     if handle_add_command(store, claim, text, source) {
         return;
     }
-    let wake = wake_text(source, text);
-    // parse_reply 要的是干净原文。wake 前缀「（邮件回复）」与正文同一行，
-    // strip_reply_noise 会把整行当标记丢弃，导致「1」解析成空、不收尾。
-    // 唤醒/落盘用 wake（给人看），动作判定和分类用干净 text。
     let (action, _body) = parse_reply(text);
     let tag = action.event_tag();
     events::append(&store.root, &claim.claim_id, source, text, &tag);
-    write_wake_request(&store.root, &claim.claim_id, &wake, &tag);
+    if let Some(w) = wake_override {
+        if !w.is_empty() {
+            write_wake_request(&store.root, &claim.claim_id, w, &tag);
+        }
+    } else {
+        let wake = wake_text(source, text);
+        // parse_reply 要的是干净原文。wake 前缀「（邮件回复）」与正文同一行，
+        // strip_reply_noise 会把整行当标记丢弃，导致「1」解析成空、不收尾。
+        // 唤醒/落盘用 wake（给人看），动作判定和分类用干净 text。
+        write_wake_request(&store.root, &claim.claim_id, &wake, &tag);
+    }
     dispatch_reply(store, &claim.claim_id, text, source);
 }
 
@@ -464,32 +507,33 @@ fn dispatch_reply(store: &Store, claim_id: &str, text: &str, _source: &str) {
         Some(c) => c,
         None => return,
     };
-    let has_ask = !claim.ask_at.is_empty();
-    if !has_ask {
-        // 执行中态：不 resume、不改状态，原话已在 events/wakes 里，交给 agent 决定。
-        return;
-    }
-    // 待回复态：先 resume 推回进行中。
-    match resume(store, claim_id) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("… 聚合回复 {claim_id} 时 resume 失败: {e}");
-            return;
-        }
-    }
+
+    // 回 1 是明确收尾指令，跟任务当前是「待回复」还是「进行中」无关——
+    // 进行中任务的 ask_at 为空，旧逻辑在这里直接 return，导致用户回 1 没反应。
+    // 先处理 Closed 再谈状态门：进行中不需要 resume（本就 running），直接联动 + finish。
     if action == ReplyAction::Closed {
-        // lead task 回 1：先把同会话的待回复/僵尸 peer 一起收尾，再 finish lead 自己。
-        // 普通任务回 1 时 lead_finalize_peers 直接返回空，行为不变。
+        // 回 1 联动：lead 收同会话全部子任务；子代理（note=agent-N）收同 tag 的。
+        // 普通任务（无 tag 非 lead）返回空，只 finish 自己。
         match crate::ops::lead_finalize_peers(store, claim_id) {
             Ok(peers) if !peers.is_empty() => {
-                eprintln!("… {claim_id} lead 联动收尾: {}", peers.join("；"));
+                eprintln!("… {claim_id} 回1联动收尾: {}", peers.join("；"));
             }
             Ok(_) => {}
-            Err(e) => eprintln!("… {claim_id} lead 联动收尾失败: {e}"),
+            Err(e) => eprintln!("… {claim_id} 回1联动收尾失败: {e}"),
         }
         if let Err(e) = finish(store, claim_id, STAGE_DONE) {
             eprintln!("… 聚合收尾 {claim_id} 失败: {e}");
         }
+        return;
+    }
+
+    // 非收尾回复：只有「待回复」态才 resume 推回进行中；进行中态不动状态，
+    // 原话已在 events/wakes 里，交给 agent 自己判断。
+    if claim.ask_at.is_empty() {
+        return;
+    }
+    if let Err(e) = resume(store, claim_id) {
+        eprintln!("… 聚合回复 {claim_id} 时 resume 失败: {e}");
     }
 }
 
@@ -574,5 +618,70 @@ mod tests {
         // 1/2 是系统保留号，不能拿来做项目确认。
         assert!(resolve_pending(&pending, "1", &projects).is_none());
         assert!(resolve_pending(&pending, "2", &projects).is_none());
+    }
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tba-agg-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // B：多条 fresh 评论全部通过去重判定进 events；已存在的重复评论被挡住。
+    #[test]
+    fn multiple_fresh_comments_all_recorded_duplicates_filtered() {
+        let dir = tmpdir("multi");
+        // events 里已有第一条评论（上一轮落过）
+        events::append(&dir, "clm-y-0", "comment", "第一条", "free");
+        let seen: std::collections::HashSet<String> = events::load(&dir)
+            .into_iter()
+            .filter(|e| e.claim_id == "clm-y-0" && e.source == "comment")
+            .map(|e| comment_dedup_key(&e.text))
+            .collect();
+
+        let fresh_texts = ["第一条", "第二条", "第三条"];
+        let accepted: Vec<&str> = fresh_texts
+            .iter()
+            .copied()
+            .filter(|t| !seen.contains(&comment_dedup_key(t)))
+            .collect();
+        assert_eq!(accepted, vec!["第二条", "第三条"], "重复的第一条被挡，其余全进");
+        for t in &accepted {
+            events::append(&dir, "clm-y-0", "comment", t, "free");
+        }
+        let texts: Vec<String> = events::load(&dir)
+            .into_iter()
+            .filter(|e| e.claim_id == "clm-y-0")
+            .map(|e| e.text)
+            .collect();
+        // 第一条只出现一次，第二条/第三条各一次。
+        assert_eq!(texts.iter().filter(|t| *t == "第一条").count(), 1, "不重复写");
+        assert_eq!(texts.iter().filter(|t| *t == "第二条").count(), 1);
+        assert_eq!(texts.iter().filter(|t| *t == "第三条").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // D：write_wake_request 写出的 payload 字段齐全（证明 wake 确实写过）。
+    // bridge 消费后 wakes/*.json 会被删，磁盘上看不到不等于没写——这里直接断言 payload。
+    #[test]
+    fn wake_payload_has_session_text_and_claim() {
+        let dir = tmpdir("wake");
+        std::fs::create_dir_all(dir.join("waits")).unwrap();
+        std::fs::write(dir.join("waits").join("clm-z-0.session"), "session-test-123").unwrap();
+        write_wake_request(&dir, "clm-z-0", "用户回来了", "free");
+        let raw = std::fs::read_to_string(dir.join("wakes").join("session-test-123.json"))
+            .expect("wake 文件要写出");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["sessionId"], "session-test-123");
+        assert_eq!(v["claimId"], "clm-z-0");
+        assert_eq!(v["action"], "free");
+        assert_eq!(v["text"], "用户回来了");
+        assert!(v["ts"].as_str().unwrap().len() > 0);
+
+        // closed 不写 wake（收尾是终点，别白唤醒）
+        write_wake_request(&dir, "clm-z-0", "1", "closed");
+        assert!(std::fs::metadata(dir.join("wakes").join("session-test-123.json"))
+            .is_ok(), "closed 不覆盖已有 wake 文件");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

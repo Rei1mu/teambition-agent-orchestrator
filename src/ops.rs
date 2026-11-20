@@ -28,6 +28,12 @@ tba caps / tba shot / tba ui。\n\
 // 文件不存在时回退读 env（直接由 agent shell 拉起的监听走这条）。
 // 两者都没有 = 非 DSH 唤起，桥无意义，静默跳过。
 pub fn write_wake_request(root: &std::path::Path, claim_id: &str, raw: &str, action: &str) {
+    // 回 1：tba 自己已经 finish 收尾（见 wait 里的 action==Closed 分支），
+    // 不需要 agent 再动。写了 wake 只会把本会话白白唤醒一轮（reply+events+close，
+    // 最后发现已经 done）——纯烧 token。收尾信号本身就是终点，这里直接不写。
+    if action == "closed" {
+        return;
+    }
     let session_file = root.join("waits").join(format!("{claim_id}.session"));
     let from_file = std::fs::read_to_string(&session_file)
         .ok()
@@ -2293,6 +2299,26 @@ fn sync_reply_field(ctx: &mut Ctx, claim: &Claim, text: &str) {
     }
 }
 
+// 标准 --done 收尾提问：给标题插 `fin:` 标记，区分于普通拍板提问。
+// lead: xxx -> lead:fin: xxx；agent-N:xxx -> agent-N:fin:xxx。
+// 幂等：已有 fin: 不再叠加；无前缀的历史任务不动。
+fn fin_marked_title(title: &str) -> String {
+    let t = title.trim();
+    if t.contains("fin:") {
+        return t.to_string();
+    }
+    if let Some(rest) = t.strip_prefix("lead:") {
+        return format!("lead:fin:{rest}");
+    }
+    // agent-N: 前缀：冒号前那段以 agent- 开头。
+    if let Some((head, rest)) = t.split_once(':') {
+        if head.starts_with("agent-") {
+            return format!("{head}:fin:{rest}");
+        }
+    }
+    t.to_string()
+}
+
 // 提问：进行中 -> 待回复（列3），把问题写进任务备注等用户评论回复。
 pub fn ask(store: &Store, claim_id: &str, question: &str) -> Result<Claim, String> {
     let claim = store
@@ -2314,6 +2340,18 @@ pub fn ask(store: &Store, claim_id: &str, question: &str) -> Result<Claim, Strin
         validate_custom_question(q)?;
     }
     let mut ctx = Ctx::new(store.clone(), false)?;
+    // --done 的标准收尾提问：标题加 fin: 标记（lead:/agent-N: 前缀后插入，幂等）。
+    // 远程标题和本地台账同步改，status 里也看得到；普通 -q 提问不动标题。
+    if q == DONE_QUESTION {
+        let marked = fin_marked_title(&claim.task_name);
+        if marked != claim.task_name {
+            if let Err(e) = ctx.update_task_content(&claim.task_id, &marked, "") {
+                eprintln!("⚠ 给任务标题加 fin: 失败（不影响提问）: {e}");
+            } else {
+                store.patch_claim(claim_id, |c| c.task_name = marked.clone())?;
+            }
+        }
+    }
     let stages = ctx.ensure_stages(&claim.project_id)?;
     let wait = ctx
         .find_stage(&stages, STAGE_WAIT)
@@ -2429,14 +2467,88 @@ pub fn append_note(store: &Store, claim_id: &str, text: &str) -> Result<String, 
 
 // lead 单任务：开工建一条带 `lead:` 前缀的任务，绑本次会话。
 // project 从本地 .tba/project 绑定读；没绑定就报错（先 tba create）。
+// 幂等：同一会话（agent）已有活动 lead claim 就复用，换标题也不新建新任务。
 pub fn lead_start(store: &Store, title: &str) -> Result<TakeResult, String> {
     if !title.starts_with("lead:") {
         return Err("lead 任务标题必须以 lead: 开头".into());
     }
     let pid = read_project_binding().ok_or("没绑定项目，先 tba create")?;
-    // start 内部已 sweep 回收死会话；幂等键是 title，同标题不同会话的冲突
-    // 由调用方（cmds）在标题里加会话后缀处理。
-    start(store, &pid, title, "", &current_agent())
+    let agent = current_agent();
+    // 同会话只保留一条 lead 任务：已有活动的就原样返回，--text 的新标题不生效
+    // （不改标题，避免标题漂移把幂等键冲掉）。
+    if let Some(c) = find_active_lead(store, &agent) {
+        let list_now = if c.project_id == pid {
+            Ctx::new(store.clone(), false)
+                .map(|mut ctx| ctx.task_list_name(&pid, &c.task_id))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        return Ok(TakeResult {
+            claim: c,
+            warnings: Vec::new(),
+            existed: true,
+            list_now,
+        });
+    }
+    // start 内部已 sweep 回收死会话。start 的幂等键只有 title（不比 agent），
+    // 别的会话占着同名 lead 任务时加会话后缀，避免跨会话复用同一条 lead task。
+    let title = if store
+        .active_claims()
+        .into_iter()
+        .any(|c| c.task_name == title && c.agent != agent)
+    {
+        format!("{title} [{agent}]")
+    } else {
+        title.to_string()
+    };
+    start(store, &pid, &title, "", &agent)
+}
+
+// 本次会话是否已有活动 lead 任务。lead_start / ensure_lead_for_session / lead_report
+// 共用这一份判定：按 agent 隔离，已结束的 claim 不算。
+fn find_active_lead(store: &Store, agent: &str) -> Option<Claim> {
+    store
+        .active_claims()
+        .into_iter()
+        .find(|c| c.agent == agent && c.task_name.starts_with("lead:"))
+}
+
+// tba sub 领到任务时确保本会话有 lead 任务承接汇报/收尾。
+// 幂等：同会话已有活动 lead claim 就复用；没有才建一条。返回是否新建。
+// 标题带会话名后缀——起名字时避开别的会话占的同名 lead 任务。
+pub fn ensure_lead_for_session(store: &Store, project_id: &str) -> Result<bool, String> {
+    let agent = current_agent();
+    if find_active_lead(store, &agent).is_some() {
+        return Ok(false);
+    }
+    let short: String = agent.chars().take(20).collect();
+    let prefix = format!("lead: {short}");
+    // 同名前缀被别的会话占着才加后缀；同一条 active 列表查一次就够。
+    let active = store.active_claims();
+    let title = if active
+        .iter()
+        .any(|c| c.task_name == prefix && c.agent != agent)
+    {
+        format!("{prefix} [{agent}]")
+    } else {
+        prefix
+    };
+    start(store, project_id, &title, "", &agent)?;
+    Ok(true)
+}
+
+// ask -q 没给 claim 时，用问题首行当 lead 任务主题（≤20 字）。
+pub fn lead_question_title(question: &str) -> String {
+    let topic = question
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("需要你回复")
+        .trim()
+        .chars()
+        .take(20)
+        .collect::<String>();
+    format!("lead: {topic}")
 }
 
 // lead 汇报：内容写进 lead task 备注（append_note 会同步存 last_note），
@@ -2460,46 +2572,76 @@ pub fn lead_report(store: &Store, content: &str) -> Result<Claim, String> {
     ask(store, &lead.claim_id, DONE_QUESTION)
 }
 
-// 回 1 收尾 lead task 时联动：把同会话（claim.agent 相同）的其他活动 claim 一起收尾。
-//   waiting            -> finish 到 STAGE_DONE（已解决）
-//   running / claimed  -> 心跳新鲜 -> finish 到 STAGE_DONE（已解决，正常执行中的子任务）
-//                         心跳老化（僵尸）-> finish 到 STAGE_CLOSED（已完成）
-// 僵尸只看 claim 自己的 heartbeat：子代理 claim.agent 是主会话名，没有独立
-// session 心跳文件，用 session_age 豁免会把 lead 活着时的僵尸全都漏掉。
-// 动作是 finish 而不是 sweep 的 revert。lead claim 自己不入列，由 aggregator 正常 finish。单个 finish 失败只记错误继续。
-pub fn lead_finalize_peers(store: &Store, lead_claim_id: &str) -> Result<Vec<String>, String> {
-    let lead = match store.get_claim(lead_claim_id) {
-        Some(c) if c.task_name.starts_with("lead:") => c,
-        _ => return Ok(Vec::new()), // 普通任务回 1 不联动
+// 回 1 联动收尾：按收尾的是谁，决定收哪些 peer。
+//   lead task（标题 lead:）回 1  -> 收同会话（claim.agent 相同）全部子任务；
+//   子代理（note=agent-N）回 1   -> 只收同一个 agent-N 的任务。
+// 收尾范围都只挑进行中/待回复，一律 finish 到 STAGE_DONE（已解决）——用户回 1
+// 就是授权收尾，不再按心跳新鲜度区分「已完成」，免得僵尸赖在列5。
+// 自己的那条不入列：由 aggregator 正常 finish。单个失败只记错误继续。
+//
+// note 是子代理的唯一可靠标识：apply_agent_tag 把 agent-N 写进 claim.note，
+// 不写 task_name、不改 claim.agent（所有子任务的 agent 都是主会话名）。
+pub fn lead_finalize_peers(store: &Store, closing_claim_id: &str) -> Result<Vec<String>, String> {
+    let closing = match store.get_claim(closing_claim_id) {
+        Some(c) => c,
+        None => return Ok(Vec::new()),
     };
-    let cfg = store.load_config();
-    let timeout = cfg.heartbeat_timeout_secs as i64;
+    let is_lead = closing.task_name.starts_with("lead:");
+    // lead 收同会话全部；子代理收同 agent-N。两者都不收自己。
+    let tag = closing.note.trim();
+    if !is_lead && !tag.starts_with("agent-") {
+        return Ok(Vec::new()); // 既不是 lead 也没 agent tag：普通任务，不联动
+    }
     let mut out = Vec::new();
     for c in store.active_claims() {
-        if c.claim_id == lead_claim_id || c.agent != lead.agent {
+        if c.claim_id == closing_claim_id {
             continue;
         }
-        let (stage, label) = if c.state == "waiting" {
-            (STAGE_DONE, "已解决")
-        } else if c.is_running() {
-            // 子代理的 claim.agent 就是主会话名，没有自己的 session 心跳文件；
-            // 只看 claim 自己的心跳：由子代理调 tba beat 刷新，子代理会话一断就老化。
-            // 心跳新鲜 = 正常执行中，lead 回 1 了就一起收为「已解决」；
-            // 心跳老化 = 断线的僵尸，收为「已完成」。
-            if crate::store::age_secs(c.heartbeat()) <= timeout {
-                (STAGE_DONE, "已解决")
-            } else {
-                (STAGE_CLOSED, "已完成")
-            }
+        let in_scope = if is_lead {
+            c.agent == closing.agent
         } else {
-            continue;
+            c.note.trim() == tag
         };
-        match finish(store, &c.claim_id, stage) {
-            Ok(_) => out.push(format!("{label}: {}", c.task_name)),
+        if !in_scope {
+            continue;
+        }
+        if c.state != "waiting" && !c.is_running() {
+            continue;
+        }
+        match finish(store, &c.claim_id, STAGE_DONE) {
+            Ok(_) => out.push(format!("已解决: {}", c.task_name)),
             Err(e) => out.push(format!("收尾 {}（{}）失败: {e}", c.claim_id, c.task_name)),
         }
     }
     Ok(out)
+}
+
+// CLI `tba done <lead>` 的联动收尾：跟聚合器回 1 一致，收尾 lead 自己之前
+// 先收同会话子任务。只对 lead 任务生效，失败只记错误不中断主任务收尾。
+pub fn finalize_lead_on_cli_done(store: &Store, claim_id: &str) {
+    let is_lead = store
+        .get_claim(claim_id)
+        .map(|c| c.task_name.starts_with("lead:"))
+        .unwrap_or(false);
+    if !is_lead {
+        return;
+    }
+    match lead_finalize_peers(store, claim_id) {
+        Ok(peers) if !peers.is_empty() => {
+            eprintln!("… {claim_id} 回1联动收尾: {}", peers.join("；"));
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("… {claim_id} 回1联动收尾失败: {e}"),
+    }
+}
+
+// wait() 旧路径回 1 时调：联动收尾 + 打印。错误只提示不影响自己 finish。
+fn finalize_on_close(store: &Store, claim_id: &str) {
+    match lead_finalize_peers(store, claim_id) {
+        Ok(peers) if !peers.is_empty() => eprintln!("… {claim_id} 回1联动收尾: {}", peers.join("；")),
+        Ok(_) => {}
+        Err(e) => eprintln!("… {claim_id} 回1联动收尾失败: {e}"),
+    }
 }
 
 // 到「待回复」时给客户发邮件。
@@ -3388,6 +3530,7 @@ pub fn wait(
                         match resume(store, claim_id) {
                             Ok((c, _)) => {
                                 let claim = if action == ReplyAction::Closed {
+                                    finalize_on_close(store, claim_id);
                                     finish(store, claim_id, STAGE_DONE)?
                                 } else {
                                     c
@@ -3500,6 +3643,7 @@ pub fn wait(
             // 回复 1 = 用户明确授权收尾 → tb 直接执行。
             // （agent 自己跑 tb done 依然禁止，这里执行的是**用户**的指令。）
             let claim2 = if action == ReplyAction::Closed {
+                let _ = finalize_on_close(store, claim_id);
                 finish(store, claim_id, STAGE_DONE).unwrap_or_else(|e| {
                     eprintln!("… 收尾时任务已是终态（{e}），沿用当前 claim");
                     store.get_claim(claim_id).unwrap_or(c.clone())
@@ -3536,6 +3680,7 @@ pub fn wait(
             };
             let stop = emit(&outcome);
             if closing {
+                let _ = finalize_on_close(store, claim_id);
                 let c = finish(store, claim_id, STAGE_DONE).unwrap_or_else(|e| {
                     eprintln!("… 收尾时任务已是终态（{e}），沿用当前 claim");
                     store.get_claim(claim_id).unwrap_or(claim.clone())
@@ -5078,15 +5223,20 @@ pub fn orphan_block_msg(claims: &[Claim]) -> String {
     s
 }
 
-// 工作空间入口文件的标记。有这个标记就认为已经写过，不再重复追加。
-const ENTRY_MARK: &str = "<!-- tba:entry";
-// 编码纪律那一节的标记。单独一个标记是为了让老项目的 AGENTS.md
-// 在下次 tba g 时能补上这一节，而不是被「已有入口」挡住。
-const RULES_MARK: &str = "<!-- tba:rules";
+// 工作空间入口的非 bootstrap 内容（入口流程 + 编码纪律 + 回复风格）合并为一块，
+// 只留这一个标记；bootstrap 单独一块、带版本。
+const AGENT_MARK: &str = "<!-- tba:agent";
+// 历史标记，只用于把老文件的三块迁到新的单块；新生成的文件不再写这三个标记。
+const LEGACY_MARKS: [&str; 3] = ["<!-- tba:entry", "<!-- tba:rules", "<!-- tba:ultracave"];
+// 只在测试夹具里拼老三块文案用；生产逻辑统一走 LEGACY_MARKS。
+#[cfg(test)]
+const ENTRY_MARK: &str = LEGACY_MARKS[0];
+#[cfg(test)]
+const RULES_MARK: &str = LEGACY_MARKS[1];
 
 // 固定生成文案的版本指纹。绑定 crate 版本，发版才变。
 // 版本只写在 bootstrap 块第一行的标记里（如 `<!-- tba:bootstrap v0.2.62 ... -->`）；
-// 其余三块标记不带版本。版本一致就整体跳过不重写（省 token），不一致或缺失就
+// 合并块不带版本。版本一致就整体跳过不重写（省 token），不一致或缺失就
 // 清掉旧块重写——把「逐句 contains 检查」换成「只比指纹」，以后改文案不用每句加检查。
 const ENTRY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -5144,7 +5294,7 @@ pub fn refresh_agents_at(dir: &std::path::Path, cmd: &str, force: bool) -> Optio
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     let mut stale = old.clone();
     // 把 bootstrap 标记行里的版本号摘掉：gate 只认「bootstrap 标记 + 当前版本」，
-    // 摘掉就不通过，ensure_entry_at 会清掉三块旧块重生成；bootstrap 自身由
+    // 摘掉就不通过，ensure_entry_at 会清掉旧块重生成；bootstrap 自身由
     // ensure_bootstrap_block 按当前版本改写标记行。只动版本标记，块外用户内容一个字不碰。
     stale = stale.replace(
         &format!("{BOOTSTRAP_MARK} v{ENTRY_VERSION}"),
@@ -5171,27 +5321,10 @@ fn ensure_entry_file(store: &Store) -> Option<std::path::PathBuf> {
     ensure_entry_in(store, &dir)
 }
 
-// 实际干活的那一半，单独抽出来是为了能测（不碰全局 cwd）。
-// 删掉一个 tba 块（从标记行到下一个 `## ` 标题之前）。
-// 找不到标记就原样返回。找不到下一个标题就删到文件尾——那说明块在最后。
-fn strip_tba_block(s: &str, mark: &str) -> String {
-    let Some(start) = s.find(mark) else {
-        return s.to_string();
-    };
-    let after = start + mark.len();
-    // 先跳过本块的标题行，再从它之后找下一个 `## ` 作边界。
-    let body = s[after..]
-        .find("\n## ")
-        .map(|i| after + i + 1)
-        .unwrap_or(after);
-    let end = s[body..].find("\n## ").map(|i| body + i).unwrap_or(s.len());
-    format!("{}{}", &s[..start], &s[end..])
-}
-
 // 零上下文短块，只写 AGENTS.md 一份。CLAUDE.md 用 @AGENTS.md 导入，不重复写。
 // 「别搜 exe」只限定在定位 tba 这件事上：写成「禁止读源码」会挡住正常开发。
 const BOOTSTRAP_MARK: &str = "<!-- tba:bootstrap";
-// 版本只写在这一块的标记行里（全文件唯一一处版本号）。其余三块标记不带版本。
+// 版本只写在这一块的标记行里（全文件唯一一处版本号）。合并块不带版本。
 fn bootstrap_block() -> String {
     format!(
         "{BOOTSTRAP_MARK} v{ENTRY_VERSION} 由 tba 自动生成，删掉不影响功能 -->\n\
@@ -5226,8 +5359,8 @@ fn ensure_bootstrap_block(path: &std::path::Path) {
 }
 
 // 迁移用：从 mark 删到下一个 `<!-- tba:` 标记之前（不含）。
-// 用来清掉旧的手动 `<!-- user:ultracave -->` 节——它内部有 `## ` 子标题，
-// 不能用 strip_tba_block（会被子标题截断），所以按下一个 tba 标记收边界。
+// 用来清掉合并块及旧的手动 `<!-- user:ultracave -->` 节——它们内部有 `## ` 子标题，
+// 按「下一个 `## `」会被子标题截断，所以按下一个 tba 标记收边界。
 fn strip_marker_block_to_next_tba(s: &str, mark: &str) -> String {
     let Some(start) = s.find(mark) else {
         return s.to_string();
@@ -5240,17 +5373,45 @@ fn strip_marker_block_to_next_tba(s: &str, mark: &str) -> String {
     format!("{}{}", &s[..start], &s[end..])
 }
 
+// 风格段的两个历史/当前标题。合并块里风格是最后一段，用户内容在它之后。
+const STYLE_HEADS: [&str; 2] = ["## 默认回复风格：ultracave", "## 默认回复风格：简洁"];
+
+// 删掉一个合并块。不能简单删到下一个 `<!-- tba:`（会把块后用户正文一起吞掉），
+// 也不能删到下一个 `## `（块内就有三个）。合块顺序固定，风格是最后一段，
+// 从风格标题往下找下一个用户标题 / tba 标记作边界。
+fn strip_agent_block(s: &str) -> String {
+    let Some(start) = s.find(AGENT_MARK) else {
+        return s.to_string();
+    };
+    let after = start + AGENT_MARK.len();
+    let style = STYLE_HEADS.iter().find_map(|h| {
+        s[after..]
+            .match_indices(h)
+            .map(|(p, _)| after + p)
+            .find(|&p| p == 0 || s[..p].ends_with('\n'))
+    });
+    let Some(style) = style else {
+        // 手改坏的块找不到风格段：退回「删到下一个 tba 标记」，至少不留半个块。
+        return strip_marker_block_to_next_tba(s, AGENT_MARK);
+    };
+    let tail = &s[style..];
+    let end = tail
+        .find("\n## ")
+        .or_else(|| tail.find("\n<!-- tba:"))
+        .map(|i| style + i)
+        .unwrap_or(s.len());
+    format!("{}{}", &s[..start], &s[end..])
+}
+
 // 清掉历史 refresh 留下的「无标记 ultracave 残留」：正文里有行首的
 // `## 默认回复风格：ultracave` 但前面没有 `<!-- tba:` 标记。这些是旧版
-// strip_tba_block 被块内 `##` 截断后剩下的，strip_marker_block_to_next_tba
+// 按「下一个 `## `」截断后剩下的，strip_marker_block_to_next_tba
 // 找不到 mark 删不掉。必须在删完带标记真块之后调用，那时剩下的全是残留。
 // 只认行首标题，避免命中正文里反引号中的同名引用。
 fn strip_unmarked_ultracave(s: &str) -> String {
-    // 旧标题 + 新标题都要认，历史残留是旧块的正文。
-    const HEADS: [&str; 2] = ["## 默认回复风格：ultracave", "## 默认回复风格：简洁"];
     // 行首标题位置（含开头），从后往前删，避免删除影响前面的下标。
     let mut heads: Vec<(usize, usize)> = Vec::new();
-    for head in HEADS {
+    for head in STYLE_HEADS {
         heads.extend(
             s.match_indices(head)
                 .filter(|(p, _)| *p == 0 || s[..*p].ends_with('\n'))
@@ -5274,21 +5435,35 @@ fn strip_unmarked_ultracave(s: &str) -> String {
     out
 }
 
-const ULTRACAVE_MARK: &str = "<!-- tba:ultracave";
+// 旧版生成器落盘的无标记 `## 红线` 整段：从行首标题删到下一个行首 `## `
+// 或 tba 标记之前（边界本身保留），避免吞掉后面的 `## 详细流程` 等用户标题。
+// 只认行首标题，避免命中正文里反引号中的同名引用。
+fn strip_unmarked_redline(s: &str) -> String {
+    let head = "## 红线";
+    let Some(pos) = s
+        .match_indices(head)
+        .map(|(p, _)| p)
+        .find(|&p| p == 0 || s[..p].ends_with('\n'))
+    else {
+        return s.to_string();
+    };
+    let after = pos + head.len();
+    let rest = &s[after..];
+    let end_rel = rest
+        .find("\n## ")
+        .or_else(|| rest.find("\n<!-- tba:"))
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    format!("{}{}", &s[..pos], &s[after + end_rel..])
+}
+
 // 极简版。原因（用户原话）：主代理上下文不能太长，我怕他主代理先抽风或者出问题。
 // 2588 字符的旧块占常驻上下文 27%；模型本就不稳定遵守，砍到 ~150 字。
+// 合并进 tba:agent 单块，不再单独带 tba:ultracave 标记。
 const ULTRACAVE_BODY: &str = "## 默认回复风格：简洁\n\n\
 中文回复。短句优先，能一行说清不写一段。同一事实不重复；列表后不加总结。\n\
 代码、命令、路径、API 名、报错原文、数字单位原样保留，不缩写成自造词。\n\
 安全警告、不可逆操作、有两种读法的句子、给用户的选择题 → 用完整句。用户说 stop caveman / normal mode 即退回正常语气。\n";
-
-// 带标记的 ultracave 块。版本统一由 bootstrap 标记行承载（见 ENTRY_VERSION 注释）。
-fn ultracave_block() -> String {
-    format!(
-        "{ULTRACAVE_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
-         {ULTRACAVE_BODY}"
-    )
-}
 
 fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBuf> {
     let path = dir.join("AGENTS.md");
@@ -5298,7 +5473,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     let exe = cmd.to_string();
 
     let entry = format!(
-        "{ENTRY_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
+        "{AGENT_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
          ## 任务队列入口\n\n\
          **工具**：`{exe}`（本机已装，在 PATH 里；项目根的 `tba.cmd` 等价）。\
          直接执行，别搜 exe、别验证路径、别读 `.tba/`。\n\n\
@@ -5322,7 +5497,17 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
          **派子代理先打 tag**：主代理收到 `{exe} sub` 简报后，先跑 DSH 的 `list_agents`\
           **只看本会话**已有 agent-N（含 inactive 历史）。agent-N **按任务号分配，不按子代理实例数**：\
           N = 本会话已分过号的任务数 + 1；同一个任务重开（失败/断线/换实例接手）复用原 agent-N，不占新号；\
-          send_message 冷恢复原实例号不变；只有全新任务才递增。本会话第一个任务 = agent-1。\
+          send_message 冷恢复原实例号不变；关联性强的新任务（同一模块/延续上文/同一问题返工）也复用旧 agent，\
+          不管它现在是已完成还是在 `ask --done` 待回复，用 send_message 续活、沿用原 agent-N 与 tag，\
+          不新建 subagent 实例、不占新号；复用时不必重新打 tag（tag 已在原任务标题里）。只有全新无关任务才递增。\
+          默认复用更省 token（旧 agent 已有上下文，send_message 续活比新建重喂整段简报便宜）；\
+          只有旧 agent 明显跑偏、汇报质量差或上下文明显过长时才新建，不用刻意估算上下文长度。\
+          复用 agent 时 Teambition 任务也要复用，别让同 agent-N 出现两条 claim：\
+          原 claim 还在进行中/待回复时，用 `{exe} reply <旧claim_id>` 推回进行中 + `{exe} note <旧claim_id>` 写新需求 + send_message 续活，\
+          不再 `{exe} sub` 新建 claim；原 claim 已收尾（done/closed）不许 reply，只能新建 claim，\
+          但 tag 仍沿用原 agent-N（实例复用、不占新号），并在新任务里说明是续活。\
+          只有全新无关任务才新建 claim + 递增新号。\
+          本会话第一个任务 = agent-1。\
           别跨会话、别参考别的项目/历史会话的任务。原因（用户原话）：前缀混了会导致本会话序号从别的会话接着数、打错 tag。\
           `agent-N:` 由 `{exe} sub <claim_id> --agent-tag agent-N` 写进 Teambition 标题与 claim.note，\
           subagent 工具的实例名（name 参数）跟 tag 是两回事，不用管；前缀由 `agent_tagged_title` 加，支持覆盖 swap（打错可重打纠正）。\
@@ -5330,7 +5515,8 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
           别给 lead 任务打 agent tag，别给子代理任务用 lead: 前缀。\
           然后再用 subagent 工具把简报作为 prompt 派活。不许跳过打 tag 直接 subagent。派完再挂一条 `{exe} sub` 继续监听。\n\n\
           **`{exe} sub` 常驻监听必须后台执行**：它是常驻监听（空队列不退出），前台跑会挂住会话。\
-          挂监听时一律用后台 job（`run_in_background: true`），**不许前台等待**；前台跑只留给单次领任务的动作。\n\n\
+          挂监听时一律用后台 job（`run_in_background: true`），**不许前台等待**；前台跑只留给单次领任务的动作。\
+          After attaching, never poll it with `job_output` — move on; wake-ups arrive via the bridge.\n\n\
           **主代理不自己写、优先派子代理**：主代理（lead）以**省 token、省时间**为前提，\
           动手活（改代码、改文件、查文件、调研、跑验证）**尽量不自己干**，合理拆给子代理：\
           能由子代理独立完成的一律派子代理，只有需要本会话上下文的整合、收尾、拍板、`ask` 才自己来。\
@@ -5367,8 +5553,7 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     // 任务流程无关，而且每条都要解释才管用。塞进 prompt 每次会话固定多 1500 字，
     // 而 AGENTS.md 是 agent 进项目就会读的约定文件，成本几乎为零。
     let rules = format!(
-        "{RULES_MARK} 由 tba 自动生成，删掉不影响功能 -->\n\
-         ## 编码纪律\n\n\
+        "## 编码纪律\n\n\
          五条，动手前过一遍。\n\n\
          1. **先想再写。** 不假设、不藏困惑。不确定就问，别猜着往下做；有歧义就摆出几种解释；\
          有更简单的路就直说；想不明白就停下问。\n\
@@ -5385,21 +5570,21 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
     );
 
     let mut old = std::fs::read_to_string(&path).unwrap_or_default();
-    let ultracave = ultracave_block();
 
     // 迁移：清掉旧的手动 `<!-- user:ultracave -->` 节（内部有 `## ` 子标题，
-    // 不能用 strip_tba_block，按下一个 tba 标记收边界）。新块由下面的 ultracave 逻辑补。
+    // 按「下一个 `## `」会截断，所以按下一个 tba 标记收边界）。新风格由下面的合并块补。
     old = strip_marker_block_to_next_tba(&old, "<!-- user:ultracave");
 
-    // 版本门：版本只在 bootstrap 标记行上。bootstrap 带当前版本 + 另外三块标记都在
-    // 才算最新；bootstrap 版本不一致或缺失，就整块清掉三块重写（老文件自然重写一次，
-    // 平滑迁移）。bootstrap 自身的标记行由 ensure_bootstrap_block 归一到当前版本。
+    // 版本门：版本只在 bootstrap 标记行上。bootstrap 带当前版本 + 合并块标记都在
+    // 才算最新；bootstrap 版本不一致或缺失，或文件还是老三块，都清旧块重写。
+    // bootstrap 自身的标记行由 ensure_bootstrap_block 归一到当前版本。
     let current_mark_line = bootstrap_block();
     let current_mark_line = current_mark_line.lines().next().unwrap_or(BOOTSTRAP_MARK);
     let bootstrap_ok = old.lines().any(|l| l == current_mark_line);
-    let entry_ok = old.lines().any(|l| l.contains(ENTRY_MARK));
-    let rules_ok = old.lines().any(|l| l.contains(RULES_MARK));
-    let ultracave_ok = old.lines().any(|l| l.contains(ULTRACAVE_MARK));
+    let agent_count = old.matches(AGENT_MARK).count();
+    let agent_ok = agent_count == 1;
+    // 三个老标记中的任何一个都表示旧布局，必须与合并块不兼容、触发迁移。
+    let legacy = LEGACY_MARKS.iter().any(|m| old.contains(m));
 
     // 转发脚本只写 `tba.exe`，不带本机绝对路径，换设备一样能用。
     // 带 .exe 后缀是必须的：只写 `tba` 的话 cmd 会先匹配到当前目录的 tba.cmd，
@@ -5410,41 +5595,43 @@ fn ensure_entry_at(dir: &std::path::Path, cmd: &str) -> Option<std::path::PathBu
         let _ = std::fs::write(&shim, shim_text);
     }
 
-    if bootstrap_ok && entry_ok && rules_ok && ultracave_ok {
-        // 四块齐全且 bootstrap 版本是当前的：只补/修 bootstrap 标记行（幂等）。
+    if bootstrap_ok && agent_ok && !legacy {
+        // bootstrap 版本当前 + 合并块在 + 无旧三块：已是最新，只补/修 bootstrap 标记行（幂等）。
         ensure_bootstrap_block(&path);
         return None;
     }
 
-    // 清掉所有旧的 tba 块，再整体重写两块。
-    //
-    // 边界必须是「下一个 `## ` 标题」，不能是「下一个 `<!-- tba:`」。
-    // 入口段常常就在文件第一行，后面紧跟用户自己写的章节（这个项目是什么 /
-    // 编译与部署 / 红线），按 `<!-- tba:` 找边界会把它们整段吞掉——
-    // 实测把一份 100 多行的 AGENTS.md 删到只剩两个块。
-    old = strip_tba_block(&old, ENTRY_MARK);
-    old = strip_tba_block(&old, RULES_MARK);
-    // ultracave 块内部全是 `## ` 子标题，strip_tba_block 会被块内第一个 `## ` 提前截断，
-    // 只删掉标记行、留下正文，下次 refresh 又追加一份——实测刷出三份逐字相同的 ultracave。
-    // 按下一个 `<!-- tba:` 标记收边界才能整块删干净。
-    old = strip_marker_block_to_next_tba(&old, ULTRACAVE_MARK);
+    // 清掉所有旧布局的 tba 块（新单块 + 历史三块），再整体重写成一块。
+    // 边界必须是「下一个 `<!-- tba:`」：合并块/历史 ultracave 块内部有多个 `## ` 子标题，
+    // 按「下一个 `## `」会截断，留下正文残片。
+    while old.contains(AGENT_MARK) {
+        old = strip_agent_block(&old);
+    }
+    for mark in LEGACY_MARKS {
+        old = strip_marker_block_to_next_tba(&old, mark);
+    }
     // 再清掉历史遗留的无标记 ultracave 残留（旧版截断留下的正文）。
     old = strip_unmarked_ultracave(&old);
+    // 再清掉旧版无标记红线整段（新入口块已覆盖打 tag / ask / 派活等规则）。
+    // 只在上面的迁移路径里调用；已是最新走早退分支，用户文件一个字不动。
+    old = strip_unmarked_redline(&old);
     // 删块会留下连续空行，收一下。
     while old.contains("\n\n\n") {
         old = old.replace("\n\n\n", "\n\n");
     }
 
-    // 绝不覆盖用户自己的内容：只在末尾追加。
+    // 绝不覆盖用户自己的内容：只追加一块。顺序：入口 → 编码纪律 → 回复风格。
     let mut s = old.trim_end().to_string();
-    for block in [&rules, &ultracave, &entry] {
-        if !s.is_empty() {
-            s.push_str("\n\n");
-        }
-        s.push_str(block);
+    if !s.is_empty() {
+        s.push_str("\n\n");
     }
+    s.push_str(&entry);
+    s.push_str("\n\n");
+    s.push_str(&rules);
+    s.push_str("\n\n");
+    s.push_str(ULTRACAVE_BODY);
     std::fs::write(&path, s).ok()?;
-    // 重写完三块后，再补/修 bootstrap 块（不参与上面的剥离，用户正文保留）。
+    // 重写完合并块后，再补/修 bootstrap 块（不参与上面的剥离，用户正文保留）。
     ensure_bootstrap_block(&path);
     Some(path)
 }
@@ -5633,6 +5820,10 @@ pub fn agent_prompt_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 这些 lead 测试要改 TBA_AGENT 进程环境变量，并行跑会互相踩：
+    // 用一把锁把它们串起来（Rust 1.77+ LazyLock；老工具链则用 OnceLock）。
+    static LEAD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn skill_and_mem_states_are_end_kind() {
@@ -5921,6 +6112,8 @@ mod tests {
             ("list_stages", "taskflowstatus_list"),
             ("create_stage", "taskflowstatus_create"),
             ("move_task", "task_update_stage"),
+            ("create_task", "task_create"),
+            ("update_task", "task_update"),
             ("list_tasks", "task_query"),
             ("get_task", "task_get"),
         ] {
@@ -5933,6 +6126,8 @@ mod tests {
             {"name":"taskflow_list","description":"list taskflows","inputSchema":{"type":"object","properties":{}}},
             {"name":"taskflowstatus_list","description":"list task stages","inputSchema":{"type":"object","properties":{}}},
             {"name":"taskflowstatus_create","description":"create task stage","inputSchema":{"type":"object","properties":{}}},
+            {"name":"task_create","description":"create task","inputSchema":{"type":"object","properties":{}}},
+            {"name":"task_update","description":"update task","inputSchema":{"type":"object","properties":{}}},
             {"name":"task_query","description":"query task","inputSchema":{"type":"object","properties":{}}},
             {"name":"task_get","description":"get task","inputSchema":{"type":"object","properties":{}}},
             {"name":"task_update_stage","description":"move task stage","inputSchema":{"type":"object","properties":{}}}
@@ -5975,6 +6170,7 @@ mod tests {
                                 {"id":"s-done","name":"已解决","kind":"end"},
                                 {"id":"s-closed","name":"已完成","kind":"end"}
                             ]),
+                            "task_create" => serde_json::json!({"id":"task-stub"}),
                             _ => serde_json::json!({}),
                         };
                         serde_json::json!({"content":[{"type":"text","text":payload.to_string()}]})
@@ -6012,6 +6208,206 @@ mod tests {
         }
     }
 
+    // 把 cwd 临时切到 store 根，让 lead_start 的 read_project_binding() 读到测试自己的
+    // .tba/project（否则会读仓库根的绑定，跟别的测试抢状态）。调用方须持 LEAD_ENV_LOCK。
+    fn lead_test_in_dir(store: &Store, agent: &str) -> (Option<String>, Option<std::path::PathBuf>) {
+        write_project_binding_at(&store.root, "p-test").unwrap();
+        let prev_agent = std::env::var("TBA_AGENT").ok();
+        let prev_cwd = std::env::current_dir().ok();
+        std::env::set_var("TBA_AGENT", agent);
+        std::env::set_current_dir(&store.root).unwrap();
+        (prev_agent, prev_cwd)
+    }
+    fn lead_test_restore(state: (Option<String>, Option<std::path::PathBuf>)) {
+        match state.0 {
+            Some(v) => std::env::set_var("TBA_AGENT", v),
+            None => std::env::remove_var("TBA_AGENT"),
+        }
+        if let Some(d) = state.1 {
+            let _ = std::env::set_current_dir(d);
+        }
+    }
+
+    // lead 单任务幂等：同会话换标题也复用同一条活动 lead，不新建第二条。
+    #[test]
+    fn lead_start_reuses_same_session_lead_with_different_title() {
+        let _lock = LEAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("lead-start-reuse-same");
+        let _stub = test_mcp_stub(&store);
+        let env = lead_test_in_dir(&store, "s-lead-reuse");
+
+        let first = lead_start(&store, "lead: 标题A").unwrap();
+        assert!(!first.existed, "首次该新建");
+        let second = lead_start(&store, "lead: 标题B").unwrap();
+        assert!(second.existed, "同会话重跑该复用");
+        assert_eq!(second.claim.claim_id, first.claim.claim_id);
+        assert_eq!(second.claim.task_name, first.claim.task_name, "标题不该漂移");
+
+        let leads = store
+            .active_claims()
+            .into_iter()
+            .filter(|c| c.agent == "s-lead-reuse" && c.task_name.starts_with("lead:"))
+            .collect::<Vec<_>>();
+        let lead_names: Vec<&str> = leads.iter().map(|c| c.task_name.as_str()).collect();
+        assert_eq!(leads.len(), 1, "同会话只能有一条活动 lead: {lead_names:?}");
+
+        lead_test_restore(env);
+    }
+
+    // ask -q 无 claim 时自动建的提问任务：标题带 lead: 前缀，且复用同会话的 lead。
+    #[test]
+    fn ask_question_title_uses_lead_prefix_and_reuses() {
+        let _lock = LEAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("lead-ask-question");
+        let _stub = test_mcp_stub(&store);
+        let env = lead_test_in_dir(&store, "s-lead-ask");
+
+        let title = lead_question_title("两件事要拍板\n第二行不该进标题");
+        assert!(title.starts_with("lead: "), "提问任务标题该带 lead 前缀: {title}");
+        assert!(!title.contains("第二行"), "只取首行: {title}");
+        let first = lead_start(&store, &title).unwrap();
+        let second = lead_start(&store, &lead_question_title("另一个问题")).unwrap();
+        assert_eq!(second.claim.claim_id, first.claim.claim_id, "多次提问复用同一条 lead");
+        assert_eq!(second.claim.task_name, first.claim.task_name, "标题不漂移");
+
+        lead_test_restore(env);
+    }
+
+    // 不同会话各自保留独立 lead：跨会话隔离，不复用同一条。
+    #[test]
+    fn lead_start_isolated_between_sessions() {
+        let _lock = LEAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("lead-start-isolated");
+        let _stub = test_mcp_stub(&store);
+        let env = lead_test_in_dir(&store, "s-lead-a");
+
+        let a = lead_start(&store, "lead: 会话A").unwrap();
+        assert!(!a.existed);
+        std::env::set_var("TBA_AGENT", "s-lead-b");
+        let b = lead_start(&store, "lead: 会话A").unwrap();
+        assert!(!b.existed, "别的会话同名标题也该新建自己的 lead");
+        assert_ne!(b.claim.claim_id, a.claim.claim_id);
+
+        let count_a = store
+            .active_claims()
+            .iter()
+            .filter(|c| c.agent == "s-lead-a" && c.task_name.starts_with("lead:"))
+            .count();
+        let count_b = store
+            .active_claims()
+            .iter()
+            .filter(|c| c.agent == "s-lead-b" && c.task_name.starts_with("lead:"))
+            .count();
+        assert_eq!(count_a, 1);
+        assert_eq!(count_b, 1);
+
+        lead_test_restore(env);
+    }
+
+    // 已完成的 lead 不算 active：同会话可以新建一条新的。
+    #[test]
+    fn lead_start_creates_after_previous_lead_done() {
+        let _lock = LEAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("lead-start-done-recreate");
+        let _stub = test_mcp_stub(&store);
+        let now = chrono::Local::now().to_rfc3339();
+        let env = lead_test_in_dir(&store, "s-lead-done");
+
+        let mut old = peer_claim("clm-old-lead", "lead: 旧任务", "done", "s-lead-done", &now);
+        old.project_id = "p-test".into();
+        store.append_claim(&old).unwrap();
+        let fresh = lead_start(&store, "lead: 新任务").unwrap();
+        assert!(!fresh.existed, "已完成的 lead 不该被复用");
+        let active = store
+            .active_claims()
+            .iter()
+            .filter(|c| c.agent == "s-lead-done" && c.task_name.starts_with("lead:"))
+            .count();
+        assert_eq!(active, 1);
+
+        lead_test_restore(env);
+    }
+
+    #[test]
+    fn fin_marked_title_inserts_once_and_keeps_prefix() {
+        assert_eq!(fin_marked_title("lead: 内置dsh插件能力"), "lead:fin: 内置dsh插件能力");
+        assert_eq!(fin_marked_title("agent-2:pwsh-lite 提示词"), "agent-2:fin:pwsh-lite 提示词");
+        // 幂等：重复 --done 不叠加。
+        assert_eq!(
+            fin_marked_title("lead:fin: 内置dsh插件能力"),
+            "lead:fin: 内置dsh插件能力"
+        );
+        assert_eq!(
+            fin_marked_title("agent-2:fin:pwsh-lite 提示词"),
+            "agent-2:fin:pwsh-lite 提示词"
+        );
+        // 无前缀历史任务不动。
+        assert_eq!(fin_marked_title("普通任务"), "普通任务");
+    }
+
+    // --done 标准收尾：ask 后标题加 fin: 且幂等；普通 -q 提问不加。
+    #[test]
+    fn ask_done_marks_title_fin_idempotently() {
+        let _lock = LEAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("ask-done-fin");
+        let _stub = test_mcp_stub(&store);
+        let env = lead_test_in_dir(&store, "s-ask-done");
+
+        let r = start(&store, "p-test", "lead: 内置dsh插件能力", "", "s-ask-done").unwrap();
+        let cid = &r.claim.claim_id;
+        ask(&store, cid, DONE_QUESTION).unwrap();
+        let after = store.get_claim(cid).unwrap();
+        assert_eq!(after.task_name, "lead:fin: 内置dsh插件能力");
+        // 再问一次（claim 仍是 waiting，ask 允许）不叠加 fin:。
+        ask(&store, cid, DONE_QUESTION).unwrap();
+        let after2 = store.get_claim(cid).unwrap();
+        assert_eq!(after2.task_name, "lead:fin: 内置dsh插件能力", "fin: 不该叠加");
+
+        // 普通 -q 提问的任务标题不含 fin:。
+        let r2 = start(&store, "p-test", "lead: 拍板问题", "", "s-ask-done").unwrap();
+        ask(&store, &r2.claim.claim_id, "请拍板（3=A 4=B）").unwrap();
+        let plain = store.get_claim(&r2.claim.claim_id).unwrap();
+        assert!(!plain.task_name.contains("fin:"), "普通提问不该加 fin: {}", plain.task_name);
+
+        lead_test_restore(env);
+    }
+
+    // CLI done 一个 lead 任务，会连带收同会话的子任务（跟邮件回 1 一致）。
+    #[test]
+    fn cli_done_lead_finalizes_peer_and_leaves_other_session() {
+        let store = tmp_store("cli-done-lead");
+        let _stub = test_mcp_stub(&store);
+        let now = chrono::Local::now().to_rfc3339();
+        let a = "s-cli-done";
+        store.append_claim(&peer_claim("clm-lead", "lead: 收尾测试", "waiting", a, &now)).unwrap();
+        store.append_claim(&peer_claim("clm-peer", "子任务甲", "running", a, &now)).unwrap();
+        store.append_claim(&peer_claim("clm-other", "别会话任务", "running", "s-other", &now)).unwrap();
+
+        // 跟 Cmd::Done 分支一致：先联动，再 finish 自己。
+        finalize_lead_on_cli_done(&store, "clm-lead");
+        finish(&store, "clm-lead", STAGE_DONE).unwrap();
+
+        let state = |id: &str| store.get_claim(id).unwrap().state;
+        assert_eq!(state("clm-peer"), "done", "同会话 peer 该被联动收为已解决");
+        assert_eq!(state("clm-other"), "running", "别会话不该被收");
+        assert_eq!(state("clm-lead"), "done", "lead 自己也已解决");
+    }
+
+    // 非 lead 任务 done 不联动（子代理/普通任务行为不变）。
+    #[test]
+    fn cli_done_non_lead_does_not_finalize() {
+        let store = tmp_store("cli-done-non-lead");
+        let _stub = test_mcp_stub(&store);
+        let now = chrono::Local::now().to_rfc3339();
+        let a = "s-cli-done";
+        store.append_claim(&peer_claim("clm-plain", "普通任务", "running", a, &now)).unwrap();
+        store.append_claim(&peer_claim("clm-peer", "子任务乙", "running", a, &now)).unwrap();
+
+        finalize_lead_on_cli_done(&store, "clm-plain");
+        finish(&store, "clm-plain", STAGE_DONE).unwrap();
+        assert_eq!(store.get_claim("clm-peer").unwrap().state, "running", "非 lead done 不该联动");
+    }
+
     #[test]
     fn lead_finalize_peers_closes_all_kinds_and_spares_others() {
         let store = tmp_store("lead-finalize-peers");
@@ -6028,16 +6424,48 @@ mod tests {
         let got = lead_finalize_peers(&store, "clm-lead").unwrap();
         assert!(got.iter().any(|s| s == "已解决: 执行中子任务"), "新鲜 running 应已解决: {got:?}");
         assert!(got.iter().any(|s| s == "已解决: 待回复子任务"), "waiting 应已解决: {got:?}");
-        assert!(got.iter().any(|s| s == "已完成: 僵尸子任务"), "超时 running 应已完成: {got:?}");
+        assert!(got.iter().any(|s| s == "已解决: 僵尸子任务"), "僵尸也统一已解决: {got:?}");
         assert!(!got.iter().any(|s| s.contains("别会话任务")), "别会话不该被收: {got:?}");
         assert!(!got.iter().any(|s| s.contains("lead:收尾")), "lead 自己不该被收: {got:?}");
 
         let state = |id: &str| store.get_claim(id).unwrap().state;
         assert_eq!(state("clm-run"), "done", "新鲜 running 落 done");
         assert_eq!(state("clm-wait"), "done", "waiting 落 done");
-        assert_eq!(state("clm-zombie"), "closed", "僵尸 running 落 closed");
+        assert_eq!(state("clm-zombie"), "done", "僵尸也落 done，不再赖在列5");
         assert_eq!(state("clm-other"), "running", "别会话保持原样");
         assert_eq!(state("clm-lead"), "waiting", "lead 自己保持原样");
+    }
+
+    // 子代理回 1：只收同 agent-N 的进行中/待回复，不碰别的 agent 和 lead。
+    #[test]
+    fn agent_close_finalizes_only_same_tag() {
+        let store = tmp_store("agent-close-finalize");
+        let _stub = test_mcp_stub(&store);
+        let now = chrono::Local::now().to_rfc3339();
+        let a = "s-main";
+        let mut closing = peer_claim("clm-close", "子任务甲", "waiting", a, &now);
+        closing.note = "agent-3".into();
+        store.append_claim(&closing).unwrap();
+        let mut peer = peer_claim("clm-peer", "子任务乙", "running", a, &now);
+        peer.note = "agent-3".into();
+        store.append_claim(&peer).unwrap();
+        let mut other = peer_claim("clm-other-tag", "别的agent任务", "waiting", a, &now);
+        other.note = "agent-5".into();
+        store.append_claim(&other).unwrap();
+        let untagged = peer_claim("clm-untagged", "没打tag任务", "running", a, &now);
+        store.append_claim(&untagged).unwrap();
+        store.append_claim(&peer_claim("clm-lead", "lead:收尾", "waiting", a, &now)).unwrap();
+
+        let got = lead_finalize_peers(&store, "clm-close").unwrap();
+        assert!(got.iter().any(|s| s == "已解决: 子任务乙"), "同 agent-3 该被收: {got:?}");
+        assert!(!got.iter().any(|s| s.contains("别的agent任务")), "别的 agent 不该被收: {got:?}");
+        assert!(!got.iter().any(|s| s.contains("没打tag任务")), "没 tag 的不该被收: {got:?}");
+        assert!(!got.iter().any(|s| s.contains("lead:收尾")), "lead 不该被子代理收: {got:?}");
+        let state = |id: &str| store.get_claim(id).unwrap().state;
+        assert_eq!(state("clm-peer"), "done", "同 tag 落 done");
+        assert_eq!(state("clm-other-tag"), "waiting", "别 tag 原样");
+        assert_eq!(state("clm-untagged"), "running", "没 tag 原样");
+        assert_eq!(state("clm-close"), "waiting", "自己原样（由聚合器 finish）");
     }
 
     // 直连模式文案（`tba go -off <任务>`）：带上这次要做的事，但**一条 Teambition
@@ -6362,9 +6790,11 @@ mod tests {
         // 只列名字 agent 猜不出用途，等于没写；正文仍然按需读，没有内联。
         // 再涨就说明文案又变长了，要主动确认。
         // v0.2.20 新增内置能力 git-create（索引多一行）：这是预期增长。
+        // v0.2.68 内置能力加到 v6（dsh-plugin / cap-author / context-cost，索引多三行），
+        // 实测 2769 字符，预算抬到 3000 仍远小于「20 个 skill 全内联」的 10 万+。
         assert!(
-            p.chars().count() < 2600,
-            "文案体积失控: {} 字符（预算 2600）",
+            p.chars().count() < 3000,
+            "文案体积失控: {} 字符（预算 3000）",
             p.chars().count()
         );
     }
@@ -6409,7 +6839,10 @@ mod tests {
         assert!(out.contains("先想再写"), "自动块应刷成最新");
         assert!(!out.contains("旧的先想再写"), "旧文案不该残留");
         assert!(out.contains("用户手写，不许动"), "用户内容不该被覆盖");
-        assert_eq!(out.matches(ENTRY_MARK).count(), 1, "入口块不能重复");
+        assert_eq!(out.matches(AGENT_MARK).count(), 1, "合并块不能重复");
+        for mark in LEGACY_MARKS {
+            assert_eq!(out.matches(mark).count(), 0, "旧分块标记不该残留: {mark}");
+        }
     }
 
     #[test]
@@ -6440,18 +6873,18 @@ mod tests {
         assert!(s.contains("最后一次 report 列清全部子任务状态"), "缺最终 report 列状态: {s}");
     }
 
-    // v0.2.57：旧版 strip_tba_block 被 ultracave 块内 `##` 截断，refresh 一次多一份。
-    // 脏文件（两份无标记残留 + 一份带标记）refresh 后必须只剩一份带标记的。
+    // 旧版按 `## ` 收边界会截断 ultracave 块，refresh 一次多一份无标记正文。
+    // 脏文件（两份无标记残留 + 一份最新合并块）refresh 后必须只剩一份风格标题。
     #[test]
-    fn refresh_collapses_duplicate_ultracave_blocks() {
+    fn refresh_collapses_unmarked_ultracave_residue() {
         let store = tmp_store("refresh-dedup-ultracave");
         let dir = store.root.clone();
         let clean = ensure_entry_at(&dir, "tba").expect("生成初始 AGENTS.md");
         let full = std::fs::read_to_string(&clean).unwrap();
-        // 抽带标记的 ultracave 整块，复制两份去掉标记的正文模拟历史残留。
-        let marked = full.find(ULTRACAVE_MARK).expect("缺 ultracave 标记");
-        let block = &full[marked..];
-        let unmarked = block.replace(ULTRACAVE_MARK, "").trim_start().to_string();
+        // 抽合并块里的风格正文，复制两份模拟历史无标记残留。
+        let marked = full.find(AGENT_MARK).expect("缺合并块标记");
+        let style = full[marked..].find(ULTRACAVE_BODY.trim_start()).expect("合并块缺风格正文");
+        let unmarked = full[marked + style..].trim_start().to_string();
         let dirty = format!("{unmarked}\n\n{unmarked}\n\n{full}");
         std::fs::write(&clean, &dirty).unwrap();
 
@@ -6463,7 +6896,7 @@ mod tests {
             .filter(|(p, _)| *p == 0 || out[..*p].ends_with('\n'))
             .count();
         assert_eq!(head_count, 1, "refresh 后 ultracave 块该只剩一份: {out}");
-        assert_eq!(out.matches(ULTRACAVE_MARK).count(), 1, "标记块该只有一份");
+        assert_eq!(out.matches(AGENT_MARK).count(), 1, "合并块标记该只有一份");
     }
 
     #[test]
@@ -6475,12 +6908,16 @@ mod tests {
         assert!(refresh_agents_at(&dir, "tba", true).is_some());
         let out = std::fs::read_to_string(&p).unwrap();
         assert!(!out.contains("手写内容"), "--f 应整份覆盖");
-        assert!(out.contains(ENTRY_MARK), "--f 后自动生成块齐全");
-        assert!(out.contains(RULES_MARK));
-        assert!(out.contains(ULTRACAVE_MARK));
+        assert_eq!(out.matches(AGENT_MARK).count(), 1, "--f 后只该有一个合并块");
+        assert!(out.contains("## 任务队列入口"));
+        assert!(out.contains("## 编码纪律"));
+        assert!(out.contains("## 默认回复风格：简洁"));
+        for mark in LEGACY_MARKS {
+            assert_eq!(out.matches(mark).count(), 0, "--f 不该写旧分块标记: {mark}");
+        }
     }
 
-    // 版本号全文件只写一次：只在 bootstrap 标记行；其余三块不带版本。
+    // 版本号全文件只写一次：只在 bootstrap 标记行；合并块不带版本。
     #[test]
     fn version_appears_only_in_bootstrap_marker() {
         let store = tmp_store("single-version");
@@ -6490,10 +6927,8 @@ mod tests {
         let ver = format!("v{ENTRY_VERSION}");
         assert_eq!(s.matches(&ver).count(), 1, "版本号应只出现一次: {s}");
         assert!(s.contains(&format!("{BOOTSTRAP_MARK} {ver}")), "bootstrap 标记该带版本");
-        for mark in [ENTRY_MARK, RULES_MARK, ULTRACAVE_MARK] {
-            let line = s.lines().find(|l| l.contains(mark)).expect("缺标记");
-            assert!(!line.contains("v0."), "{mark} 标记行不该带版本: {line}");
-        }
+        let line = s.lines().find(|l| l.contains(AGENT_MARK)).expect("缺合并块标记");
+        assert!(!line.contains("v0."), "合并块标记行不该带版本: {line}");
         // 再跑一次：幂等，不追加不重复。
         assert!(ensure_entry_at(&dir, "tba").is_none(), "已是最新不该再写");
     }
@@ -6512,7 +6947,7 @@ mod tests {
                  旧 bootstrap 正文\n\n\
                  {ENTRY_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 任务队列入口\n\n旧入口。\n\n\
                  {RULES_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 编码纪律\n\n旧纪律。\n\n\
-                 {ULTRACAVE_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 默认回复风格：简洁\n\n旧风格。\n"
+                 <!-- tba:ultracave 由 tba 自动生成，删掉不影响功能 -->\n## 默认回复风格：简洁\n\n旧风格。\n"
             ),
         )
         .unwrap();
@@ -6524,8 +6959,14 @@ mod tests {
         let ver = format!("v{ENTRY_VERSION}");
         assert_eq!(s.matches(&ver).count(), 1, "重写后版本号只该出现一次");
         assert!(s.contains(&format!("{BOOTSTRAP_MARK} {ver}")), "bootstrap 该是最新版本");
-        assert!(s.contains("git create"), "三块该刷成最新文案");
+        assert_eq!(s.matches(AGENT_MARK).count(), 1, "老三块该迁移成一个合并块");
+        for mark in LEGACY_MARKS {
+            assert_eq!(s.matches(mark).count(), 0, "旧分块标记不该残留: {mark}");
+        }
+        assert!(s.contains("git create"), "入口文案该刷成最新");
         assert!(s.contains("主代理不自己写"), "入口块该刷成最新文案");
+        assert!(s.contains("先想再写"), "编码纪律该刷成最新文案");
+        assert!(s.contains("默认回复风格：简洁"), "回复风格该刷成最新文案");
         assert!(s.contains("# 用户说明"), "用户正文不该丢");
         assert!(!s.contains("旧入口"), "旧块正文不该残留");
         assert!(ensure_entry_at(&dir, "tba").is_none(), "已是最新不该反复重写");
@@ -6551,34 +6992,34 @@ mod tests {
         assert!(out.contains(&format!("{BOOTSTRAP_MARK} {ver}")), "bootstrap 该是最新版本");
         assert!(out.contains("先想再写") && !out.contains("旧的先想再写"), "三块该刷成最新");
         assert!(out.contains("用户手写，不许动"), "用户正文不该丢");
-        for mark in [ENTRY_MARK, RULES_MARK, ULTRACAVE_MARK] {
-            assert_eq!(out.matches(mark).count(), 1, "{mark} 不该重复");
+        assert_eq!(out.matches(AGENT_MARK).count(), 1, "合并块不该重复");
+        for mark in LEGACY_MARKS {
+            assert_eq!(out.matches(mark).count(), 0, "旧分块标记不该残留: {mark}");
         }
     }
 
-    // AGENTS.md 入口：两个块各自补，用户自己的内容一个字不动。
-    // 重点是「老项目也能补上后加的编码纪律」——不能被「已有入口」挡住。
+    // AGENTS.md 入口：三段合成一块，用户自己的内容一个字不动。
+    // 重点是「老项目只有入口块时也能被合并块替换」——不能被「已有入口」挡住。
     #[test]
     fn entry_file_adds_rules_without_touching_user_content() {
         let store = tmp_store("entry");
         let dir = store.root.clone();
 
-        // 1) 空目录：两个块都写进去，四条原则一条不少。
+        // 1) 空目录：一个合并块写进去，三段内容一条不少。
         let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
         let s = std::fs::read_to_string(&p).unwrap();
-        assert!(s.contains(ENTRY_MARK), "缺任务队列入口块");
-        assert!(s.contains(RULES_MARK), "缺编码纪律块");
-        for rule in ["先想再写", "最简实现", "只改必须改的", "先定验证标准"] {
-            assert!(s.contains(rule), "缺编码纪律: {rule}");
+        assert_eq!(s.matches(AGENT_MARK).count(), 1, "缺合并块标记");
+        for rule in ["任务队列入口", "先想再写", "最简实现", "只改必须改的", "先定验证标准", "默认回复风格：简洁"] {
+            assert!(s.contains(rule), "合并块缺内容: {rule}");
         }
 
-        // 2) 再跑一次：两块都在，不该再写。
+        // 2) 再跑一次：合并块在，不该再写。
         assert!(
             ensure_entry_at(&dir, "tba").is_none(),
-            "两块都在时不该再写文件"
+            "合并块已在时不该再写文件"
         );
 
-        // 3) 老项目只有入口块：只补纪律块，入口块不重复。
+        // 3) 老项目只有入口块：迁成合并块，旧标记不残留、用户内容不动。
         std::fs::write(
             &p,
             format!("# 用户自己的说明\n\n{ENTRY_MARK} 旧版入口 -->\n## 任务队列入口\n\n旧内容\n"),
@@ -6586,13 +7027,16 @@ mod tests {
         .unwrap();
         assert!(
             ensure_entry_at(&dir, "tba").is_some(),
-            "老项目该补上纪律块"
+            "老项目该迁成合并块"
         );
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(s.contains("# 用户自己的说明"), "用户内容被动了");
-        assert!(s.contains(RULES_MARK), "老项目没补上纪律块");
-        assert_eq!(s.matches(ENTRY_MARK).count(), 1, "入口块被重复写了");
-        assert_eq!(s.matches(RULES_MARK).count(), 1, "纪律块被重复写了");
+        assert_eq!(s.matches(AGENT_MARK).count(), 1, "合并块该只有一份");
+        for mark in LEGACY_MARKS {
+            assert_eq!(s.matches(mark).count(), 0, "旧标记不该残留: {mark}");
+        }
+        assert!(s.contains("先想再写"), "合并块该补上纪律");
+        assert!(!s.contains("旧内容"), "旧入口正文不该残留");
     }
 
     // v0.2.20：老 AGENTS.md 的通用能力名单里没有 git create，agent 进项目就
@@ -6621,7 +7065,10 @@ mod tests {
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(s.contains("git create"), "新名单要带 git create");
         assert!(s.contains("别装 gh"), "要点明不用装 gh");
-        assert_eq!(s.matches(ENTRY_MARK).count(), 1, "重写不能重复追加入口块");
+        assert_eq!(s.matches(AGENT_MARK).count(), 1, "重写不能重复追加合并块");
+        for mark in LEGACY_MARKS {
+            assert_eq!(s.matches(mark).count(), 0, "旧分块标记不该残留: {mark}");
+        }
         assert!(s.contains("# 用户说明"), "用户自己的内容不能丢");
 
         // 重写后再跑一次：已经是最新的，不该再写。
@@ -6757,6 +7204,8 @@ mod tests {
         assert!(t.contains("run_in_background"), "缺后台执行指引: {t}");
         assert!(t.contains("不许前台等待"), "缺不许前台等待规则: {t}");
         assert!(t.contains("常驻监听必须后台执行"), "缺常驻监听后台规则标题: {t}");
+        // 不许用 job_output 轮询监听（33 秒耗时的根因），英文精简句。
+        assert!(t.contains("never poll it with `job_output`"), "缺禁止 job_output 轮询规则: {t}");
     }
 
     // 派子代理前主代理必须先 tba sub <claim_id> --agent-tag agent-N 打 tag，再用 subagent 工具派活。
@@ -6885,6 +7334,20 @@ mod tests {
         assert!(s.contains("重开"), "入口缺同一任务重开复用: {s}");
         assert!(s.contains("只看本会话"), "入口缺只看本会话边界: {s}");
         assert!(s.contains("本会话第一个任务 = agent-1"), "入口缺本会话首个 agent-1 规则: {s}");
+        // 关联性强的新任务复用旧 agent（产品级，写进生成器）。
+        assert!(s.contains("关联性强"), "入口缺关联性强的复用规则: {s}");
+        assert!(s.contains("ask --done"), "入口缺待回复 agent 也可复用: {s}");
+        assert!(s.contains("不新建 subagent 实例"), "入口缺不新建实例: {s}");
+        assert!(s.contains("复用时不必重新打 tag"), "入口缺复用免打 tag: {s}");
+        assert!(s.contains("只有全新无关任务才递增"), "入口缺全新无关才递增: {s}");
+        assert!(s.contains("默认复用更省 token"), "入口缺省 token 复用边界: {s}");
+        assert!(s.contains("不用刻意估算上下文长度"), "入口缺不估算上下文: {s}");
+        // 复用 agent 时 Teambition 任务也复用：同 agent-N 不许两条 claim。
+        assert!(s.contains("原 claim"), "入口缺原 claim 复用: {s}");
+        assert!(s.contains("tba reply <旧claim_id>"), "入口缺 reply 旧 claim: {s}");
+        assert!(s.contains("不再 `tba sub` 新建 claim"), "入口缺不新建 claim: {s}");
+        assert!(s.contains("已收尾（done/closed）"), "入口缺已收尾分支: {s}");
+        assert!(s.contains("只有全新无关任务才新建 claim + 递增新号"), "入口缺全新无关才新建 claim: {s}");
         assert!(!s.contains("如 agent-1 / agent-2"), "入口仍有误导性递增示例: {s}");
 
         // 造一份「其它版本条件都在、只有 --agent-tag 但缺新序号规则」的老入口。
@@ -6907,7 +7370,13 @@ mod tests {
         assert!(s.contains("重开"), "重写后缺同一任务重开复用: {s}");
         assert!(s.contains("只看本会话"), "重写后缺只看本会话边界: {s}");
         assert!(s.contains("本会话第一个任务 = agent-1"), "重写后缺本会话首个 agent-1 规则: {s}");
-        assert_eq!(s.matches(ENTRY_MARK).count(), 1, "重写不能重复追加入口块");
+        assert!(s.contains("关联性强"), "重写后缺关联性强的复用规则: {s}");
+        assert!(s.contains("ask --done"), "重写后缺待回复 agent 也可复用: {s}");
+        assert!(s.contains("不新建 subagent 实例"), "重写后缺不新建实例: {s}");
+        assert!(s.contains("原 claim"), "重写后缺原 claim 复用: {s}");
+        assert!(s.contains("tba reply <旧claim_id>"), "重写后缺 reply 旧 claim: {s}");
+        assert!(s.contains("已收尾（done/closed）"), "重写后缺已收尾分支: {s}");
+        assert_eq!(s.matches(AGENT_MARK).count(), 1, "重写不能重复追加合并块");
         assert!(s.contains("# 用户说明"), "用户自己的内容不能丢");
         assert!(ensure_entry_at(&dir, "tba").is_none(), "已是新版就不该反复重写");
     }
@@ -6943,7 +7412,7 @@ mod tests {
         assert!(ensure_entry_at(&dir, "tba").is_some(), "缺主代理派活规则的老入口必须重写");
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(s.contains("主代理不自己写、优先派子代理"), "重写后仍缺主代理派活规则: {s}");
-        assert_eq!(s.matches(ENTRY_MARK).count(), 1, "重写不能重复追加入口块");
+        assert_eq!(s.matches(AGENT_MARK).count(), 1, "重写不能重复追加合并块");
         assert!(s.contains("# 用户说明"), "用户自己的内容不能丢");
         assert!(ensure_entry_at(&dir, "tba").is_none(), "已是新版就不该反复重写");
     }
@@ -6970,6 +7439,96 @@ mod tests {
             ensure_entry_at(&dir, "tba").is_none(),
             "已是新版就不该反复重写"
         );
+    }
+
+    // 三块迁一块：老文件有 entry/rules/ultracave 三个标记，必须清成一个 AGENT_MARK，
+    // 三段内容保留，用户正文不动，重复跑不追加。
+    #[test]
+    fn entry_migrates_three_legacy_blocks_into_one() {
+        let store = tmp_store("entry-merge-legacy");
+        let dir = store.root.clone();
+        let p = dir.join("AGENTS.md");
+        std::fs::write(
+            &p,
+            format!(
+                "# 用户说明\n\n\
+                 {BOOTSTRAP_MARK} v0.0.1 由 tba 自动生成，删掉不影响功能 -->\n旧 bootstrap 正文\n\n\
+                 {ENTRY_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 任务队列入口\n\n旧入口。\n\n\
+                 {RULES_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 编码纪律\n\n旧纪律。\n\n\
+                 <!-- tba:ultracave 由 tba 自动生成，删掉不影响功能 -->\n## 默认回复风格：简洁\n\n旧风格。\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(ensure_entry_at(&dir, "tba").is_some(), "旧三块该触发迁移");
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(s.matches(AGENT_MARK).count(), 1, "只该有一个合并块标记");
+        for mark in LEGACY_MARKS {
+            assert_eq!(s.matches(mark).count(), 0, "旧标记不该残留: {mark}");
+        }
+        for stale in ["旧入口", "旧纪律", "旧风格"] {
+            assert!(!s.contains(stale), "旧正文不该残留: {stale}");
+        }
+        for text in ["## 任务队列入口", "## 编码纪律", "## 默认回复风格：简洁"] {
+            assert!(s.contains(text), "合并块缺段落: {text}");
+        }
+        assert!(s.contains("# 用户说明"), "用户正文不该丢");
+        assert!(ensure_entry_at(&dir, "tba").is_none(), "重复跑该幂等");
+        let s2 = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(s2, s, "重复跑不该改文件");
+    }
+
+    // 当前版本 + 合并块 => 不重写；再跑两次也一个字不动。
+    #[test]
+    fn entry_merged_block_is_current_and_idempotent() {
+        let store = tmp_store("entry-merged-idempotent");
+        let dir = store.root.clone();
+        let p = ensure_entry_at(&dir, "tba").expect("空目录该生成 AGENTS.md");
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(before.matches(AGENT_MARK).count(), 1);
+        assert_eq!(before.matches(BOOTSTRAP_MARK).count(), 1);
+        for _ in 0..2 {
+            assert!(ensure_entry_at(&dir, "tba").is_none(), "当前版本不该重写");
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "重复跑不该改文件");
+    }
+
+    // 旧版无标记 `## 红线` 整段会和当前合并块大面积重复。触发迁移时要剥掉它，
+    // 但不能吞掉后面的 `## 详细流程` 及用户正文；已是最新时不碰用户文件。
+    #[test]
+    fn entry_migration_strips_unmarked_redline_but_keeps_user_sections() {
+        let store = tmp_store("entry-unmarked-redline");
+        let dir = store.root.clone();
+        let p = dir.join("AGENTS.md");
+        let current = bootstrap_block().lines().next().unwrap().to_string();
+        let user_tail = "## 详细流程\n\n看 `docs/流程图.md`，需要时再读。\n\n## 我的笔记\n\n手写保留。\n";
+        let dirty = format!(
+            "# 用户说明\n\n{current}\n旧 bootstrap 正文\n\n\
+             ## 红线\n\n0. 旧红线一。\n0. 旧红线二。\n\n\
+             {user_tail}\
+             {AGENT_MARK} 由 tba 自动生成，删掉不影响功能 -->\n## 任务队列入口\n\n当前入口。\n"
+        );
+        std::fs::write(&p, &dirty).unwrap();
+
+        // 当前 bootstrap 版本 + 当前合并块 => 早退分支，一个字都不改。
+        assert!(
+            ensure_entry_at(&dir, "tba").is_none(),
+            "当前版本该早退，不该动用户文件"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), dirty, "早退分支不该改文件");
+
+        // 版本号摘掉模拟 refresh 把版本门弄失效，走迁移路径。
+        let stale = dirty.replace(&current, BOOTSTRAP_MARK);
+        std::fs::write(&p, &stale).unwrap();
+        assert!(ensure_entry_at(&dir, "tba").is_some(), "版本门失效该触发迁移");
+
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(!out.contains("## 红线"), "旧无标记红线段该整段剥掉: {out}");
+        assert!(!out.contains("旧红线一") && !out.contains("旧红线二"), "旧红线正文该剥掉");
+        assert!(out.contains(user_tail), "## 详细流程 及后续用户内容该原样保留");
+        assert!(out.contains("# 用户说明"), "用户说明不该丢");
+        assert_eq!(out.matches(AGENT_MARK).count(), 1, "agent 合并块该仍只有一块");
+        assert!(out.contains(&current), "bootstrap 该是最新版本");
     }
 
     // 造一条台账记录，只关心跟孤儿判定相关的字段。
@@ -7223,6 +7782,30 @@ mod tests {
         assert!(summary.contains("离线模式是什么情况"), "text 应是摘要: {summary}");
         assert!(!summary.contains("第二行"), "摘要只取首行: {summary}");
         assert!(summary.len() <= 130, "摘要封顶 ~120 字 + 省略号: {summary}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 回 1（closed）：tba 已自己 finish 收尾，不能再写 wake 唤醒 agent 白跑一轮。
+    #[test]
+    fn wake_skips_closed_action() {
+        let tmp = std::env::temp_dir().join(format!("tba-wake-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("data");
+        let waits = root.join("waits");
+        std::fs::create_dir_all(&waits).unwrap();
+        std::fs::write(waits.join("clm-c.session"), "sess-c").unwrap();
+
+        write_wake_request(&root, "clm-c", "1", "closed");
+        assert!(
+            std::fs::read_to_string(root.join("wakes").join("sess-c.json")).is_err(),
+            "回 1 不该写 wake（已由 tba finish，无需 agent 再动）"
+        );
+        // 其它动作照常唤醒。
+        write_wake_request(&root, "clm-c", "继续改", "custom:3");
+        assert!(
+            std::fs::read_to_string(root.join("wakes").join("sess-c.json")).is_ok(),
+            "非收尾回复仍要唤醒"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

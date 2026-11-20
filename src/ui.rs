@@ -47,7 +47,7 @@ enum Ev {
     ToolchainChecked(crate::toolchain::Resolved),
     /// DSH 插件检测结果（后台，不挡窗口）
     PluginsChecked(Vec<PluginStatus>),
-    /// 一键安装 DSH 预设的结果
+    /// 一键安装 DSH 预设的结果（含 pwsh-lite）
     PresetsInstalled(Result<String, String>),
 }
 
@@ -115,16 +115,20 @@ const BRIDGE_PATHS: &[&str] = &[
     "~/.dsh/profiles/desktop/node_modules/dsh-tba-bridge",
 ];
 const CONTEXT_DIFF_PATHS: &[&str] = &["~/.dsh/profiles/desktop/node_modules/dsh-context-diff"];
+const PWSH_LITE_PATHS: &[&str] = &["~/.dsh/profiles/desktop/node_modules/@local/dsh-pwsh-lite"];
 
 const MODSEARCH_DESC: &str = "全网最强 DSH 免费联网搜索插件，免费免注册免 API key，为不能联网的模型补搜索，问网页/X 返回结构化 JSON 证据";
 const BRIDGE_DESC: &str = "tba 回复唤醒桥：邮件 / Teambition 新回复立刻注入会话，不用等 job 退出";
 const CONTEXT_DIFF_DESC: &str = "上下文差异能力插件";
+const PWSH_LITE_DESC: &str = "pwsh-lite 精简版 PowerShell 工具（tba 模式/聊天模式 preset 依赖），本地目录安装后可默认启用";
 
 // 两类来源，文案分开写：GitHub 用 dsh plugin --profile ... add "github:..."，
 // dsh 类从插件市场装，用 dsh plugin add <包名>。
 const INSTALL_MODSEARCH: &str = "GitHub 安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin --profile web add \"github:liustack/modsearch\"\n仓库：https://github.com/liustack/modsearch\n装完重启 harness / 在 Web UI 确认加载。\n已装可照此命令重装/更新到新版；插件非必须。";
 const INSTALL_BRIDGE: &str = "GitHub 安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin --profile desktop add \"github:Rei1mu/dsh-tba-bridge\"\n仓库：https://github.com/Rei1mu/dsh-tba-bridge\n装完重启 harness / 在 Web UI 确认加载。\n已装可照此命令重装/更新到新版；插件非必须。";
-const INSTALL_CONTEXT_DIFF: &str = "从 DSH 插件市场安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin add dsh-context-diff\n装完重启 harness / 在 Web UI 确认加载。\n已装可照此命令重装/更新到新版；插件非必须。";
+const INSTALL_CONTEXT_DIFF: &str = "从 DSH 插件市场安装（在你自己的 shell 里跑 dsh；本机 dsh 不在 PATH）：\n  dsh plugin add dsh-context-diff\n装完重启 DSH / 在 Web UI 确认加载。\n已装可照此命令重装/更新到新版；插件非必须。";
+// pwsh-lite 是本地源码插件，走 tba 自带的一键安装（pnpm add link: + 补 bundles）。
+pub const PWSH_LITE_SOURCE: &str = "D:/dev/mcp/dsh-pwsh-lite";
 
 struct PluginSpec {
     name: &'static str,
@@ -151,6 +155,12 @@ const PLUGIN_SPECS: &[PluginSpec] = &[
         desc: CONTEXT_DIFF_DESC,
         paths: CONTEXT_DIFF_PATHS,
         install_text: INSTALL_CONTEXT_DIFF,
+    },
+    PluginSpec {
+        name: "@local/dsh-pwsh-lite",
+        desc: PWSH_LITE_DESC,
+        paths: PWSH_LITE_PATHS,
+        install_text: "一键安装：点本卡片上方「安装 tba 预设+插件」按钮，tba 会检查两个预设和 pwsh-lite / dsh-tba-bridge 的版本并安装/更新。装完请完全退出并重启 DSH。",
     },
 ];
 
@@ -271,7 +281,7 @@ pub struct App {
     tc_resolved: Option<crate::toolchain::Resolved>,
     // DSH 插件状态（None = 后台还没测完）
     plugins: Option<Vec<PluginStatus>>,
-    // 一键装预设在跑（按钮置灰 + 显示「安装中...」）
+    // 一键装预设（含 pwsh-lite）在跑（按钮置灰 + 显示「安装中...」）
     preset_busy: bool,
 }
 
@@ -551,6 +561,8 @@ impl App {
         let store_cfg = store.load_config();
         // 通用能力是本地文件，窗口打开时读一次即可（不存在会灌一份内置模板）。
         let caps_rows = caps::list(&store);
+        // 工具链位置存在 toolchain.toml，启动时读回来填表单；留空则走自动探测。
+        let toolchain = crate::toolchain::load(&store);
         // 截图验证用：TBA_UI_CAP=shot 直接打开那条能力的编辑窗（GUI 没法用命令行点按钮）。
         let cap_edit0 = std::env::var("TBA_UI_CAP")
             .ok()
@@ -612,7 +624,7 @@ impl App {
             create_custom: String::new(),
             create_busy: false,
             create_out: String::new(),
-            toolchain: crate::toolchain::Toolchain::default(),
+            toolchain,
             tc_check: Some(true),
             tc_resolved: None,
             plugins: None,
@@ -665,6 +677,20 @@ impl App {
             .set_title("选择目录")
             .set_directory(start.unwrap_or_else(|| std::path::PathBuf::from(".")));
         dlg.pick_folder().map(|p| p.display().to_string())
+    }
+
+    /// 自动探测 MSVC / SDK 并立即落盘：三个设置页按钮共用，点一个就填满三个字段。
+    fn auto_detect_toolchain(&mut self) {
+        if let Some(tc) = crate::toolchain::auto_detect() {
+            self.toolchain = tc;
+            self.tc_check = Some(true);
+            match crate::toolchain::save(&self.store, &self.toolchain) {
+                Ok(()) => self.status = "已自动检测并保存到 toolchain.toml。".to_string(),
+                Err(e) => self.status = format!("保存失败: {e}"),
+            }
+        } else {
+            self.status = "没找到 MSVC / Windows SDK（标准位置没有；可手选或去安装）。".to_string();
+        }
     }
 
     fn pick_but_path(&mut self) {
@@ -1051,15 +1077,6 @@ impl App {
                     egui::RichText::new("✗").color(egui::Color32::from_rgb(0xc6, 0x28, 0x28))
                 }
             };
-            let auto_fill = |field: &str| -> Option<String> {
-                let r = crate::toolchain::auto_detect()?;
-                match field {
-                    "msvc_bin" => Some(r.msvc_bin),
-                    "msvc_lib" => Some(r.msvc_lib),
-                    "winsdk" => Some(r.winsdk_libs),
-                    _ => None,
-                }
-            };
             egui::Grid::new("toolchain_form")
                 .num_columns(3)
                 .spacing([8.0, 8.0])
@@ -1079,9 +1096,7 @@ impl App {
                     });
                     ui.horizontal(|ui| {
                         if ui.small_button("自动检测").clicked() {
-                            if let Some(v) = auto_fill("msvc_bin") {
-                                self.toolchain.msvc_bin = v;
-                            }
+                            self.auto_detect_toolchain();
                         }
                         ui.label(mark(bin_ok));
                     });
@@ -1102,9 +1117,7 @@ impl App {
                     });
                     ui.horizontal(|ui| {
                         if ui.small_button("自动检测").clicked() {
-                            if let Some(v) = auto_fill("msvc_lib") {
-                                self.toolchain.msvc_lib = v;
-                            }
+                            self.auto_detect_toolchain();
                         }
                         ui.label(mark(lib_ok));
                     });
@@ -1125,9 +1138,7 @@ impl App {
                     });
                     ui.horizontal(|ui| {
                         if ui.small_button("自动检测").clicked() {
-                            if let Some(v) = auto_fill("winsdk") {
-                                self.toolchain.winsdk_libs = v;
-                            }
+                            self.auto_detect_toolchain();
                         }
                         ui.label(mark(sdk_ok));
                     });
@@ -1195,18 +1206,18 @@ impl App {
         }
     }
 
-    /// DSH 插件卡：4 个插件的已装/未装状态 + 都可复制安装/更新文案。
-    /// 只提示、不自动装；检测走后台线程，不挡窗口。
+    /// DSH 插件卡：插件的已装/未装状态 + 可复制安装文案 + 一键装预设（含 pwsh-lite）。
+    /// 检测走后台线程，不挡窗口。
     fn draw_plugins_card(&mut self, ui: &mut egui::Ui) {
         ui.add_space(10.0);
         ui.label(egui::RichText::new("DSH 插件").strong());
-        ui.label("只检测、不自动安装。已装/未装都可复制文案（更新或安装），去你自己的 shell 跑（本机 dsh 不在 PATH）。");
+        ui.label("已装的插件显示 ✓；未装的显示 ✗。其它插件只提示不自动装，可复制文案去你自己的 shell 跑（本机 dsh 不在 PATH）。点「安装 tba 预设+插件」会同时按版本检查并安装两个预设和 pwsh-lite / dsh-tba-bridge。");
         ui.horizontal_wrapped(|ui| {
             if self.preset_busy {
-                ui.label("安装中...");
-            } else if ui.button("安装 tba模式/聊天模式预设").clicked() {
+                ui.label("安装预设中...");
+            } else if ui.button("安装 tba 预设+插件").clicked() {
                 self.preset_busy = true;
-                self.status = "正在安装 DSH 预设...".to_string();
+                self.status = "正在安装 tba 预设与插件...".to_string();
                 let tx = self.tx.clone();
                 thread::spawn(move || {
                     let _ = tx.send(Ev::PresetsInstalled(crate::preset_install::install_presets()));
@@ -3072,7 +3083,7 @@ mod tests {
             std::fs::create_dir_all(home.join(rel)).unwrap();
         }
         let rows = detect_plugins(&home);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].name, "modsearch");
         assert!(rows[0].paths.iter().any(|p| p
             .to_string_lossy()
@@ -3083,6 +3094,8 @@ mod tests {
         assert!(rows[1].paths.iter().any(|p| p.to_string_lossy().contains("dsh-tba-bridge")));
         assert!(rows[1].installed);
         assert!(rows[2].installed);
+        assert_eq!(rows[3].name, "@local/dsh-pwsh-lite");
+        assert!(!rows[3].installed, "临时 home 没装 pwsh-lite");
 
         // 缺一个就应报未装（另一个路径还在也不能误判已装）。
         std::fs::remove_dir_all(home.join(r".dsh\dsh-tba-bridge")).unwrap();
@@ -3098,7 +3111,7 @@ mod tests {
     #[test]
     fn plugin_detect_current_machine_all_installed() {
         let rows = detect_plugins(&plugin_home());
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         for p in &rows {
             assert!(p.installed, "当前环境应已装 {}", p.name);
         }
@@ -3293,6 +3306,43 @@ mod tests {
         );
         let app3 = App::new(app.store.clone());
         assert_eq!(app3.font_size, MIN_FONT_SIZE, "低于下限应夹到 12");
+    }
+
+    // toolchain.toml 的手选路径要在下次启动时填回表单（原来一直读默认值）。
+    #[test]
+    fn app_loads_saved_toolchain_on_launch() {
+        let app = tmp_app("tc-load");
+        let saved = crate::toolchain::Toolchain {
+            msvc_bin: r"C:\vc\bin".into(),
+            msvc_lib: r"C:\vc\lib".into(),
+            winsdk_libs: r"C:\kit\um;C:\kit\ucrt".into(),
+        };
+        crate::toolchain::save(&app.store, &saved).unwrap();
+        let reopened = App::new(app.store.clone());
+        assert_eq!(reopened.toolchain.msvc_bin, saved.msvc_bin);
+        assert_eq!(reopened.toolchain.msvc_lib, saved.msvc_lib);
+        assert_eq!(reopened.toolchain.winsdk_libs, saved.winsdk_libs);
+    }
+
+    // 自动检测按钮必须把三个字段都填上并落盘；检测不到时不能清掉用户已填的值。
+    #[test]
+    fn auto_detect_toolchain_writes_all_fields_and_saves() {
+        let mut app = tmp_app("tc-detect");
+        if crate::toolchain::auto_detect().is_none() {
+            // 没有 MSVC 的环境只验证「不破坏原值」，不做落盘断言。
+            app.toolchain.msvc_bin = r"C:\manual\bin".into();
+            app.auto_detect_toolchain();
+            assert_eq!(app.toolchain.msvc_bin, r"C:\manual\bin");
+            return;
+        }
+        app.auto_detect_toolchain();
+        let detected = crate::toolchain::auto_detect().unwrap();
+        assert_eq!(app.toolchain.msvc_bin, detected.msvc_bin);
+        assert_eq!(app.toolchain.msvc_lib, detected.msvc_lib);
+        assert_eq!(app.toolchain.winsdk_libs, detected.winsdk_libs);
+        assert_eq!(crate::toolchain::load(&app.store).msvc_bin, detected.msvc_bin);
+        let reopened = App::new(app.store.clone());
+        assert_eq!(reopened.toolchain.msvc_lib, detected.msvc_lib);
     }
 
     // 字体选择要落盘、读回来、且默认是「自动」（空串）。

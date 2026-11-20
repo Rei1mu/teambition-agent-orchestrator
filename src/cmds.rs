@@ -419,6 +419,15 @@ fn subagent_watch(
         // sub 能让子代理并行处理，不被待回复任务拦住领新任务。
         match classify_claim_result(claim(store, project_id, None, &agent, true)) {
             SubPoll::Dispatch(c) => {
+                // 子代理干完要有 lead 任务承接汇报/收尾。用户没先跑 lead start 时
+                // 这里补一条（幂等），免得子代理问「跟谁汇报」时没人接。
+                match ensure_lead_for_session(store, &c.project_id) {
+                    Ok(true) => eprintln!(
+                        "tba sub：已自动建本会话 lead 任务（汇报/收尾用 `tba lead report`）。"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("tba sub：自动建 lead 任务失败（不影响派活）：{e}"),
+                }
                 let skills = cached_skills(store, &c.project_id);
                 print!("{}", subagent_brief(store, &c, &c.task_name, &skills));
                 eprintln!(
@@ -1634,10 +1643,21 @@ pub fn run() -> Result<(), String> {
             use std::io::Write;
             // 跟了文字：新建一条任务并开工，不再派子代理。
             // 标题即文字，置「进行中」+ 看板列「进行中」。
+            // 给了 --agent-tag 时，标题直接写 `agent-N:` 前缀（建任务模式以前会忽略这个
+            // 参数，用户踩过坑），并把 tag 记进 claim.note 供收尾识别。
             if !task.is_empty() {
                 let desc = task.join(" ");
+                let desc = agent_tag
+                    .as_deref()
+                    .map(|tag| agent_tagged_title(tag, desc.trim()))
+                    .unwrap_or_else(|| desc.trim().to_string());
                 let pid = resolve_project(project.as_deref(), name.as_deref())?;
-                let r = start(&store, &pid, desc.trim(), "", &current_agent())?;
+                let r = start(&store, &pid, &desc, "", &current_agent())?;
+                if let Some(tag) = agent_tag.as_deref() {
+                    if !tag.trim().is_empty() {
+                        store.patch_claim(&r.claim.claim_id, |c| c.note = tag.trim().to_string())?;
+                    }
+                }
                 for w in &r.warnings {
                     eprintln!("警告: {w}");
                 }
@@ -1851,29 +1871,30 @@ pub fn run() -> Result<(), String> {
                 return Ok(());
             }
             // 主代理要用户拍板但手上没有现成 claim（比如会话内直接提的要求）：
-            // 不带 claim_id 且非 --off 时，直接新建一条 task 并转「待回复」。
-            // 标题用问题首行，避免长问题撑爆标题，也让每次提问各自独立。
+            // 不带 claim_id 且非 --off 时，走 lead 单任务——同会话已有活动 lead 就复用，
+            // 没有就新建一条 `lead:` 任务（标题取问题首行）。保证主代理建的任务都在
+            // 同一条 lead 上，回 1/2/3+ 分流不变。
             let claim_id = match claim_id {
                 Some(id) => id,
                 None => {
-                    let pid = resolve_project(None, None)?;
-                    let title = q
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("需要你回复")
-                        .trim()
-                        .chars()
-                        .take(60)
-                        .collect::<String>();
-                    let r = start(&store, &pid, &title, "", &current_agent())?;
+                    let title = lead_question_title(&q);
+                    let r = lead_start(&store, &title)?;
                     for w in &r.warnings {
                         eprintln!("警告: {w}");
                     }
-                    println!(
-                        "已新建任务并提问：task_id: {}  链接: {}",
-                        r.claim.task_id,
-                        crate::ops::task_url(&r.claim.task_id)
-                    );
+                    if r.existed {
+                        println!(
+                            "复用本次会话的 lead 任务提问：claim_id: {}  链接: {}",
+                            r.claim.claim_id,
+                            crate::ops::task_url(&r.claim.task_id)
+                        );
+                    } else {
+                        println!(
+                            "已新建 lead 任务并提问：task_id: {}  链接: {}",
+                            r.claim.task_id,
+                            crate::ops::task_url(&r.claim.task_id)
+                        );
+                    }
                     r.claim.claim_id
                 }
             };
@@ -1905,26 +1926,27 @@ pub fn run() -> Result<(), String> {
                     return Err("lead start 的主题不能为空".into());
                 }
                 let title = format!("lead: {}", topic);
-                // start 的幂等键只有 title（不比 agent）。别的会话占着同名 lead 任务时
-                // 加会话后缀，避免跨会话复用同一条 lead task；同会话重跑仍复用。
-                let agent = current_agent();
-                let title = if store.active_claims().into_iter().any(|c| {
-                    c.task_name == title && c.agent != agent
-                }) {
-                    format!("{title} [{agent}]")
-                } else {
-                    title
-                };
+                // lead_start 内部按当前会话去重（已有活动 lead 就直接复用），并处理
+                // 别的会话占同名标题的冲突；--text 在复用路径上不生效，仅作主题提示。
                 let r = lead_start(&store, &title)?;
                 for w in &r.warnings {
                     eprintln!("警告: {w}");
                 }
-                println!(
-                    "已建 lead 任务：{}  claim_id: {}  链接: {}",
-                    r.claim.task_name,
-                    r.claim.claim_id,
-                    crate::ops::task_url(&r.claim.task_id)
-                );
+                if r.existed {
+                    println!(
+                        "已复用本次会话的 lead 任务（不同标题也不会新建）：{}  claim_id: {}  链接: {}",
+                        r.claim.task_name,
+                        r.claim.claim_id,
+                        crate::ops::task_url(&r.claim.task_id)
+                    );
+                } else {
+                    println!(
+                        "已建 lead 任务：{}  claim_id: {}  链接: {}",
+                        r.claim.task_name,
+                        r.claim.claim_id,
+                        crate::ops::task_url(&r.claim.task_id)
+                    );
+                }
             } else if matches!(action.as_str(), "report" | "say" | "ask") {
                 let content = if let Some(t) = text {
                     t
@@ -2196,6 +2218,9 @@ pub fn run() -> Result<(), String> {
             }
         }
         Cmd::Done { claim_id } => {
+            // lead 任务回 1 收尾要连带同会话子任务（跟邮件回 1 的 dispatch_reply 一致）。
+            // 之前 CLI done 只收自己，主代理手动补收了 10 条——这里补上联动。
+            finalize_lead_on_cli_done(&store, &claim_id);
             let c = finish(&store, &claim_id, STAGE_DONE)?;
             println!("任务「{}」已转为「已解决」。claim_id: {}", c.task_name, c.claim_id);
         }

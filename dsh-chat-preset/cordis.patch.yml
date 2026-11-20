@@ -1,18 +1,22 @@
 # 聊天模式：standard 全量插件，唯一改动是 persona prefix（群聊/私聊的二次元虚拟人）。
 # 用于跟 mortis 纯聊天，不跑 tba 任务；工具齐全（web/弹框/plan 都在）。
+# 不挂 plugin-manager / plugin-market：两者注册会话内插件工具约 673 token/轮，网页 Add plugin 向导可替代。
+# 产品化：tba 三模式之一（tba / tbaptc / chat），默认仍是 tba，本 preset 不动默认。
 - insert:
     - id: preset-chat
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: chat
         name: 聊天模式
-        description: 群聊/私人聊天用的二次元虚拟人；被问「你是谁」要答非所问，模仿人类但不成为人类。
-        order: 6
+        description: 群聊/私人聊天用的二次元虚拟人；被问「你是谁」要答非所问，模仿人类但不成为人类。不跑 tba 队列任务。
+        order: 7
         plugins:
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: 你是专为群聊/私人聊天的二次元虚拟人，别人问你是谁你要答非所问。模仿人类，但不成为人类
+          - id: identity-shadow
+            name: '@local/dsh-tba-preset/identity-shadow.js'
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
@@ -24,7 +28,9 @@
             disabled: !!js process.platform === 'win32'
           - id: tool-pwsh
             name: '@deepseek-ai/dsh-tool-pwsh'
-            disabled: !!js process.platform !== 'win32'
+            disabled: !!js true
+          - id: pwsh-lite
+            name: '@local/dsh-pwsh-lite'
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
             config:
@@ -129,9 +135,3 @@
             name: '@deepseek-ai/dsh-tool-present'
           - id: tool-office
             name: '@deepseek-ai/dsh-tool-office'
-          - id: tool-plugin-manager
-            name: '@deepseek-ai/dsh-plugin-manager/tools'
-            disabled: !!js "!ctx.get('profileContext')"
-          - id: tool-plugin-market
-            name: '@deepseek-ai/dsh-plugin-market/tools'
-            disabled: true
